@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Build
+build/
+dist/
+
+# Local DBs (development scratch)
+*.db
+*.sqlite
+*.sqlite3
+
+# Local environment
+.env
+.envrc
+.venv/
+venv/
+
+# Editor cruft
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+*~
+
+# Lab-specific: test fixtures live as a sibling directory, NOT under the
+# package. Listed defensively in case anyone copies them in.
+embryoDB_test_data/
+test_data/

@@ -110,3 +110,20 @@ end-to-end on the test fixture at
 
 Don't push to GitHub. Make local commits as you go. The human will
 decide when to push.
+
+## Future-feature backlog (heard, not yet implemented)
+
+- **Variable curation-depth visualization.** One movie may be shown at
+  50-cell depth for one paper and 350-cell for another. The control
+  should live in the tree-plotting module (eventually under v3/v4) and
+  optionally override the series' `partial_editing_code` *for that one
+  visualization*, without mutating the DB. The current single
+  per-series partial-editing-code stays the canonical curation extent;
+  the override is purely a display-time argument to the tree renderer.
+- **Auto-populate `edited_cells` from `edited_timepts` + StarryNite
+  data.** The user noted `edited_cells` is currently approximate and
+  manually entered, while `edited_timepts` is what downstream tools
+  actually rely on. A future cleanup could count cells alive at the
+  edited_timepts threshold from the StarryNite output zip and write the
+  exact count back to `edited_cells`. Probably a v3 task (lands when
+  we're reading the StarryNite output natively).

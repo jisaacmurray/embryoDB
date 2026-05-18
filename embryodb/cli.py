@@ -665,6 +665,109 @@ def pipeline_backfill_cmd(
         console.print(f"  [yellow]?[/yellow] {n} (no matching Series row)")
 
 
+# --- open (convenience launcher) --------------------------------------------
+
+
+@app.command("open")
+def open_cmd(
+    source: Annotated[
+        Path | None,
+        typer.Option("--source", help="XML source dir (default: EMBRYODB_SOURCE_DIR)"),
+    ] = None,
+    lists_dir: Annotated[
+        Path | None,
+        typer.Option("--lists-dir", help="Flat list files dir (default: /gpfs/fs0/l/murr/lists)"),
+    ] = None,
+    parameters_dir: Annotated[
+        Path | None,
+        typer.Option("--params-dir", help="Protocol parameters dir (default: /gpfs/fs0/l/murr/parameters)"),
+    ] = None,
+    no_worker: Annotated[bool, typer.Option("--no-worker")] = False,
+) -> None:
+    """One-shot launcher: init DB, sync XMLs and lists, seed protocols, then open the GUI.
+
+    Idempotent — safe to run on every startup. Re-running is fast because
+    import-xml short-circuits unchanged rows, and seed-protocols is a no-op
+    when protocols already exist.
+    """
+    src = source or settings.source_dir
+    lists = lists_dir or Path("/gpfs/fs0/l/murr/lists")
+    params = parameters_dir or Path("/gpfs/fs0/l/murr/parameters")
+
+    # 1. Tables
+    console.print("[bold]1/5[/bold] initialising database…")
+    database.create_all()
+    console.print("    [green]ok[/green]")
+
+    # 2. Import legacy XMLs
+    console.print(f"[bold]2/5[/bold] syncing XMLs from [cyan]{src}[/cyan]…")
+    with database.session_scope() as s:
+        report = import_dir(s, source_dir=src)
+    console.print(f"    [green]ok[/green]  {report.summary()}")
+    if report.parse_errors:
+        for path, err in report.parse_errors[:5]:
+            console.print(f"    [yellow]parse error[/yellow] {path}: {err}")
+
+    # 3. Import dataset lists
+    if lists.is_dir():
+        console.print(f"[bold]3/5[/bold] syncing dataset lists from [cyan]{lists}[/cyan]…")
+        with database.session_scope() as s:
+            lr = import_lists(s, source_dir=lists)
+        console.print(f"    [green]ok[/green]  {lr.summary()}")
+    else:
+        console.print(f"[bold]3/5[/bold] lists dir [yellow]{lists}[/yellow] not found — skipping")
+
+    # 4. Seed protocols
+    console.print(f"[bold]4/5[/bold] seeding protocols from [cyan]{params}[/cyan]…")
+    with database.session_scope() as s:
+        pr = seed_protocols(s, parameters_dir=params, name_prefix="Stellaris_")
+    console.print(
+        f"    [green]ok[/green]  inserted={len(pr.inserted)}  updated={len(pr.updated)}  skipped={len(pr.skipped)}"
+    )
+
+    # 5. Spawn worker if there are PENDING pipeline runs
+    if not no_worker:
+        from sqlalchemy import func, select
+        from .models import PipelineStepRun, RunStatus
+        from .pipeline.worker import spawn_worker, worker_is_running, WORKER_STEPS
+
+        with database.session_scope() as s:
+            n_pending = s.scalar(
+                select(func.count())
+                .select_from(PipelineStepRun)
+                .where(
+                    PipelineStepRun.step.in_(WORKER_STEPS),
+                    PipelineStepRun.status == RunStatus.PENDING,
+                )
+            )
+        console.print(f"[bold]5/5[/bold] worker: {n_pending} pending pipeline step(s)")
+        if n_pending:
+            if worker_is_running():
+                console.print("    worker already running")
+            else:
+                spawn_worker()
+                console.print("    [green]worker spawned[/green]")
+        else:
+            console.print("    nothing pending — skipping")
+    else:
+        console.print("[bold]5/5[/bold] worker: skipped (--no-worker)")
+
+    # Open GUI
+    console.print("\nopening GUI…")
+    import os
+    os.execvp("embryodb-gui", ["embryodb-gui"])
+
+
+def open_gui() -> None:
+    """Entry point for `embryodb-open`: runs `embryodb open` with no args."""
+    import sys
+    # Reuse the Typer app so --help, --source, etc. all work.
+    sys.argv = ["embryodb-open"] + sys.argv[1:]
+    # Inject the subcommand name so Typer routes correctly.
+    sys.argv.insert(1, "open")
+    app()
+
+
 # --- entrypoint -------------------------------------------------------------
 
 

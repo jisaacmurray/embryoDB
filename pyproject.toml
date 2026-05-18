@@ -34,6 +34,7 @@ dev = [
 embryodb = "embryodb.cli:app"
 embryodb-gui = "embryodb.gui.app:main"
 embryodb-worker = "embryodb.pipeline.worker:main"
+embryodb-open = "embryodb.cli:open_gui"
 
 [tool.hatch.build.targets.wheel]
 packages = ["embryodb"]

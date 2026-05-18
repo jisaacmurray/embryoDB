@@ -21,9 +21,24 @@ _engine: Engine | None = None
 _SessionLocal: sessionmaker[Session] | None = None
 
 
+def _ensure_sqlite_parent(db_url: str) -> None:
+    """If `db_url` is a SQLite file URL, create the parent directory."""
+    # SQLite URLs look like sqlite:////absolute/path or sqlite:///relative/path
+    if not db_url.startswith("sqlite:///"):
+        return
+    path_part = db_url[len("sqlite:///"):]  # strips the scheme; may start with /
+    if not path_part or path_part == ":memory:":
+        return
+    from pathlib import Path
+    parent = Path(path_part).parent
+    if parent != Path("."):
+        parent.mkdir(parents=True, exist_ok=True)
+
+
 def get_engine() -> Engine:
     global _engine
     if _engine is None:
+        _ensure_sqlite_parent(settings.db_url)
         _engine = create_engine(settings.db_url, future=True)
     return _engine
 

@@ -439,3 +439,220 @@ def test_backfill_is_idempotent(db_session, tmp_path):
     r2 = backfill_directory(db_session, tmp_path / "images")
     assert r1.runs_inserted == 9  # one per step
     assert r2.runs_inserted == 0  # nothing new the second time
+
+
+# ---------------------------------------------------------------------------
+# subprocess_steps: SKIPPED / mock-success paths
+# ---------------------------------------------------------------------------
+
+
+def _make_series_with_run(session, series_name: str, step: str) -> tuple:
+    """Helper: create a minimal Series + RUNNING PipelineStepRun, return (series, run)."""
+    series = Series(
+        series_name=series_name,
+        status=Status.NEW,
+        image_loc=f"/tmp/fake/{series_name}",
+        annot_loc=f"/tmp/fake/{series_name}",
+    )
+    session.add(series)
+    session.flush()
+    run = PipelineStepRun(
+        series_id=series.id,
+        step=step,
+        status=RunStatus.RUNNING,
+    )
+    session.add(run)
+    session.flush()
+    return series, run
+
+
+def test_run_red_extract_skipped_when_no_reporter(db_session, tmp_path):
+    """run_red_extract marks the run SKIPPED when protocol has no reporter channel."""
+    from embryodb.pipeline.subprocess_steps import step_run_red_extract
+
+    series, run = _make_series_with_run(db_session, "test_no_rep_L1", "run_red_extract")
+    run_id = run.id
+    image_loc = tmp_path / "test_no_rep_L1"
+    image_loc.mkdir()
+
+    # channel_map has no reporter role
+    step_run_red_extract(
+        series.id, series.series_name, image_loc, run_id,
+        protocol_channel_map={"0": "histone"},
+    )
+
+    db_session.expire_all()
+    refreshed = db_session.get(PipelineStepRun, run_id)
+    assert refreshed.status == RunStatus.SKIPPED
+
+
+def test_run_measure_skipped_when_no_reporter(db_session, tmp_path):
+    """run_measure marks the run SKIPPED when protocol has no reporter channel."""
+    from embryodb.pipeline.subprocess_steps import step_run_measure
+
+    series, run = _make_series_with_run(db_session, "test_no_rep2_L1", "run_measure")
+    run_id = run.id
+    image_loc = tmp_path / "test_no_rep2_L1"
+    image_loc.mkdir()
+
+    step_run_measure(
+        series.id, series.series_name, image_loc, run_id,
+        protocol_channel_map={},
+    )
+
+    db_session.expire_all()
+    refreshed = db_session.get(PipelineStepRun, run_id)
+    assert refreshed.status == RunStatus.SKIPPED
+
+
+def test_step_run_starrynite_complete_on_success(db_session, tmp_path, monkeypatch):
+    """run_starrynite marks the run COMPLETE when the subprocess exits 0."""
+    import subprocess as _sp
+    from embryodb.pipeline.subprocess_steps import step_run_starrynite
+
+    class _FakeProc:
+        returncode = 0
+        def poll(self): return 0  # immediately done
+
+    monkeypatch.setattr(_sp, "Popen", lambda *a, **kw: _FakeProc())
+
+    series, run = _make_series_with_run(db_session, "test_sn_L1", "run_starrynite")
+    run_id = run.id
+    image_loc = tmp_path / "test_sn_L1"
+    (image_loc / "dats").mkdir(parents=True)
+    (image_loc / "tif").mkdir(parents=True)
+    (image_loc / "matlabParams").write_text("slices=67;\n")
+
+    step_run_starrynite(series.id, series.series_name, image_loc, run_id)
+
+    db_session.expire_all()
+    refreshed = db_session.get(PipelineStepRun, run_id)
+    assert refreshed.status == RunStatus.COMPLETE
+    assert refreshed.log_path is not None
+
+
+def test_step_run_starrynite_failed_on_nonzero(db_session, tmp_path, monkeypatch):
+    """run_starrynite marks the run FAILED when subprocess exits non-zero."""
+    import subprocess as _sp
+    from embryodb.pipeline.subprocess_steps import step_run_starrynite
+
+    class _FakeProc:
+        returncode = 1
+        def poll(self): return 1
+
+    monkeypatch.setattr(_sp, "Popen", lambda *a, **kw: _FakeProc())
+
+    series, run = _make_series_with_run(db_session, "test_sn_fail_L1", "run_starrynite")
+    run_id = run.id
+    image_loc = tmp_path / "test_sn_fail_L1"
+    (image_loc / "dats").mkdir(parents=True)
+    (image_loc / "tif").mkdir(parents=True)
+
+    step_run_starrynite(series.id, series.series_name, image_loc, run_id)
+
+    db_session.expire_all()
+    refreshed = db_session.get(PipelineStepRun, run_id)
+    assert refreshed.status == RunStatus.FAILED
+
+
+# ---------------------------------------------------------------------------
+# Worker: queue logic and stale-heartbeat reset
+# ---------------------------------------------------------------------------
+
+
+def _make_full_pipeline_series(session, series_name: str) -> Series:
+    """Create a Series with inline steps COMPLETE and worker steps PENDING."""
+    from embryodb.pipeline.orchestrate import STEPS
+
+    series = Series(
+        series_name=series_name,
+        status=Status.NEW,
+        image_loc=f"/tmp/fake/{series_name}",
+        annot_loc=f"/tmp/fake/{series_name}",
+    )
+    session.add(series)
+    session.flush()
+
+    inline_steps = STEPS[:6]
+    worker_steps = STEPS[6:]
+
+    for step in inline_steps:
+        session.add(PipelineStepRun(
+            series_id=series.id, step=step, status=RunStatus.COMPLETE,
+        ))
+    for step in worker_steps:
+        session.add(PipelineStepRun(
+            series_id=series.id, step=step, status=RunStatus.PENDING,
+        ))
+    session.flush()
+    return series
+
+
+def test_worker_resets_stale_running(db_session):
+    """_reset_stale_running requeues RUNNING rows with a stale heartbeat."""
+    from datetime import datetime, timedelta, timezone
+    from embryodb.pipeline.worker import _reset_stale_running
+
+    series, run = _make_series_with_run(db_session, "stale_L1", "run_starrynite")
+    # Make heartbeat stale (10 minutes ago)
+    run.heartbeat_at = datetime.now(tz=timezone.utc) - timedelta(minutes=10)
+    db_session.flush()
+
+    n = _reset_stale_running(db_session)
+    assert n == 1
+
+    db_session.expire_all()
+    refreshed = db_session.get(PipelineStepRun, run.id)
+    assert refreshed.status == RunStatus.PENDING
+    assert refreshed.started_at is None
+
+
+def test_worker_finds_next_pending_after_inline_steps(db_session):
+    """_next_work_item returns the first PENDING worker step when prerequisites are done."""
+    from embryodb.pipeline.worker import _next_work_item
+
+    series = _make_full_pipeline_series(db_session, "queue_test_L1")
+
+    result = _next_work_item(db_session)
+    assert result is not None
+    found_series, step, run = result
+    assert found_series.id == series.id
+    assert step == "run_starrynite"
+
+
+def test_worker_skips_series_with_failed_prerequisite(db_session):
+    """_next_work_item returns None when a prerequisite inline step has FAILED."""
+    from embryodb.pipeline.worker import _next_work_item
+    from embryodb.pipeline.orchestrate import STEPS
+
+    series = Series(series_name="failed_prereq_L1", status=Status.NEW, image_loc="/tmp/x")
+    db_session.add(series)
+    db_session.flush()
+
+    # write_matlab_params (step 6) is FAILED; run_starrynite is PENDING
+    for step in STEPS[:5]:
+        db_session.add(PipelineStepRun(
+            series_id=series.id, step=step, status=RunStatus.COMPLETE,
+        ))
+    db_session.add(PipelineStepRun(
+        series_id=series.id, step="write_matlab_params", status=RunStatus.FAILED,
+    ))
+    db_session.add(PipelineStepRun(
+        series_id=series.id, step="run_starrynite", status=RunStatus.PENDING,
+    ))
+    db_session.flush()
+
+    result = _next_work_item(db_session)
+    assert result is None
+
+
+def test_worker_respects_series_order(db_session):
+    """_next_work_item returns the series with the lowest id first."""
+    from embryodb.pipeline.worker import _next_work_item
+
+    s1 = _make_full_pipeline_series(db_session, "order_test_L1")
+    s2 = _make_full_pipeline_series(db_session, "order_test_L2")
+
+    result = _next_work_item(db_session)
+    assert result is not None
+    assert result[0].id == min(s1.id, s2.id)

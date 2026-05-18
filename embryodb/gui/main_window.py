@@ -92,6 +92,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
 
+        act_import_acq = QtGui.QAction("Import acquisition…", self)
+        act_import_acq.triggered.connect(self._on_import_acquisition)
+        file_menu.addAction(act_import_acq)
+
         act_import = QtGui.QAction("Import from source-dir…", self)
         act_import.triggered.connect(self._on_import)
         file_menu.addAction(act_import)
@@ -140,6 +144,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._dataset_panel.exportRequested.connect(self._on_dataset_export)
         self._dataset_panel.filterChanged.connect(self._on_dataset_filter_changed)
         self._dataset_filter_id: int | None = None
+
+        # Live pipeline-status polling: refresh the Pipeline column whenever any
+        # PipelineStepRun row has status=RUNNING (i.e., the worker is active).
+        self._pipeline_timer = QtCore.QTimer(self)
+        self._pipeline_timer.setInterval(5000)
+        self._pipeline_timer.timeout.connect(self._poll_pipeline_status)
+        self._pipeline_timer.start()
 
     # --- session helpers --------------------------------------------------
 
@@ -338,3 +349,32 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.information(
             self, "Export complete", f"Wrote {output}"
         )
+
+    # --- pipeline import wizard -------------------------------------------
+
+    def _on_import_acquisition(self) -> None:
+        from .import_wizard import ImportWizard
+        wizard = ImportWizard(self._session_cm, parent=self)
+        if wizard.exec() == QtWidgets.QWizard.Accepted:
+            self._refresh_all()
+            self.statusBar().showMessage(
+                "Acquisition import queued; worker running in background.", 8000
+            )
+
+    # --- live pipeline-status polling -------------------------------------
+
+    def _poll_pipeline_status(self) -> None:
+        """Refresh the Pipeline column if any step is currently RUNNING."""
+        from sqlalchemy import func, select
+        from ..models import PipelineStepRun, RunStatus
+        try:
+            with self._session_cm() as s:
+                n_running = s.scalar(
+                    select(func.count())
+                    .select_from(PipelineStepRun)
+                    .where(PipelineStepRun.status == RunStatus.RUNNING)
+                )
+        except Exception:
+            return
+        if n_running:
+            self._refresh_table()

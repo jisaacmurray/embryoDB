@@ -45,5 +45,15 @@ class Settings(BaseSettings):
         description="JVM max-heap argument forwarded to AceTree (-mx<value>).",
     )
 
+    # Pipeline subprocess tools
+    tools3_dir: Path = Field(
+        default=Path("/gpfs/fs0/l/murr/tools3"),
+        description="Directory containing matlab_SN_cluster.pl, acebatch3.jar, etc.",
+    )
+    worker_pidfile_dir: Path = Field(
+        default=Path("/tmp"),
+        description="Directory for the per-machine worker pidfile.",
+    )
+
 
 settings = Settings()

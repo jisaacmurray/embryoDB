@@ -611,6 +611,23 @@ def pipeline_import_acquisition(
         console.print(line)
 
 
+@pipeline_app.command("worker")
+def pipeline_worker_cmd() -> None:
+    """Start the per-machine background worker (exits when queue is empty).
+
+    The worker picks up PENDING run_starrynite / run_red_extract / run_measure
+    rows in series order and executes them sequentially. It is crash-safe: rows
+    left RUNNING with a stale heartbeat are requeued on startup.
+    """
+    from .pipeline.worker import run_worker, worker_is_running
+    if worker_is_running():
+        console.print("[yellow]worker already running for this host — nothing to do[/yellow]")
+        return
+    console.print("[green]worker starting…[/green]")
+    run_worker()
+    console.print("[green]worker exited (queue empty)[/green]")
+
+
 @pipeline_app.command("backfill")
 def pipeline_backfill_cmd(
     root: Annotated[

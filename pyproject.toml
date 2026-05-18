@@ -33,6 +33,7 @@ dev = [
 [project.scripts]
 embryodb = "embryodb.cli:app"
 embryodb-gui = "embryodb.gui.app:main"
+embryodb-worker = "embryodb.pipeline.worker:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["embryodb"]

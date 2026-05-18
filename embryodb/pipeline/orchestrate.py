@@ -506,9 +506,16 @@ def import_acquisition(
         planes = (
             getattr(series.microscopy, "planes_per_volume", None) if series.microscopy else None
         ) or pos_plan.planes_per_volume or 67
+        # Actual staged file count takes priority over the metadata-reported
+        # count (which reflects what the microscope was *configured* to do, not
+        # what was actually acquired). For an aborted or test acquisition the
+        # two differ and using the wrong value causes StarryNite to request
+        # non-existent files.
         n_tp = (
-            getattr(series.microscopy, "n_timepoints", None) if series.microscopy else None
-        ) or pos_plan.n_timepoints or raw_timepts
+            pos_plan.n_timepoints
+            or (getattr(series.microscopy, "n_timepoints", None) if series.microscopy else None)
+            or raw_timepts
+        )
 
         # --- step 3: write_acetree_config
         if stop_after >= 2:

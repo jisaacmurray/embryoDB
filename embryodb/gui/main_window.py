@@ -120,20 +120,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # Each dock's toggleViewAction shows up here and stays in sync with
         # docked / floating / hidden state automatically.
         view_menu.addAction(self._detail_dock.toggleViewAction())
-        view_menu.addSeparator()
-        # Optional Pipeline column — useful when actively importing, noise
-        # when just browsing.
-        act_pipeline = QtGui.QAction("Pipeline column", self, checkable=True)
-        act_pipeline.setChecked(True)
-        act_pipeline.toggled.connect(self._set_pipeline_column_visible)
-        view_menu.addAction(act_pipeline)
-
-    def _set_pipeline_column_visible(self, visible: bool) -> None:
-        from .models import COLUMNS
-        for idx, (col, _) in enumerate(COLUMNS):
-            if col == "pipeline_summary":
-                self._table.horizontalHeader().setSectionHidden(idx, not visible)
-                return
 
     def _wire(self) -> None:
         self._filter_bar.filtersChanged.connect(self._refresh_table)
@@ -144,6 +130,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._dataset_panel.exportRequested.connect(self._on_dataset_export)
         self._dataset_panel.filterChanged.connect(self._on_dataset_filter_changed)
         self._dataset_filter_id: int | None = None
+
+        # Right-click on column header → show/hide any column.
+        hdr = self._table.horizontalHeader()
+        hdr.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        hdr.customContextMenuRequested.connect(self._on_header_context_menu)
+
+        # Right-click on browser rows → actions for selected series.
+        self._table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._on_row_context_menu)
 
         # Live pipeline-status polling: refresh the Pipeline column whenever any
         # PipelineStepRun row has status=RUNNING (i.e., the worker is active).
@@ -349,6 +344,45 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.information(
             self, "Export complete", f"Wrote {output}"
         )
+
+    # --- column header context menu (show/hide columns) ------------------
+
+    def _on_header_context_menu(self, pos: QtCore.QPoint) -> None:
+        from .models import COLUMNS
+        header = self._table.horizontalHeader()
+        menu = QtWidgets.QMenu(self)
+        for idx, (_, label) in enumerate(COLUMNS):
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(not header.isSectionHidden(idx))
+            action.toggled.connect(
+                lambda checked, i=idx: self._table.horizontalHeader().setSectionHidden(i, not checked)
+            )
+        menu.exec(header.mapToGlobal(pos))
+
+    # --- row right-click context menu ------------------------------------
+
+    def _on_row_context_menu(self, pos: QtCore.QPoint) -> None:
+        selected = self._selected_series_names()
+        if not selected:
+            return
+        menu = QtWidgets.QMenu(self)
+        label = f"Re-run StarryNite… ({len(selected)} series)" if len(selected) > 1 else "Re-run StarryNite…"
+        act_rerun = menu.addAction(label)
+        act_rerun.triggered.connect(self._on_rerun_starrynite)
+        menu.exec(self._table.viewport().mapToGlobal(pos))
+
+    def _on_rerun_starrynite(self) -> None:
+        selected = self._selected_series_names()
+        if not selected:
+            return
+        from .rerun_dialog import RerunStarryNiteDialog
+        dlg = RerunStarryNiteDialog(self._session_cm, selected, parent=self)
+        if dlg.exec():
+            self._refresh_table()
+            self.statusBar().showMessage(
+                f"Re-queued StarryNite for {len(selected)} series.", 5000
+            )
 
     # --- pipeline import wizard -------------------------------------------
 

@@ -350,13 +350,27 @@ class TargetsPage(QtWidgets.QWizardPage):
         self._image_root_edit, row1 = self._path_row(str(DEFAULT_IMAGE_LOC_ROOT))
         layout.addRow("Image loc root:", row1)
 
-        self._alias_check = QtWidgets.QCheckBox("Create alias symlink")
-        self._alias_check.setChecked(True)
-        layout.addRow("", self._alias_check)
+        # Warn if the user-specific subdirectory doesn't exist yet.
+        self._user_warn = QtWidgets.QLabel("")
+        self._user_warn.setStyleSheet("color: #b8860b;")  # dark-yellow
+        self._user_warn.setWordWrap(True)
+        layout.addRow("", self._user_warn)
+        self._image_root_edit.textChanged.connect(self._update_user_warning)
 
-        self._alias_root_edit, row2 = self._path_row(str(DEFAULT_ALIAS_ROOT))
-        self._alias_check.toggled.connect(row2.setEnabled)
-        layout.addRow("Alias root:", row2)
+        # Alias: checkbox to enable/disable; location is always DEFAULT_ALIAS_ROOT
+        # (not user-editable — the lab convention is fixed).
+        alias_row = QtWidgets.QWidget()
+        alias_hl = QtWidgets.QHBoxLayout(alias_row)
+        alias_hl.setContentsMargins(0, 0, 0, 0)
+        self._alias_check = QtWidgets.QCheckBox("Create symlink")
+        self._alias_check.setChecked(True)
+        self._alias_label = QtWidgets.QLabel(str(DEFAULT_ALIAS_ROOT))
+        self._alias_label.setStyleSheet("color: grey;")
+        self._alias_check.toggled.connect(self._alias_label.setEnabled)
+        alias_hl.addWidget(self._alias_check)
+        alias_hl.addWidget(self._alias_label)
+        alias_hl.addStretch(1)
+        layout.addRow("Alias symlink:", alias_row)
 
         self._legacy_xml_edit, row3 = self._path_row(str(settings.source_dir))
         layout.addRow("Legacy XML dir:", row3)
@@ -382,16 +396,31 @@ class TargetsPage(QtWidgets.QWizardPage):
         if path:
             edit.setText(path)
 
+    def _update_user_warning(self) -> None:
+        wizard = self.wizard()
+        meta: MetadataPage | None = wizard.page(1) if wizard else None  # type: ignore
+        user = meta.person() if meta else settings.user
+        if not user:
+            self._user_warn.setText("")
+            return
+        root = Path(self._image_root_edit.text().strip())
+        user_dir = root / user / "images"
+        if not user_dir.exists():
+            self._user_warn.setText(
+                f"Note: {user_dir} does not exist yet — it will be created on import."
+            )
+        else:
+            self._user_warn.setText("")
+
     def initializePage(self) -> None:
         plan = getattr(self.wizard(), "_plan", None)
-        if plan is None:
-            return
-        # Rough disk usage estimate: positions × timepoints × planes × channels × 4 MB ÷ 2 (LZW)
-        total_files = 0
-        for pp in plan.positions.values():
-            total_files += pp.n_timepoints * pp.planes_per_volume * len(pp.files_by_channel)
-        est_gb = total_files * 4 / 2 / 1024
-        self._disk_label.setText(f"~{est_gb:.1f} GB (estimate)")
+        if plan is not None:
+            total_files = 0
+            for pp in plan.positions.values():
+                total_files += pp.n_timepoints * pp.planes_per_volume * len(pp.files_by_channel)
+            est_gb = total_files * 4 / 2 / 1024
+            self._disk_label.setText(f"~{est_gb:.1f} GB (estimate)")
+        self._update_user_warning()
 
     def image_loc_root(self) -> Path:
         return Path(self._image_root_edit.text().strip())
@@ -399,7 +428,7 @@ class TargetsPage(QtWidgets.QWizardPage):
     def alias_root(self) -> Path | None:
         if not self._alias_check.isChecked():
             return None
-        return Path(self._alias_root_edit.text().strip())
+        return DEFAULT_ALIAS_ROOT
 
     def legacy_xml_dir(self) -> Path:
         return Path(self._legacy_xml_edit.text().strip())

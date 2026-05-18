@@ -12,15 +12,15 @@ on save — raw values are preserved).
 
 from __future__ import annotations
 
+import subprocess
 from collections.abc import Callable
+from pathlib import Path
 
 from qtpy import QtCore, QtWidgets
 from sqlalchemy.orm import Session
 
-from pathlib import Path
-
 from .. import external
-from ..models import Series, Status
+from ..models import RunStatus, Series, Status
 from ..queries import series as q_series
 from .acetree_config_dialog import AceTreeConfigDialog
 
@@ -160,6 +160,34 @@ class DetailPanel(QtWidgets.QWidget):
             self._prov_widgets[column] = value_label
             prov_layout.addRow(label + ":", value_label)
         right_layout.addWidget(prov_box)
+
+        # Pipeline steps table
+        pipe_box = QtWidgets.QGroupBox("Pipeline")
+        pipe_vl = QtWidgets.QVBoxLayout(pipe_box)
+        self._pipeline_table = QtWidgets.QTableWidget(0, 3)
+        self._pipeline_table.setHorizontalHeaderLabels(["Step", "Status", ""])
+        self._pipeline_table.horizontalHeader().setStretchLastSection(False)
+        self._pipeline_table.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeToContents
+        )
+        self._pipeline_table.horizontalHeader().setSectionResizeMode(
+            1, QtWidgets.QHeaderView.ResizeToContents
+        )
+        self._pipeline_table.horizontalHeader().setSectionResizeMode(
+            2, QtWidgets.QHeaderView.Stretch
+        )
+        self._pipeline_table.verticalHeader().setVisible(False)
+        self._pipeline_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self._pipeline_table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self._pipeline_table.setMinimumHeight(120)
+        pipe_vl.addWidget(self._pipeline_table)
+
+        self._rerun_btn = QtWidgets.QPushButton("Re-run StarryNite…")
+        self._rerun_btn.setEnabled(False)
+        self._rerun_btn.clicked.connect(self._on_rerun_starrynite)
+        pipe_vl.addWidget(self._rerun_btn)
+
+        right_layout.addWidget(pipe_box)
         right_layout.addStretch(1)
         body_splitter.addWidget(right)
 
@@ -224,12 +252,104 @@ class DetailPanel(QtWidgets.QWidget):
 
     # --- population / save ------------------------------------------------
 
+    def _populate_pipeline_table(self, row: Series) -> None:
+        from ..pipeline.orchestrate import STEPS
+        runs_by_step = {r.step: r for r in row.runs}
+        has_any = bool(runs_by_step)
+        self._pipeline_table.setRowCount(len(STEPS))
+        _STATUS_COLOR = {
+            RunStatus.COMPLETE: "#2a8a2a",
+            RunStatus.FAILED: "#b00000",
+            RunStatus.RUNNING: "#0050b0",
+            RunStatus.SKIPPED: "#888888",
+            RunStatus.PENDING: "#555555",
+        }
+        for r_idx, step in enumerate(STEPS):
+            run = runs_by_step.get(step)
+            status = run.status if run else None
+            short = step.replace("write_", "").replace("stage_", "stage/").replace("create_", "")
+            step_item = QtWidgets.QTableWidgetItem(short)
+            self._pipeline_table.setItem(r_idx, 0, step_item)
+
+            if status is None:
+                status_item = QtWidgets.QTableWidgetItem("—")
+            else:
+                glyphs = {
+                    RunStatus.COMPLETE: "✓", RunStatus.FAILED: "✗",
+                    RunStatus.RUNNING: "⟳", RunStatus.SKIPPED: "–",
+                    RunStatus.PENDING: "·",
+                }
+                status_item = QtWidgets.QTableWidgetItem(
+                    f"{glyphs.get(status, '?')} {status.value}"
+                )
+                color = _STATUS_COLOR.get(status)
+                if color:
+                    status_item.setForeground(
+                        QtWidgets.QApplication.palette().text()
+                        if status == RunStatus.PENDING
+                        else __import__("qtpy.QtGui", fromlist=["QColor"]).QColor(color)
+                    )
+            self._pipeline_table.setItem(r_idx, 1, status_item)
+
+            # Log button for steps with a log file
+            if run and run.log_path and Path(run.log_path).exists():
+                log_btn = QtWidgets.QPushButton("Log")
+                log_btn.setMaximumWidth(42)
+                log_btn.setFlat(True)
+                log_path = run.log_path
+                log_btn.clicked.connect(lambda _, p=log_path: self._open_log(p))
+                self._pipeline_table.setCellWidget(r_idx, 2, log_btn)
+            elif run and run.error_excerpt:
+                err_item = QtWidgets.QTableWidgetItem(run.error_excerpt[:80])
+                err_item.setForeground(
+                    __import__("qtpy.QtGui", fromlist=["QColor"]).QColor("#b00000")
+                )
+                err_item.setToolTip(run.error_excerpt)
+                self._pipeline_table.setItem(r_idx, 2, err_item)
+            else:
+                self._pipeline_table.setItem(r_idx, 2, QtWidgets.QTableWidgetItem(""))
+
+        # Enable Re-run StarryNite if any worker step exists
+        has_sn = "run_starrynite" in runs_by_step
+        self._rerun_btn.setEnabled(has_sn)
+
+    def _open_log(self, log_path: str) -> None:
+        """Open a log file in a simple read-only viewer dialog."""
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"Log — {Path(log_path).name}")
+        dlg.resize(700, 500)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        text_edit = QtWidgets.QPlainTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        try:
+            text_edit.setPlainText(Path(log_path).read_text(errors="replace"))
+        except OSError as exc:
+            text_edit.setPlainText(f"Could not read log:\n{exc}")
+        layout.addWidget(text_edit)
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        layout.addWidget(close_btn)
+        dlg.exec()
+
+    def _on_rerun_starrynite(self) -> None:
+        if not self._series_name:
+            return
+        from .rerun_dialog import RerunStarryNiteDialog
+        dlg = RerunStarryNiteDialog(
+            self._session_factory, [self._series_name], parent=self
+        )
+        if dlg.exec():
+            self.load_series(self._series_name)
+
     def _clear(self) -> None:
         for column, _, kind in EDIT_FIELDS:
             self._set_value(column, "", kind)
         for label in self._prov_widgets.values():
             label.setText("")
         self._datasets_list.clear()
+        self._pipeline_table.setRowCount(0)
+        self._rerun_btn.setEnabled(False)
         self._set_enabled(False)
         self._loaded_version = None
         self._dirty_label.setText("")
@@ -254,6 +374,7 @@ class DetailPanel(QtWidgets.QWidget):
             placeholder.setFlags(QtCore.Qt.NoItemFlags)
             self._datasets_list.addItem(placeholder)
         self._loaded_version = row.version
+        self._populate_pipeline_table(row)
         self._set_enabled(True)
         self._dirty_label.setText("")
         # Refresh combo suggestions

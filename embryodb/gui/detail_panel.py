@@ -46,6 +46,11 @@ EDIT_FIELDS: list[tuple[str, str, str]] = [
     ("status", "Status", "status"),
 ]
 
+# Fields that link to files on disk or downstream tools — warn before saving.
+PROTECTED_FIELDS: frozenset[str] = frozenset(
+    {"series_name", "image_loc", "annot_loc", "date_acquired", "timepts"}
+)
+
 PROVENANCE_FIELDS: list[tuple[str, str]] = [
     ("version", "Version"),
     ("updated_at", "Updated at"),
@@ -439,6 +444,27 @@ class DetailPanel(QtWidgets.QWidget):
             if self._loaded_version is not None and row.version != self._loaded_version:
                 self._handle_conflict(row)
                 return
+            # Warn before saving changes to fields that affect disk paths or
+            # downstream tools.
+            changed_protected = [
+                label
+                for column, label, kind in EDIT_FIELDS
+                if column in PROTECTED_FIELDS
+                and str(getattr(row, column) or "") != self._get_value(column, kind)
+            ]
+            if changed_protected:
+                reply = QtWidgets.QMessageBox.warning(
+                    self,
+                    "Sensitive field changed",
+                    "You've modified:\n  " + "\n  ".join(changed_protected) + "\n\n"
+                    "These fields link to files on disk and are used by AceTree, "
+                    "StarryNite, and the legacy embryoDB XML. Saving an incorrect "
+                    "value can break those tools.\n\nSave anyway?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No,
+                )
+                if reply != QtWidgets.QMessageBox.Yes:
+                    return
             for column, _, kind in EDIT_FIELDS:
                 value = self._get_value(column, kind)
                 if column == "status":

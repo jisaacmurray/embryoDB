@@ -104,10 +104,16 @@ def _skip_run(run_id: int, reason: str) -> None:
         run.error_excerpt = reason
 
 
-def _write_series_list(tmp_dir: Path, series_name: str, image_loc: Path) -> Path:
-    """Write a single-line acebatch3 series list file. Returns the path."""
+def _write_series_list(tmp_dir: Path, series_name: str) -> Path:
+    """Write a single-line acebatch3 series list file. Returns the path.
+
+    acebatch3 treats each line as a series name, looks up
+    <embryoDB_source_dir>/<name>.xml, and derives image/annot paths from there.
+    Do NOT write the image_loc path — the Java tool would prepend source_dir to
+    it and produce a nonsensical combined path.
+    """
     list_file = tmp_dir / f"{series_name}.list"
-    list_file.write_text(str(image_loc) + "\n", encoding="utf-8")
+    list_file.write_text(series_name + "\n", encoding="utf-8")
     return list_file
 
 
@@ -133,7 +139,7 @@ def step_run_starrynite(
     cwd=tools3_dir so it can find starrynite_traceonly/starrynite relative
     to itself.
     """
-    log_path = ensure_dir(image_loc / "dats") / f"{series_name}-run_starrynite.log"
+    log_path = ensure_dir(image_loc / "logs") / f"{series_name}-run_starrynite.log"
 
     # Record log_path before the subprocess starts so the GUI can open it.
     with session_scope() as s:
@@ -173,7 +179,7 @@ def step_run_red_extract(
         _skip_run(run_id, "no reporter channel in protocol channel_map")
         return
 
-    log_path = ensure_dir(image_loc / "dats") / f"{series_name}-run_red_extract.log"
+    log_path = ensure_dir(image_loc / "logs") / f"{series_name}-run_red_extract.log"
 
     with session_scope() as s:
         run = s.get(PipelineStepRun, run_id)
@@ -181,7 +187,7 @@ def step_run_red_extract(
             run.log_path = str(log_path)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        list_file = _write_series_list(Path(tmp_dir), series_name, image_loc)
+        list_file = _write_series_list(Path(tmp_dir), series_name)
         cmd = [
             "nice",
             settings.java_command,
@@ -215,7 +221,7 @@ def step_run_measure(
         _skip_run(run_id, "no reporter channel in protocol channel_map")
         return
 
-    log_path = ensure_dir(image_loc / "dats") / f"{series_name}-run_measure.log"
+    log_path = ensure_dir(image_loc / "logs") / f"{series_name}-run_measure.log"
 
     with session_scope() as s:
         run = s.get(PipelineStepRun, run_id)
@@ -223,7 +229,7 @@ def step_run_measure(
             run.log_path = str(log_path)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        list_file = _write_series_list(Path(tmp_dir), series_name, image_loc)
+        list_file = _write_series_list(Path(tmp_dir), series_name)
         cmd = [
             "nice",
             settings.java_command,

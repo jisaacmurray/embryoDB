@@ -89,6 +89,7 @@ class RerunStarryNiteDialog(QtWidgets.QDialog):
                     "id": row.id,
                     "name": row.series_name,
                     "image_loc": row.image_loc,
+                    "timepts": row.timepts or "",
                     "params_path": (
                         str(Path(row.image_loc) / "matlabParams") if row.image_loc else None
                     ),
@@ -130,6 +131,9 @@ class RerunStarryNiteDialog(QtWidgets.QDialog):
         self._params_table.setMinimumHeight(220)
 
         # Pre-fill current values from the first series' matlabParams file.
+        # end_time and start_time are also seeded from the DB timepts field
+        # so the dialog always shows the correct acquisition length even if
+        # the matlabParams file still has a stale value.
         current_vals: dict[str, str] = {}
         first = self._series_data[0] if self._series_data else None
         if first and first["params_path"] and Path(first["params_path"]).exists():
@@ -138,6 +142,13 @@ class RerunStarryNiteDialog(QtWidgets.QDialog):
                 current_vals = {k: p.get(k, "") or "" for k in TUNABLE_KEYS}
             except Exception:
                 pass
+        # Override end_time from DB timepts if it's a valid integer.
+        if first:
+            tp = first.get("timepts", "")
+            if tp and str(tp).strip().isdigit():
+                current_vals["end_time"] = str(tp).strip()
+                if "start_time" not in current_vals or not current_vals["start_time"]:
+                    current_vals["start_time"] = "1"
 
         for row_idx, key in enumerate(TUNABLE_KEYS):
             key_item = QtWidgets.QTableWidgetItem(key)

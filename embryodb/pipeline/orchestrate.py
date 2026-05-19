@@ -274,21 +274,27 @@ def step_write_acetree_config(
 
 
 def step_write_embryodb_xml(series: Series, source_xml_dir: Path) -> Path:
-    """Write the legacy embryoDB XML for a freshly-created series.
+    """Write the legacy embryoDB XML for a series.
 
-    Per design discussion: we *add* new files to source-dir so the legacy
-    Java GUI sees new acquisitions immediately, but we never overwrite an
-    existing file there. If a file already exists for this series name, we
-    fail loudly so the user can decide.
+    New acquisitions: writes to source-dir so the legacy Java GUI sees them
+    immediately. Never overwrites an existing file — if one is already there
+    (from a previous import or the legacy Java GUI), reads its content and
+    populates provenance so audit-import stays happy, then returns without
+    modifying the file.
     """
     target = source_xml_dir / f"{series.series_name}.xml"
     if target.exists():
-        raise FileExistsError(
-            f"refusing to overwrite existing legacy XML: {target}"
-        )
+        # Already written (re-import or legacy file). Populate provenance from
+        # the existing file so audit-import round-trips correctly.
+        if not series.xml_source_path:
+            body = target.read_text(encoding="utf-8", errors="replace")
+            series.xml_source_path = str(target)
+            series.xml_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+            series.xml_mtime = datetime.now(tz=timezone.utc)
+            series.raw_xml = body
+        return target
     body = serialize_legacy_xml(_row_to_record(series))
     safe_write_text(target, body)
-    # Populate provenance so audit-import will still pass on this row.
     series.xml_source_path = str(target)
     series.xml_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
     series.xml_mtime = datetime.now(tz=timezone.utc)
@@ -388,23 +394,40 @@ def import_acquisition(
     n_timepoints_from_plan = max((p.n_timepoints for p in plan.positions.values()), default=0)
     raw_timepts = n_timepoints_from_plan or protocol.default_timepts
 
-    # Acquisition row
-    acq = Acquisition(
-        name=acq_name,
-        source_dir=str(source),
-        parser_name=parser_name,
-        protocol=protocol,
-        raw_timepts=raw_timepts,
-        staged_at=datetime.now(tz=timezone.utc),
-        staged_by=_user_for(opts),
-        parameter_overrides=dict(opts.parameter_overrides),
-        person=person,
-        strain_name=strain_name,
-        treatments=treatments,
-        reporter_gene=reporter_gene,
-        comments=comments,
-    )
-    session.add(acq)
+    # Acquisition row — find or create so re-importing the same source dir
+    # is idempotent (wizard submit after a previous run won't crash).
+    acq = session.query(Acquisition).filter_by(name=acq_name).one_or_none()
+    if acq is None:
+        acq = Acquisition(
+            name=acq_name,
+            source_dir=str(source),
+            parser_name=parser_name,
+            protocol=protocol,
+            raw_timepts=raw_timepts,
+            staged_at=datetime.now(tz=timezone.utc),
+            staged_by=_user_for(opts),
+            parameter_overrides=dict(opts.parameter_overrides),
+            person=person,
+            strain_name=strain_name,
+            treatments=treatments,
+            reporter_gene=reporter_gene,
+            comments=comments,
+        )
+        session.add(acq)
+    else:
+        # Update mutable metadata from this call's arguments (non-empty wins).
+        if person:
+            acq.person = person
+        if strain_name:
+            acq.strain_name = strain_name
+        if treatments:
+            acq.treatments = treatments
+        if reporter_gene:
+            acq.reporter_gene = reporter_gene
+        if comments:
+            acq.comments = comments
+        if opts.parameter_overrides:
+            acq.parameter_overrides = dict(opts.parameter_overrides)
     session.flush()
 
     outcomes: list[SeriesOutcome] = []
@@ -413,34 +436,41 @@ def import_acquisition(
         pos_plan = plan.positions[position]
         outcome = SeriesOutcome(series_name=pos_plan.series_name)
 
-        # Series row
+        # Series row — find or create for the same idempotency reason.
         image_loc = _series_image_loc(opts, pos_plan.series_name)
-        # date_acquired defaults to today (YYYYMMDD) so newly-imported
-        # series sort to the top under the default "most recent first"
-        # browser sort. Many acquisition stems start with a date — strip
-        # the first 8 digits and use those if present, matching how the
-        # lab has historically populated this field.
-        stem = pos_plan.series_name
-        date_from_stem = stem[:8] if stem[:8].isdigit() and len(stem) >= 8 else ""
-        date_acquired = date_from_stem or datetime.now(tz=timezone.utc).strftime("%Y%m%d")
-        series = Series(
-            series_name=pos_plan.series_name,
-            date_acquired=date_acquired,
-            person=person or acq.person,
-            strain_name=strain_name or acq.strain_name,
-            treatments=treatments or acq.treatments,
-            reporter_gene=reporter_gene or acq.reporter_gene,
-            image_loc=str(image_loc),
-            annot_loc=str(image_loc),
-            acetree_config=f"{pos_plan.series_name}.xml",
-            timepts=str(pos_plan.n_timepoints or raw_timepts),
-            status=Status.NEW,
-            acquisition=acq,
-            position=position,
-            image_layout=ImageLayout.SPLIT_TIF_PER_PLANE,
-            updated_by=_user_for(opts),
+        existing_series = (
+            session.query(Series)
+            .filter_by(series_name=pos_plan.series_name)
+            .one_or_none()
         )
-        session.add(series)
+        if existing_series is not None:
+            series = existing_series
+            # Re-link to this acquisition if not already linked.
+            if series.acquisition_id is None:
+                series.acquisition = acq
+                series.position = position
+        else:
+            stem = pos_plan.series_name
+            date_from_stem = stem[:8] if stem[:8].isdigit() and len(stem) >= 8 else ""
+            date_acquired = date_from_stem or datetime.now(tz=timezone.utc).strftime("%Y%m%d")
+            series = Series(
+                series_name=pos_plan.series_name,
+                date_acquired=date_acquired,
+                person=person or acq.person,
+                strain_name=strain_name or acq.strain_name,
+                treatments=treatments or acq.treatments,
+                reporter_gene=reporter_gene or acq.reporter_gene,
+                image_loc=str(image_loc),
+                annot_loc=str(image_loc),
+                acetree_config=f"{pos_plan.series_name}.xml",
+                timepts=str(pos_plan.n_timepoints or raw_timepts),
+                status=Status.NEW,
+                acquisition=acq,
+                position=position,
+                image_layout=ImageLayout.SPLIT_TIF_PER_PLANE,
+                updated_by=_user_for(opts),
+            )
+            session.add(series)
         session.flush()
         outcome.series_id = series.id
 

@@ -317,9 +317,14 @@ def test_import_acquisition_end_to_end(
     assert len(pending) == 3 * 2
 
 
-def test_import_refuses_to_overwrite_existing_legacy_xml(
+def test_import_treats_existing_legacy_xml_as_already_done(
     db_session, seeded_protocols, synth_acquisition, tmp_path
 ):
+    """Re-importing when a legacy XML already exists should succeed, not fail.
+
+    The file is left untouched; provenance is populated from the existing
+    content so audit-import stays happy.
+    """
     from sqlalchemy import select
 
     proto = db_session.execute(
@@ -327,9 +332,9 @@ def test_import_refuses_to_overwrite_existing_legacy_xml(
     ).scalar_one()
     legacy_dir = tmp_path / "legacy_xml"
     legacy_dir.mkdir()
-    # Pre-existing file simulates a real legacy XML that the safe-mirror
-    # property forbids us from overwriting.
-    (legacy_dir / "acq_L1.xml").write_text("existing")
+    # Pre-existing file — simulates a re-import or a file written by the
+    # legacy Java GUI.
+    (legacy_dir / "acq_L1.xml").write_text("existing-content")
 
     opts = ImportOptions(
         image_loc_root=tmp_path / "images",
@@ -344,12 +349,19 @@ def test_import_refuses_to_overwrite_existing_legacy_xml(
         options=opts,
         legacy_xml_dir=legacy_dir,
     )
-    # acq_L1 should fail at write_embryodb_xml; acq_L2 should succeed
+    # Both series should succeed — acq_L1 treats the existing file as done.
     by_name = {o.series_name: o for o in result.series_outcomes}
-    assert by_name["acq_L1"].failed_step == "write_embryodb_xml"
+    assert by_name["acq_L1"].failed_step is None
     assert by_name["acq_L2"].failed_step is None
-    # Existing file unchanged
-    assert (legacy_dir / "acq_L1.xml").read_text() == "existing"
+    # Existing file must not have been overwritten.
+    assert (legacy_dir / "acq_L1.xml").read_text() == "existing-content"
+    # Provenance must be populated from the existing file.
+    from sqlalchemy import select as sa_select
+    from embryodb.models import Series as S
+    row = db_session.execute(
+        sa_select(S).where(S.series_name == "acq_L1")
+    ).scalar_one()
+    assert row.xml_source_path == str(legacy_dir / "acq_L1.xml")
 
 
 # ---------------------------------------------------------------------------

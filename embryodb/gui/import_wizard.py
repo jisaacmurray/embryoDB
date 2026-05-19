@@ -19,6 +19,24 @@ from qtpy import QtCore, QtWidgets
 
 from ..config import settings
 from ..parsers.filename import list_parsers
+
+_DEFAULT_ACQ_DIR = "/murrlab3/Images"
+_SETTINGS_KEY = "acquisition/default_dir"
+
+
+def _acq_dir_default() -> str:
+    """Return the user's saved default acquisition directory, or /murrlab3/Images."""
+    s = QtCore.QSettings("MurrayLab", "embryoDB")
+    saved = s.value(_SETTINGS_KEY, "")
+    if saved and Path(str(saved)).is_dir():
+        return str(saved)
+    return _DEFAULT_ACQ_DIR if Path(_DEFAULT_ACQ_DIR).is_dir() else str(Path.home())
+
+
+def _save_acq_dir_default(chosen: str) -> None:
+    """Persist the parent of the chosen directory as the new default."""
+    parent = str(Path(chosen).parent)
+    QtCore.QSettings("MurrayLab", "embryoDB").setValue(_SETTINGS_KEY, parent)
 from ..parsers.matlab_params import TUNABLE_KEYS
 from ..pipeline.orchestrate import (
     DEFAULT_ALIAS_ROOT,
@@ -118,10 +136,11 @@ class SourcePage(QtWidgets.QWizardPage):
 
     def _browse_dir(self) -> None:
         path = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Choose acquisition directory", str(Path.home())
+            self, "Choose acquisition directory", _acq_dir_default()
         )
         if path:
             self._dir_edit.setText(path)
+            _save_acq_dir_default(path)
 
     def _scan(self) -> None:
         source = self._dir_edit.text().strip()

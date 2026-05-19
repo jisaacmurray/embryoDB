@@ -243,8 +243,57 @@ class MainWindow(QtWidgets.QMainWindow):
         if not current.isValid():
             return
         name = self._model.series_name_at(current.row())
-        if name:
-            self._detail.load_series(name)
+        if not name:
+            return
+        if name == self._detail.loaded_series_name():
+            return
+        if self._detail.is_dirty() and not self._prompt_discard_unsaved(
+            f"You have unsaved changes to {self._detail.loaded_series_name()!r}."
+        ):
+            # Revert selection to the previously loaded series without retriggering this handler.
+            if previous.isValid():
+                self._table.selectionModel().blockSignals(True)
+                try:
+                    self._table.selectionModel().setCurrentIndex(
+                        previous, QtCore.QItemSelectionModel.ClearAndSelect | QtCore.QItemSelectionModel.Rows
+                    )
+                finally:
+                    self._table.selectionModel().blockSignals(False)
+            return
+        self._detail.load_series(name)
+
+    def _prompt_discard_unsaved(self, message: str) -> bool:
+        """Ask the user whether to discard unsaved detail-panel edits.
+
+        Returns True if the caller should proceed (user chose Discard or Save).
+        Returns False if the user chose Cancel and the caller should abort.
+        """
+        msg = QtWidgets.QMessageBox(self)
+        msg.setIcon(QtWidgets.QMessageBox.Warning)
+        msg.setWindowTitle("Unsaved changes")
+        msg.setText(message)
+        msg.setInformativeText("Save your changes, discard them, or cancel?")
+        save_btn = msg.addButton("Save", QtWidgets.QMessageBox.AcceptRole)
+        discard_btn = msg.addButton("Discard", QtWidgets.QMessageBox.DestructiveRole)
+        msg.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+        msg.setDefaultButton(save_btn)
+        msg.exec()
+        clicked = msg.clickedButton()
+        if clicked is save_btn:
+            self._detail._on_save()  # noqa: SLF001 — internal call by design
+            return not self._detail.is_dirty()  # if save was vetoed (conflict), abort
+        if clicked is discard_btn:
+            return True
+        return False  # Cancel
+
+    def closeEvent(self, event) -> None:
+        if self._detail.is_dirty():
+            if not self._prompt_discard_unsaved(
+                f"You have unsaved changes to {self._detail.loaded_series_name()!r}."
+            ):
+                event.ignore()
+                return
+        event.accept()
 
     def _selected_series_names(self) -> list[str]:
         rows = self._table.selectionModel().selectedRows()

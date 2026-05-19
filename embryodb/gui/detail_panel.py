@@ -75,7 +75,17 @@ class DetailPanel(QtWidgets.QWidget):
         self._series_name: str | None = None
         self._loaded_version: int | None = None
         self._widgets: dict[str, QtWidgets.QWidget] = {}
+        self._dirty: bool = False
         self._build()
+
+    # --- dirty state ------------------------------------------------------
+
+    def is_dirty(self) -> bool:
+        """True if the user has typed edits that haven't been saved."""
+        return self._dirty and self._series_name is not None
+
+    def loaded_series_name(self) -> str | None:
+        return self._series_name
 
     # --- public API -------------------------------------------------------
 
@@ -357,6 +367,7 @@ class DetailPanel(QtWidgets.QWidget):
         self._rerun_btn.setEnabled(False)
         self._set_enabled(False)
         self._loaded_version = None
+        self._dirty = False
         self._dirty_label.setText("")
 
     def _populate_from_row(self, row: Series, session: Session) -> None:
@@ -381,6 +392,7 @@ class DetailPanel(QtWidgets.QWidget):
         self._loaded_version = row.version
         self._populate_pipeline_table(row)
         self._set_enabled(True)
+        self._dirty = False
         self._dirty_label.setText("")
         # Refresh combo suggestions
         self.populate_combo_choices(session)
@@ -425,6 +437,7 @@ class DetailPanel(QtWidgets.QWidget):
         self._edit_acetree_button.setEnabled(enabled)
 
     def _on_dirty(self, *_args: object) -> None:
+        self._dirty = True
         self._dirty_label.setText("• unsaved changes")
 
     def _on_reload(self) -> None:
@@ -475,6 +488,7 @@ class DetailPanel(QtWidgets.QWidget):
             session.flush()
             new_version = row.version
         self._loaded_version = new_version
+        self._dirty = False
         self._dirty_label.setText(f"saved (version {new_version})")
         self.saved.emit(self._series_name)
         self.load_series(self._series_name)  # refresh provenance fields

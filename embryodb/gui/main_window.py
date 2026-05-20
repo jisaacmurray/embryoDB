@@ -416,21 +416,102 @@ class MainWindow(QtWidgets.QMainWindow):
         if not selected:
             return
         menu = QtWidgets.QMenu(self)
-        label = f"Re-run StarryNite… ({len(selected)} series)" if len(selected) > 1 else "Re-run StarryNite…"
-        act_rerun = menu.addAction(label)
-        act_rerun.triggered.connect(self._on_rerun_starrynite)
+        n = len(selected)
+        n_suffix = f" ({n} selected)" if n > 1 else ""
+
+        # Selection expansion
+        act_expand = menu.addAction(f"Select all from same acquisition{n_suffix}")
+        act_expand.triggered.connect(self._on_select_same_acquisition)
+        menu.addSeparator()
+
+        # Bulk edit metadata
+        act_bulk = menu.addAction(f"Bulk edit metadata…{n_suffix}")
+        act_bulk.triggered.connect(self._on_bulk_edit_metadata)
+
+        # Re-run pipeline
+        act_rerun = menu.addAction(f"Re-run pipeline…{n_suffix}")
+        act_rerun.triggered.connect(self._on_rerun_pipeline)
+
         menu.exec(self._table.viewport().mapToGlobal(pos))
 
-    def _on_rerun_starrynite(self) -> None:
+    def _on_select_same_acquisition(self) -> None:
+        """Expand the current selection to include every series sharing an
+        acquisition with any currently-selected row."""
+        from sqlalchemy import select
+        from ..models import Series
+
+        seed = self._selected_series_names()
+        if not seed:
+            return
+        with self._session_cm() as s:
+            acq_ids = set()
+            unlinked: list[str] = []
+            for name in seed:
+                row = s.execute(
+                    select(Series).where(Series.series_name == name)
+                ).scalar_one_or_none()
+                if row is None:
+                    continue
+                if row.acquisition_id is None:
+                    unlinked.append(name)
+                else:
+                    acq_ids.add(row.acquisition_id)
+            if not acq_ids:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "No acquisition",
+                    "None of the selected series are linked to an acquisition.\n"
+                    "(Legacy XML imports have no acquisition_id.)",
+                )
+                return
+            all_names = set(
+                s.execute(
+                    select(Series.series_name).where(Series.acquisition_id.in_(acq_ids))
+                ).scalars()
+            )
+        # Add the unlinked seed rows so the user doesn't lose their starting selection.
+        all_names.update(unlinked)
+        # Update the table selection in-place.
+        sel_model = self._table.selectionModel()
+        sel_model.blockSignals(True)
+        try:
+            sel_model.clearSelection()
+            n_cols = self._model.columnCount()
+            for r in range(self._model.rowCount()):
+                name = self._model.series_name_at(r)
+                if name in all_names:
+                    top = self._model.index(r, 0)
+                    bottom = self._model.index(r, n_cols - 1)
+                    sel_model.select(
+                        QtCore.QItemSelection(top, bottom),
+                        QtCore.QItemSelectionModel.Select,
+                    )
+        finally:
+            sel_model.blockSignals(False)
+        self.statusBar().showMessage(
+            f"Selection expanded to {len(all_names)} series ({len(acq_ids)} acquisitions).",
+            5000,
+        )
+
+    def _on_bulk_edit_metadata(self) -> None:
         selected = self._selected_series_names()
         if not selected:
             return
-        from .rerun_dialog import RerunStarryNiteDialog
-        dlg = RerunStarryNiteDialog(self._session_cm, selected, parent=self)
+        from .bulk_edit_dialog import BulkEditMetadataDialog
+        dlg = BulkEditMetadataDialog(self._session_cm, selected, parent=self)
+        if dlg.exec():
+            self._refresh_table()
+
+    def _on_rerun_pipeline(self) -> None:
+        selected = self._selected_series_names()
+        if not selected:
+            return
+        from .rerun_dialog import RerunPipelineDialog
+        dlg = RerunPipelineDialog(self._session_cm, selected, parent=self)
         if dlg.exec():
             self._refresh_table()
             self.statusBar().showMessage(
-                f"Re-queued StarryNite for {len(selected)} series.", 5000
+                f"Re-queued pipeline for {len(selected)} series.", 5000
             )
 
     # --- pipeline import wizard -------------------------------------------

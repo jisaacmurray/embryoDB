@@ -197,9 +197,9 @@ class DetailPanel(QtWidgets.QWidget):
         self._pipeline_table.setMinimumHeight(120)
         pipe_vl.addWidget(self._pipeline_table)
 
-        self._rerun_btn = QtWidgets.QPushButton("Re-run StarryNite…")
+        self._rerun_btn = QtWidgets.QPushButton("Re-run pipeline…")
         self._rerun_btn.setEnabled(False)
-        self._rerun_btn.clicked.connect(self._on_rerun_starrynite)
+        self._rerun_btn.clicked.connect(self._on_rerun_pipeline)
         pipe_vl.addWidget(self._rerun_btn)
 
         right_layout.addWidget(pipe_box)
@@ -347,11 +347,11 @@ class DetailPanel(QtWidgets.QWidget):
         layout.addWidget(close_btn)
         dlg.exec()
 
-    def _on_rerun_starrynite(self) -> None:
+    def _on_rerun_pipeline(self) -> None:
         if not self._series_name:
             return
-        from .rerun_dialog import RerunStarryNiteDialog
-        dlg = RerunStarryNiteDialog(
+        from .rerun_dialog import RerunPipelineDialog
+        dlg = RerunPipelineDialog(
             self._session_factory, [self._series_name], parent=self
         )
         if dlg.exec():

@@ -300,24 +300,50 @@ class MetadataPage(QtWidgets.QWizardPage):
         layout.addRow(self._params_table)
 
     def initializePage(self) -> None:
-        """Pre-fill protocol defaults into the table."""
+        """Pre-fill protocol defaults into the table.
+
+        Column 1 ("Protocol default") gets the value from the chosen
+        protocol's parameter file. Column 2 ("Override") gets a sensible
+        per-acquisition default where one is obvious — start_time=1 and
+        end_time=min(observed timepoints across all positions). The minimum
+        is chosen so the run is safe across every position; the user can
+        bump it for individual series later via Re-run pipeline.
+        """
         wizard = self.wizard()
         plan = getattr(wizard, "_plan", None)
-        # Try to fetch protocol defaults from DB.
         source_page: SourcePage = wizard.page(0)  # type: ignore[assignment]
         proto_id = source_page.protocol_id() if source_page else None
-        if proto_id is None:
-            return
-        try:
-            with wizard._session_cm() as s:  # type: ignore[attr-defined]
-                from ..models import Protocol
-                proto = s.get(Protocol, proto_id)
-                if proto and proto.defaults:
-                    for row_idx, key in enumerate(TUNABLE_KEYS):
-                        val = proto.defaults.get(key, "")
-                        self._params_table.item(row_idx, 1).setText(str(val))
-        except Exception:
-            pass
+        if proto_id is not None:
+            try:
+                with wizard._session_cm() as s:  # type: ignore[attr-defined]
+                    from ..models import Protocol
+                    proto = s.get(Protocol, proto_id)
+                    if proto and proto.defaults:
+                        for row_idx, key in enumerate(TUNABLE_KEYS):
+                            val = proto.defaults.get(key, "")
+                            self._params_table.item(row_idx, 1).setText(str(val))
+            except Exception:
+                pass
+
+        # Auto-fill Override column with per-acquisition defaults.
+        if plan is not None and plan.positions:
+            min_tp = min(pp.n_timepoints for pp in plan.positions.values())
+            max_tp = max(pp.n_timepoints for pp in plan.positions.values())
+            for row_idx, key in enumerate(TUNABLE_KEYS):
+                override_item = self._params_table.item(row_idx, 2)
+                if override_item is None or override_item.text().strip():
+                    continue  # don't overwrite a user-typed value
+                if key == "end_time":
+                    override_item.setText(str(min_tp))
+                    if min_tp != max_tp:
+                        override_item.setToolTip(
+                            f"Positions in this acquisition have between {min_tp} "
+                            f"and {max_tp} timepoints. Default uses the minimum so "
+                            f"every position can be analysed. Adjust per-series "
+                            f"later via Re-run pipeline."
+                        )
+                elif key == "start_time":
+                    override_item.setText("1")
 
     def parameter_overrides(self) -> dict[str, str]:
         overrides: dict[str, str] = {}

@@ -219,8 +219,11 @@ def _apply_microscopy_row(
         return
     existing = series.microscopy
     new = _microscopy_row(md, raw_path=raw_path)
-    # Copy over every mutable column from `new` to `existing`. The series_id
-    # FK and primary key stay on `existing` so no new row is inserted.
+    # Copy over every mutable column from `new` to `existing`, but skip None
+    # values. SQLAlchemy column defaults (default="") only apply at INSERT
+    # time, so the in-memory `new` instance has None for unspecified string
+    # columns — pushing those over the existing values would violate NOT NULL
+    # constraints. Partial re-parses also shouldn't wipe previously-good data.
     for col in (
         "vendor", "instrument", "objective", "objective_NA", "magnification",
         "immersion", "refractive_index", "voxel_xy_um", "voxel_z_um",
@@ -230,7 +233,9 @@ def _apply_microscopy_row(
         "stage_x_um", "stage_y_um", "stage_z_um", "acquired_at",
         "raw_metadata_path",
     ):
-        setattr(existing, col, getattr(new, col))
+        val = getattr(new, col)
+        if val is not None:
+            setattr(existing, col, val)
 
 
 def _microscopy_row(md: LeicaMetadata, raw_path: str | None = None) -> MicroscopyMetadata:

@@ -394,6 +394,21 @@ class TargetsPage(QtWidgets.QWizardPage):
         self._legacy_xml_edit, row3 = self._path_row(str(settings.source_dir))
         layout.addRow("Legacy XML dir:", row3)
 
+        # Overwrite checkbox: replaces existing staged TIFs in image_loc with
+        # freshly-staged copies from the source directory. Useful when the
+        # source data has been updated (e.g. additional timepoints copied in).
+        self._overwrite_check = QtWidgets.QCheckBox(
+            "Overwrite existing staged images (re-copy from source)"
+        )
+        self._overwrite_check.setToolTip(
+            "When unchecked (default), stage_images skips files that already exist "
+            "on disk — safe for re-runs that just want to fill in missing positions. "
+            "Check this when the source acquisition has new or updated content that "
+            "must replace what's already staged."
+        )
+        self._overwrite_check.setChecked(False)
+        layout.addRow("", self._overwrite_check)
+
         self._disk_label = QtWidgets.QLabel("—")
         layout.addRow("Est. disk usage:", self._disk_label)
 
@@ -451,6 +466,9 @@ class TargetsPage(QtWidgets.QWizardPage):
 
     def legacy_xml_dir(self) -> Path:
         return Path(self._legacy_xml_edit.text().strip())
+
+    def overwrite_existing_images(self) -> bool:
+        return self._overwrite_check.isChecked()
 
 
 # ---------------------------------------------------------------------------
@@ -551,6 +569,7 @@ class ImportWizard(QtWidgets.QWizard):
             alias_root=targets_page.alias_root(),
             user=meta_page.person() or settings.user,
             parameter_overrides=meta_page.parameter_overrides(),
+            overwrite_existing_images=targets_page.overwrite_existing_images(),
             run_through_step="write_matlab_params",
         )
 

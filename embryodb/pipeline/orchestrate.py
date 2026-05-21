@@ -200,10 +200,37 @@ def step_stage_metadata(
         if entry.name.endswith(f"_Position {position}_Properties.xml"):
             try:
                 md = parse_properties_xml(entry)
-                series.microscopy = _microscopy_row(md, raw_path=str(entry))
+                _apply_microscopy_row(series, md, raw_path=str(entry))
             except Exception as exc:
                 log.warning("failed to parse %s: %s", entry, exc)
     return md, copied
+
+
+def _apply_microscopy_row(
+    series: Series, md: LeicaMetadata, raw_path: str | None = None
+) -> None:
+    """Create or update the MicroscopyMetadata row attached to `series`.
+
+    Idempotent: on re-import, updates the existing row in place rather than
+    inserting a duplicate (which would violate the unique series_id constraint).
+    """
+    if series.microscopy is None:
+        series.microscopy = _microscopy_row(md, raw_path=raw_path)
+        return
+    existing = series.microscopy
+    new = _microscopy_row(md, raw_path=raw_path)
+    # Copy over every mutable column from `new` to `existing`. The series_id
+    # FK and primary key stay on `existing` so no new row is inserted.
+    for col in (
+        "vendor", "instrument", "objective", "objective_NA", "magnification",
+        "immersion", "refractive_index", "voxel_xy_um", "voxel_z_um",
+        "planes_per_volume", "channels_per_plane", "x_pixels", "y_pixels",
+        "n_timepoints", "cycle_time_s", "pinhole_um", "pinhole_airy",
+        "scan_speed_hz", "line_averaging", "frame_averaging", "channels",
+        "stage_x_um", "stage_y_um", "stage_z_um", "acquired_at",
+        "raw_metadata_path",
+    ):
+        setattr(existing, col, getattr(new, col))
 
 
 def _microscopy_row(md: LeicaMetadata, raw_path: str | None = None) -> MicroscopyMetadata:

@@ -481,6 +481,21 @@ def import_acquisition(
             if series.acquisition_id is None:
                 series.acquisition = acq
                 series.position = position
+            # Propagate wizard metadata to existing series. Non-empty values
+            # win — user is explicitly providing them in this import. (Any
+            # per-series edits the user wanted to keep are overwritten;
+            # they can re-apply via the detail panel afterwards.)
+            if person:
+                series.person = person
+            if strain_name:
+                series.strain_name = strain_name
+            if treatments:
+                series.treatments = treatments
+            if reporter_gene:
+                series.reporter_gene = reporter_gene
+            if comments:
+                series.comments = comments
+            series.updated_by = _user_for(opts)
         else:
             stem = pos_plan.series_name
             date_from_stem = stem[:8] if stem[:8].isdigit() and len(stem) >= 8 else ""
@@ -509,6 +524,22 @@ def import_acquisition(
         # Pre-create PENDING rows for every step so the GUI can show them.
         for step in STEPS:
             _get_or_create_run(session, series.id, step)
+
+        # On overwrite: reset worker (subprocess) steps to PENDING so the
+        # worker re-runs analysis against the freshly-staged images. Without
+        # this, "Overwrite existing staged images" would replace the TIFs on
+        # disk but leave the old SN/RedExtract/Measure outputs marked
+        # COMPLETE — the user's screenshot showed exactly that mismatch.
+        if opts.overwrite_existing_images:
+            for ws in ("run_starrynite", "run_red_extract", "run_measure"):
+                wrun = _get_or_create_run(session, series.id, ws)
+                wrun.status = RunStatus.PENDING
+                wrun.started_at = None
+                wrun.completed_at = None
+                wrun.heartbeat_at = None
+                wrun.error_excerpt = None
+                wrun.log_path = None
+                wrun.output_summary = {}
 
         # --- step 1: stage_images
         outcome.image_loc = image_loc
@@ -578,6 +609,11 @@ def import_acquisition(
             or (getattr(series.microscopy, "n_timepoints", None) if series.microscopy else None)
             or raw_timepts
         )
+        # Keep series.timepts in sync with what's actually on disk. After a
+        # re-stage with new files, the original timepts (set at series-create
+        # time) may be stale.
+        if n_tp:
+            series.timepts = str(n_tp)
 
         # --- step 3: write_acetree_config
         if stop_after >= 2:

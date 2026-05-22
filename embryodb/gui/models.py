@@ -30,7 +30,7 @@ class Filters:
     date_before: str | None = None
     date_after: str | None = None
     text: str | None = None
-    text_in_comments_only: bool = True
+    text_in_comments_only: bool = False
     dataset_id: int | None = None
     limit: int | None = None
 

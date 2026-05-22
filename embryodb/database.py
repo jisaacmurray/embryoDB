@@ -92,6 +92,9 @@ def _apply_additive_migrations(engine: Engine) -> None:
             ("deleted_at", "TIMESTAMP"),
             ("deleted_by", "VARCHAR(64)"),
         ],
+        "pipeline_step_runs": [
+            ("not_before", "TIMESTAMP"),
+        ],
     }
     inspector = inspect(engine)
     existing_tables = set(inspector.get_table_names())

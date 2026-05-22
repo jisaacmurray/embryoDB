@@ -244,9 +244,186 @@ def step_run_measure(
     _finish_run(run_id, log_path, returncode)
 
 
+def step_stage_images(series_id: int, run_id: int) -> None:
+    """Worker-side staging: copy + LZW-compress raw TIFs into the series'
+    image_loc. The orchestrator skips its inline stage_images when the user
+    requested a delay; this function is what the worker eventually runs.
+
+    All required inputs (source_dir, protocol, image_loc_root, position) are
+    rehydrated from the DB so the worker doesn't need the caller's
+    Python-side state.
+    """
+    from .stage import plan_acquisition, stage_position
+    from ..models import Acquisition, Series
+
+    log_path: Path | None = None
+    started_at = datetime.now(tz=timezone.utc)
+
+    # Resolve everything we need from the DB up front.
+    with session_scope() as s:
+        series = s.get(Series, series_id)
+        if series is None:
+            _fail_run_now(run_id, f"series id={series_id} not found")
+            return
+        if series.acquisition_id is None:
+            _fail_run_now(run_id, f"series {series.series_name!r} has no acquisition; cannot re-stage")
+            return
+        acq = s.get(Acquisition, series.acquisition_id)
+        if acq is None or not acq.source_dir:
+            _fail_run_now(run_id, f"acquisition {series.acquisition_id} has no source_dir")
+            return
+        protocol = acq.protocol
+        if protocol is None:
+            _fail_run_now(run_id, f"acquisition {acq.name!r} has no protocol")
+            return
+
+        # Capture all the scalars we need; ORM objects expire after the
+        # session closes.
+        series_name = series.series_name
+        position = series.position
+        if position is None:
+            _fail_run_now(run_id, f"series {series_name!r} has no position recorded")
+            return
+        source_dir = Path(acq.source_dir)
+        parser_name = acq.parser_name or "leica_tilescan"
+        image_loc = Path(series.image_loc) if series.image_loc else None
+        if image_loc is None:
+            _fail_run_now(run_id, f"series {series_name!r} has no image_loc")
+            return
+        # image_loc_root is the parent-of-parent of image_loc:
+        # /murrlab3/<user>/images/<series>/   →   /murrlab3/<user>/images/
+        image_loc_root = image_loc.parent
+        slices_str = (protocol.defaults or {}).get("slices") or ""
+        slices = int(slices_str) if slices_str.isdigit() else 67
+        # channel_map keys come out of JSON as strings; the staging code
+        # expects int keys.
+        channel_map = {int(k): v for k, v in (protocol.channel_map or {}).items()}
+
+    # Log location matches the other subprocess steps.
+    log_path = ensure_dir(image_loc / "logs") / f"{series_name}-stage_images.log"
+    with session_scope() as s:
+        run = s.get(PipelineStepRun, run_id)
+        if run is not None:
+            run.log_path = str(log_path)
+            run.started_at = started_at
+            run.heartbeat_at = started_at
+
+    try:
+        if not source_dir.is_dir():
+            raise FileNotFoundError(
+                f"source_dir does not exist: {source_dir}  "
+                "(was it deleted between scheduling and now?)"
+            )
+        plan = plan_acquisition(source_dir, _DummyProtocol(channel_map), parser_name=parser_name)
+        if position not in plan.positions:
+            raise ValueError(
+                f"position {position} not found in {source_dir} (plan had positions: "
+                f"{sorted(plan.positions)})"
+            )
+        pos_plan = plan.positions[position]
+        # Stage with periodic heartbeat updates. stage_position is blocking
+        # and single-threaded; we run it on a background thread so the main
+        # thread can heartbeat without waiting for I/O completion.
+        outcome_holder: dict[str, object] = {}
+        exc_holder: list[BaseException] = []
+
+        def _do_stage():
+            try:
+                outcome_holder["out"] = stage_position(
+                    pos_plan,
+                    channel_map,
+                    image_loc_root=image_loc_root,
+                    slices=slices,
+                    compress_with_lzw=True,
+                    overwrite=True,  # worker re-runs always overwrite
+                )
+            except BaseException as exc:
+                exc_holder.append(exc)
+
+        import threading
+        t = threading.Thread(target=_do_stage, daemon=True)
+        t.start()
+        while t.is_alive():
+            t.join(timeout=HEARTBEAT_INTERVAL)
+            try:
+                with session_scope() as s:
+                    run = s.get(PipelineStepRun, run_id)
+                    if run is not None:
+                        run.heartbeat_at = datetime.now(tz=timezone.utc)
+            except Exception:
+                pass
+
+        if exc_holder:
+            raise exc_holder[0]
+
+        outcome = outcome_holder.get("out")
+        # Write a brief summary into the log.
+        try:
+            with open(log_path, "w", encoding="utf-8") as fp:
+                fp.write(
+                    f"stage_images for {series_name}\n"
+                    f"  source_dir: {source_dir}\n"
+                    f"  position:   {position}\n"
+                    f"  image_loc:  {image_loc}\n"
+                    f"  raw count:  {plan.raw_count}\n"
+                    f"  written:    {getattr(outcome, 'written', 0)}\n"
+                    f"  skipped:    {getattr(outcome, 'skipped', 0)}\n"
+                    f"  errors:     {len(getattr(outcome, 'errors', []))}\n"
+                )
+                for name, err in getattr(outcome, "errors", []):
+                    fp.write(f"  err: {name}: {err}\n")
+        except OSError:
+            pass
+
+        # Record success — also update series.timepts from the actual staged
+        # file count, mirroring what the inline orchestrator does.
+        with session_scope() as s:
+            run = s.get(PipelineStepRun, run_id)
+            if run is not None:
+                run.status = RunStatus.COMPLETE
+                run.completed_at = datetime.now(tz=timezone.utc)
+                run.output_summary = {
+                    "written": getattr(outcome, "written", 0),
+                    "skipped": getattr(outcome, "skipped", 0),
+                    "errors": len(getattr(outcome, "errors", [])),
+                }
+            series = s.get(Series, series_id)
+            if series is not None:
+                series.timepts = str(pos_plan.n_timepoints)
+    except BaseException as exc:  # noqa: BLE001 — we need the full message
+        _fail_run_now(run_id, f"{type(exc).__name__}: {exc}", log_path=log_path)
+
+
+def _fail_run_now(run_id: int, message: str, log_path: Path | None = None) -> None:
+    """Mark a step run as FAILED with `message` as the error_excerpt."""
+    with session_scope() as s:
+        run = s.get(PipelineStepRun, run_id)
+        if run is None:
+            return
+        run.status = RunStatus.FAILED
+        run.completed_at = datetime.now(tz=timezone.utc)
+        run.error_excerpt = message[:1024]
+        if log_path is not None:
+            run.log_path = str(log_path)
+    if log_path is not None:
+        try:
+            with open(log_path, "a", encoding="utf-8") as fp:
+                fp.write(f"\nFAILED: {message}\n")
+        except OSError:
+            pass
+
+
+class _DummyProtocol:
+    """Minimal stand-in for the ORM Protocol object so plan_acquisition can
+    read .channel_map without needing a live SQLAlchemy session."""
+    def __init__(self, channel_map: dict[int, str]) -> None:
+        self.channel_map = {str(k): v for k, v in channel_map.items()}
+
+
 __all__ = [
     "step_run_starrynite",
     "step_run_red_extract",
     "step_run_measure",
+    "step_stage_images",
     "HEARTBEAT_INTERVAL",
 ]

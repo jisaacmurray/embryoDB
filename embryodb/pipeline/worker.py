@@ -54,7 +54,12 @@ from ..models import (
 from . import subprocess_steps
 
 # Steps handled by this worker (in execution order within a series).
-WORKER_STEPS = ("run_starrynite", "run_red_extract", "run_measure")
+# stage_images is here so the heavy I/O step can be scheduled (delayed) via
+# PipelineStepRun.not_before. Inline steps that run in the orchestrator
+# (stage_metadata, write_acetree_config, write_embryodb_xml,
+# create_alias_symlink, write_matlab_params) are not in this tuple — those
+# are fast and stay synchronous in import_acquisition.
+WORKER_STEPS = ("stage_images", "run_starrynite", "run_red_extract", "run_measure")
 
 # A RUNNING row with heartbeat_at older than this is assumed crashed.
 STALE_THRESHOLD = timedelta(minutes=5)
@@ -145,11 +150,14 @@ def _reset_stale_running(session) -> int:
 
 
 def _prerequisite_ok(session, series_id: int, step: str) -> bool:
-    """Return True if all steps preceding `step` are COMPLETE or SKIPPED."""
-    # Inline steps (1-6) must all be done. If write_matlab_params doesn't
-    # exist (backfilled series), we treat it as satisfied.
+    """Return True if all steps preceding `step` are COMPLETE or SKIPPED.
+
+    Inline steps must all be done before any worker step. Within worker
+    steps, ordering follows WORKER_STEPS.
+    """
+    # stage_images was moved out of inline_steps once it became
+    # worker-runnable for off-hours scheduling.
     inline_steps = (
-        "stage_images",
         "stage_metadata",
         "write_acetree_config",
         "write_embryodb_xml",
@@ -189,14 +197,21 @@ def _next_work_item(session) -> tuple[Series, str, PipelineStepRun] | None:
     row belonging to the series with the lowest id, subject to all
     prerequisite steps being COMPLETE/SKIPPED.
     """
-    # Candidate runs: PENDING worker-step rows ordered by series.id ASC,
-    # then by the canonical WORKER_STEPS order.
+    # Candidate runs: PENDING worker-step rows ordered by series.id ASC.
+    # Also exclude rows whose `not_before` is still in the future (off-hours
+    # scheduling).
+    from sqlalchemy import or_
+    now = datetime.now(tz=timezone.utc)
     candidates = (
         session.query(PipelineStepRun, Series)
         .join(Series, PipelineStepRun.series_id == Series.id)
         .filter(
             PipelineStepRun.step.in_(WORKER_STEPS),
             PipelineStepRun.status == RunStatus.PENDING,
+            or_(
+                PipelineStepRun.not_before.is_(None),
+                PipelineStepRun.not_before <= now,
+            ),
         )
         .order_by(Series.id.asc())
         .all()
@@ -293,7 +308,9 @@ def run_worker() -> None:
             continue
 
         # Run the subprocess step (manages its own DB sessions for heartbeats).
-        if step_name == "run_starrynite":
+        if step_name == "stage_images":
+            subprocess_steps.step_stage_images(series_id, run_id)
+        elif step_name == "run_starrynite":
             subprocess_steps.step_run_starrynite(
                 series_id, series_name, image_loc, run_id
             )

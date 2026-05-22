@@ -191,7 +191,7 @@ class FilterBar(QtWidgets.QWidget):
 
         # Text search
         self._text_in_comments_only = QtWidgets.QCheckBox("Comments only")
-        self._text_in_comments_only.setChecked(True)
+        self._text_in_comments_only.setChecked(False)
         self._text_in_comments_only.toggled.connect(self.filtersChanged.emit)
         layout.addWidget(self._text_in_comments_only)
 

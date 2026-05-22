@@ -90,6 +90,12 @@ class ImportOptions:
     # and leaves the StarryNite + acebatch3 steps as PENDING rows for the
     # worker to pick up later.
     run_through_step: str = "write_matlab_params"
+    # Off-hours scheduling: when > 0, the orchestrator skips inline
+    # stage_images and instead writes `not_before = now + delay_hours` on
+    # stage_images + every worker step row. The worker picks them up after
+    # the delay elapses. Heavy I/O (compression+copy) is the dominant cost
+    # of import; deferring it spares other lab users during work hours.
+    delay_hours: float = 0.0
 
 
 @dataclass
@@ -541,41 +547,61 @@ def import_acquisition(
                 wrun.log_path = None
                 wrun.output_summary = {}
 
-        # --- step 1: stage_images
+        # --- step 1: stage_images (or schedule it for the worker)
         outcome.image_loc = image_loc
         if stop_after >= 0:
             run = _get_or_create_run(session, series.id, "stage_images")
-            _begin(run)
-            try:
-                slices = protocol.defaults.get("slices")
-                slices_int = int(slices) if slices and slices.isdigit() else (
-                    pos_plan.planes_per_volume or 67
-                )
-                stage_outcome = stage_position(
-                    pos_plan,
-                    plan.channel_map,
-                    image_loc_root=opts.image_loc_root / _user_for(opts) / "images",
-                    slices=slices_int,
-                    compress_with_lzw=opts.compress_with_lzw,
-                    overwrite=opts.overwrite_existing_images,
-                )
-                outcome.stage_outcome = stage_outcome
-                _complete(
-                    run,
-                    {
-                        "written": stage_outcome.written,
-                        "skipped": stage_outcome.skipped,
-                        "errors": len(stage_outcome.errors),
-                    },
-                )
-                outcome.steps["stage_images"] = RunStatus.COMPLETE
-            except Exception as exc:
-                _fail(run, exc)
-                outcome.steps["stage_images"] = RunStatus.FAILED
-                outcome.failed_step = "stage_images"
-                outcome.error = repr(exc)
-                outcomes.append(outcome)
-                continue
+            if opts.delay_hours > 0:
+                # Defer to worker. Set not_before so the worker waits the
+                # requested delay, and also push the same delay onto the
+                # downstream worker steps so the queue stays serialised.
+                from datetime import timedelta as _td
+                not_before = datetime.now(tz=timezone.utc) + _td(hours=opts.delay_hours)
+                run.status = RunStatus.PENDING
+                run.started_at = None
+                run.completed_at = None
+                run.heartbeat_at = None
+                run.error_excerpt = None
+                run.log_path = None
+                run.output_summary = {}
+                run.not_before = not_before
+                for ws in ("run_starrynite", "run_red_extract", "run_measure"):
+                    wrun = _get_or_create_run(session, series.id, ws)
+                    if wrun.status == RunStatus.PENDING:
+                        wrun.not_before = not_before
+                outcome.steps["stage_images"] = RunStatus.PENDING
+            else:
+                _begin(run)
+                try:
+                    slices = protocol.defaults.get("slices")
+                    slices_int = int(slices) if slices and slices.isdigit() else (
+                        pos_plan.planes_per_volume or 67
+                    )
+                    stage_outcome = stage_position(
+                        pos_plan,
+                        plan.channel_map,
+                        image_loc_root=opts.image_loc_root / _user_for(opts) / "images",
+                        slices=slices_int,
+                        compress_with_lzw=opts.compress_with_lzw,
+                        overwrite=opts.overwrite_existing_images,
+                    )
+                    outcome.stage_outcome = stage_outcome
+                    _complete(
+                        run,
+                        {
+                            "written": stage_outcome.written,
+                            "skipped": stage_outcome.skipped,
+                            "errors": len(stage_outcome.errors),
+                        },
+                    )
+                    outcome.steps["stage_images"] = RunStatus.COMPLETE
+                except Exception as exc:
+                    _fail(run, exc)
+                    outcome.steps["stage_images"] = RunStatus.FAILED
+                    outcome.failed_step = "stage_images"
+                    outcome.error = repr(exc)
+                    outcomes.append(outcome)
+                    continue
 
         # --- step 2: stage_metadata
         if stop_after >= 1:

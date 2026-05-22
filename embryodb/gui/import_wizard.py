@@ -24,6 +24,19 @@ _DEFAULT_ACQ_DIR = "/murrlab3/Images"
 _SETTINGS_KEY = "acquisition/default_dir"
 
 
+def _default_delay_until_9pm() -> float:
+    """Hours from now until the next 21:00 local. Returns 0 if we're past 9 PM
+    and haven't rolled into the next day (i.e. between 21:00 and 24:00)."""
+    from datetime import datetime, timedelta
+    now = datetime.now()
+    target = now.replace(hour=21, minute=0, second=0, microsecond=0)
+    if target <= now:
+        # Past 9 PM today — defer to tomorrow's 9 PM only if user explicitly
+        # wants it. For an immediate "start now" default, return 0.
+        return 0.0
+    return (target - now).total_seconds() / 3600.0
+
+
 def _acq_dir_default() -> str:
     """Return the user's saved default acquisition directory, or /murrlab3/Images."""
     s = QtCore.QSettings("MurrayLab", "embryoDB")
@@ -435,6 +448,23 @@ class TargetsPage(QtWidgets.QWizardPage):
         self._overwrite_check.setChecked(False)
         layout.addRow("", self._overwrite_check)
 
+        # Delay (hours): defer staging + downstream worker steps to off-hours.
+        # Default = hours until next 21:00 (9 PM), capped at 0..72.
+        self._delay_spin = QtWidgets.QDoubleSpinBox()
+        self._delay_spin.setRange(0.0, 72.0)
+        self._delay_spin.setSingleStep(0.5)
+        self._delay_spin.setDecimals(1)
+        self._delay_spin.setSuffix(" h")
+        self._delay_spin.setValue(_default_delay_until_9pm())
+        self._delay_spin.setToolTip(
+            "Defer stage_images (image copy + LZW compression) and the downstream "
+            "StarryNite / Red Extract / Measure steps until this many hours from "
+            "now. Default = hours until 9 PM. Set to 0 to start immediately. "
+            "All other inline steps (metadata, AceTree config, embryoDB XML, "
+            "symlink, matlabParams) still run synchronously."
+        )
+        layout.addRow("Delay (hours):", self._delay_spin)
+
         self._disk_label = QtWidgets.QLabel("—")
         layout.addRow("Est. disk usage:", self._disk_label)
 
@@ -495,6 +525,9 @@ class TargetsPage(QtWidgets.QWizardPage):
 
     def overwrite_existing_images(self) -> bool:
         return self._overwrite_check.isChecked()
+
+    def delay_hours(self) -> float:
+        return float(self._delay_spin.value())
 
 
 # ---------------------------------------------------------------------------
@@ -615,6 +648,7 @@ class ImportWizard(QtWidgets.QWizard):
             user=meta_page.person() or settings.user,
             parameter_overrides=meta_page.parameter_overrides(),
             overwrite_existing_images=targets_page.overwrite_existing_images(),
+            delay_hours=targets_page.delay_hours(),
             run_through_step="write_matlab_params",
         )
 

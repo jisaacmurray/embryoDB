@@ -668,3 +668,85 @@ def test_worker_respects_series_order(db_session):
     result = _next_work_item(db_session)
     assert result is not None
     assert result[0].id == min(s1.id, s2.id)
+
+
+def test_worker_respects_not_before(db_session):
+    """_next_work_item skips runs whose not_before is in the future."""
+    from datetime import datetime, timedelta, timezone
+    from embryodb.pipeline.worker import _next_work_item
+
+    series = _make_full_pipeline_series(db_session, "delayed_L1")
+    # Switch stage_images from COMPLETE (the fixture default for legacy
+    # inline-mode runs) to PENDING with a future not_before — simulating
+    # what the orchestrator does when delay_hours > 0.
+    future = datetime.now(tz=timezone.utc) + timedelta(hours=2)
+    for r in series.runs:
+        if r.step == "stage_images":
+            r.status = RunStatus.PENDING
+            r.not_before = future
+        elif r.step in ("run_starrynite", "run_red_extract", "run_measure"):
+            r.not_before = future
+    db_session.flush()
+
+    assert _next_work_item(db_session) is None
+
+    # Once the delay elapses (simulate by clearing not_before), the worker
+    # picks up stage_images first (lowest step in WORKER_STEPS order).
+    for r in series.runs:
+        if r.step == "stage_images":
+            r.not_before = None
+    db_session.flush()
+    result = _next_work_item(db_session)
+    assert result is not None
+    assert result[1] == "stage_images"
+
+
+def test_orchestrator_delay_skips_inline_staging(
+    db_session, seeded_protocols, synth_acquisition, tmp_path
+):
+    """When delay_hours > 0, import_acquisition leaves stage_images PENDING
+    with not_before set and skips the heavy I/O."""
+    from sqlalchemy import select
+    from embryodb.models import PipelineStepRun
+
+    proto = db_session.execute(
+        select(Protocol).where(Protocol.name == "Stellaris_JIM113")
+    ).scalar_one()
+    legacy_dir = tmp_path / "legacy_xml"
+    legacy_dir.mkdir()
+
+    opts = ImportOptions(
+        image_loc_root=tmp_path / "images",
+        alias_root=tmp_path / "alias",
+        user="testuser",
+        delay_hours=4.0,
+        run_through_step="write_matlab_params",
+    )
+    result = import_acquisition(
+        db_session,
+        source_dir=synth_acquisition,
+        protocol=proto,
+        options=opts,
+        legacy_xml_dir=legacy_dir,
+    )
+    by_name = {o.series_name: o for o in result.series_outcomes}
+    # stage_images should be PENDING (deferred), not COMPLETE.
+    assert by_name["acq_L1"].steps.get("stage_images") == RunStatus.PENDING
+
+    # And the DB row for stage_images has not_before set.
+    runs = db_session.execute(
+        select(PipelineStepRun).where(PipelineStepRun.step == "stage_images")
+    ).scalars().all()
+    assert all(r.status == RunStatus.PENDING for r in runs)
+    assert all(r.not_before is not None for r in runs)
+    # Subsequent worker steps inherit the delay too.
+    sn_runs = db_session.execute(
+        select(PipelineStepRun).where(PipelineStepRun.step == "run_starrynite")
+    ).scalars().all()
+    assert all(r.not_before is not None for r in sn_runs)
+
+    # Inline steps after stage_images still completed normally.
+    metadata_runs = db_session.execute(
+        select(PipelineStepRun).where(PipelineStepRun.step == "stage_metadata")
+    ).scalars().all()
+    assert all(r.status == RunStatus.COMPLETE for r in metadata_runs)

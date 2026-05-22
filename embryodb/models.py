@@ -361,6 +361,9 @@ class PipelineStepRun(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Off-hours scheduling: worker skips this row until `not_before` elapses.
+    # Used by the wizard's "Delay (hours)" knob to push heavy I/O to nights.
+    not_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     log_path: Mapped[str | None] = mapped_column(Text)
     error_excerpt: Mapped[str | None] = mapped_column(Text)
     output_summary: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)

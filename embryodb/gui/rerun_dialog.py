@@ -172,6 +172,25 @@ class RerunPipelineDialog(QtWidgets.QDialog):
         params_vl.addWidget(QtWidgets.QLabel(
             "Blank = keep current value. Applied only if StarryNite is checked above."
         ))
+
+        # Protocol picker: select an existing Protocol and bulk-populate the
+        # override column from its defaults. Useful when retuning across
+        # multiple acquisitions or comparing brightness presets.
+        proto_row = QtWidgets.QHBoxLayout()
+        proto_row.addWidget(QtWidgets.QLabel("Load defaults from protocol:"))
+        self._proto_combo = QtWidgets.QComboBox()
+        self._proto_combo.addItem("— select to apply —", None)
+        try:
+            from sqlalchemy import select
+            from ..models import Protocol
+            with self._session_cm() as s:
+                for row in s.execute(select(Protocol).order_by(Protocol.name)).scalars():
+                    self._proto_combo.addItem(row.name, row.defaults or {})
+        except Exception:
+            pass
+        proto_row.addWidget(self._proto_combo, 1)
+        self._proto_combo.currentIndexChanged.connect(self._on_protocol_picked)
+        params_vl.addLayout(proto_row)
         self._params_table = QtWidgets.QTableWidget(len(TUNABLE_KEYS), 3)
         self._params_table.setHorizontalHeaderLabels(["Key", "Current value", "New value"])
         self._params_table.horizontalHeader().setStretchLastSection(True)
@@ -227,6 +246,25 @@ class RerunPipelineDialog(QtWidgets.QDialog):
         layout.addWidget(btns)
 
     # --- action -------------------------------------------------------------
+
+    def _on_protocol_picked(self, idx: int) -> None:
+        """Populate the Override column from the selected protocol's defaults.
+
+        Empty values in the protocol skip the corresponding row. The user
+        can still tweak individual overrides afterwards.
+        """
+        if idx <= 0:
+            return
+        defaults = self._proto_combo.itemData(idx) or {}
+        if not isinstance(defaults, dict):
+            return
+        for row_idx, key in enumerate(TUNABLE_KEYS):
+            val = defaults.get(key, "")
+            if val == "" or val is None:
+                continue
+            item = self._params_table.item(row_idx, 2)
+            if item is not None:
+                item.setText(str(val))
 
     def _overrides(self) -> dict[str, str]:
         result: dict[str, str] = {}

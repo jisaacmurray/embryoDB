@@ -125,6 +125,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._filter_bar.filtersChanged.connect(self._refresh_table)
         self._table.selectionModel().currentRowChanged.connect(self._on_selection_changed)
         self._detail.saved.connect(lambda _name: self._refresh_table())
+        self._detail.datasetActivationRequested.connect(self._dataset_panel.set_active_dataset)
         self._dataset_panel.addRequested.connect(self._on_dataset_add)
         self._dataset_panel.removeRequested.connect(self._on_dataset_remove)
         self._dataset_panel.exportRequested.connect(self._on_dataset_export)
@@ -436,41 +437,71 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_select_same_acquisition(self) -> None:
         """Expand the current selection to include every series sharing an
-        acquisition with any currently-selected row."""
+        acquisition with any currently-selected row.
+
+        For legacy imports with no acquisition_id, falls back to name-based
+        grouping: series whose names share a `<stem>_L<N>` prefix are
+        treated as one acquisition.
+        """
+        import re
         from sqlalchemy import select
         from ..models import Series
+
+        # `<stem>_L<N>` with optional `_xx`/`_yy` annotation suffix (real legacy data).
+        _LSUFFIX_RE = re.compile(r"^(?P<stem>.+?)_L\d+(?:_(?:xx|yy))?$")
+
+        def _name_stem(name: str) -> str | None:
+            m = _LSUFFIX_RE.match(name)
+            return m.group("stem") if m else None
 
         seed = self._selected_series_names()
         if not seed:
             return
         with self._session_cm() as s:
-            acq_ids = set()
-            unlinked: list[str] = []
+            acq_ids: set[int] = set()
+            seed_stems: set[str] = set()
             for name in seed:
                 row = s.execute(
                     select(Series).where(Series.series_name == name)
                 ).scalar_one_or_none()
                 if row is None:
                     continue
-                if row.acquisition_id is None:
-                    unlinked.append(name)
-                else:
+                if row.acquisition_id is not None:
                     acq_ids.add(row.acquisition_id)
-            if not acq_ids:
+                else:
+                    stem = _name_stem(name)
+                    if stem:
+                        seed_stems.add(stem)
+            if not acq_ids and not seed_stems:
                 QtWidgets.QMessageBox.information(
                     self,
                     "No acquisition",
-                    "None of the selected series are linked to an acquisition.\n"
-                    "(Legacy XML imports have no acquisition_id.)",
+                    "None of the selected series are linked to an acquisition,\n"
+                    "and their names don't match the legacy `<stem>_L<N>` pattern.",
                 )
                 return
-            all_names = set(
-                s.execute(
-                    select(Series.series_name).where(Series.acquisition_id.in_(acq_ids))
-                ).scalars()
-            )
-        # Add the unlinked seed rows so the user doesn't lose their starting selection.
-        all_names.update(unlinked)
+            all_names: set[str] = set()
+            if acq_ids:
+                all_names.update(
+                    s.execute(
+                        select(Series.series_name).where(Series.acquisition_id.in_(acq_ids))
+                    ).scalars()
+                )
+            if seed_stems:
+                # Pull candidates that COULD match — server-side prefix filter
+                # avoids loading every Series. Then verify the stem extraction
+                # in Python (regex anchor is post-prefix).
+                for stem in seed_stems:
+                    candidates = s.execute(
+                        select(Series.series_name).where(
+                            Series.series_name.like(f"{stem}_L%")
+                        )
+                    ).scalars()
+                    for cand in candidates:
+                        if _name_stem(cand) == stem:
+                            all_names.add(cand)
+        # Always keep the seed selection itself.
+        all_names.update(seed)
         # Update the table selection in-place.
         sel_model = self._table.selectionModel()
         sel_model.blockSignals(True)

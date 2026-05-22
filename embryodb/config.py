@@ -1,7 +1,13 @@
+import os
 from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _default_user() -> str:
+    """Try $USER first, then $LOGNAME, then 'anonymous'."""
+    return os.environ.get("USER") or os.environ.get("LOGNAME") or "anonymous"
 
 
 class Settings(BaseSettings):
@@ -25,8 +31,11 @@ class Settings(BaseSettings):
         description="SQLAlchemy URL. SQLite path acceptable for local dev/tests.",
     )
     user: str = Field(
-        default="anonymous",
-        description="Identifier recorded in updated_by / imported_by columns.",
+        default_factory=_default_user,
+        description=(
+            "Identifier recorded in updated_by / imported_by columns. "
+            "Defaults to $USER / $LOGNAME, falls back to 'anonymous'."
+        ),
     )
 
     # AceTree external launcher (legacy Java GUI). Used by the detail panel's

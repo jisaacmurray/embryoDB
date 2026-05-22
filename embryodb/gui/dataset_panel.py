@@ -165,6 +165,22 @@ class DatasetPanel(QtWidgets.QWidget):
     def current_dataset(self) -> str | None:
         return self._combo.currentText() or None
 
+    def set_active_dataset(self, name: str) -> None:
+        """Programmatically select a dataset in the combo, refreshing the list
+        first if the name isn't currently visible (e.g. filtered out by tag)."""
+        if not name:
+            return
+        if self._combo.findText(name) < 0:
+            # Clear any active filters so the target dataset becomes visible.
+            self._search_box.clear()
+            self._tag_combo.blockSignals(True)
+            self._tag_combo.setCurrentIndex(0)  # "(any)"
+            self._tag_combo.blockSignals(False)
+            self._refresh_dataset_combo()
+        idx = self._combo.findText(name)
+        if idx >= 0:
+            self._combo.setCurrentIndex(idx)
+
     # --- handlers ---------------------------------------------------------
 
     def _on_new(self) -> None:

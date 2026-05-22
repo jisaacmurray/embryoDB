@@ -145,33 +145,51 @@ new files added). This is the v1 guarantee; v2 honours it via
 - **Channel routing looks wrong** → check `Protocol.channel_map` for the protocol used; `embryodb/pipeline/stage.py::role_subdir` maps roles to subdirs
 - **audit-import starts failing** → something modified source-dir; check `embryodb/audits.py::audit_import` output, compare exported XML against the originals via `compare-with-source`
 
+## Future-feature placeholders (designed but not yet implemented)
+
+These are deliberate design choices recorded here so they don't get lost.
+None are blocking v2; they're notes for the next sessions.
+
+### Per-step progress in long imports (option C of #3)
+
+Today `stage_images` is the only heavy step in `import_acquisition` (tens of
+GB of TIF I/O + LZW compression per acquisition — can be hours). The GUI
+freezes during this because the orchestrator runs synchronously on the main
+thread. The right long-term answer is to move `stage_images` out of the
+inline orchestrator and let the worker handle it; the GUI's existing
+`PipelineStepRun` polling QTimer will then show progress live in the table.
+This dovetails with #8 below — the same worker step would also be
+schedulable.
+
+### Off-hours scheduling (placeholder for richer scheduler)
+
+The first cut (#8 in the user's list) adds a per-import `delay_hours`
+spinner on the wizard's Targets page (default = hours until 21:00). A new
+`not_before` column on `PipelineStepRun` lets the worker skip rows whose
+`not_before > now`. This is enough to defer heavy I/O to off-hours.
+
+A future, more flexible scheduler — left as a placeholder — could add:
+- Per-step "allow run between HH:MM and HH:MM" windows
+- Day-of-week restrictions (weekend bulk imports only)
+- Resource pools (max N concurrent stage_images across the lab)
+- A "scheduled jobs" view in the GUI showing what will run when
+
+For now, the simple `not_before` timestamp is the API. Anything richer can
+read it without further schema changes.
+
+### Deletion lifecycle (implemented; future hardening)
+
+`Series.deleted_at` / `deleted_by` flag soft deletes. `embryodb gc-deleted
+--older-than 30 [--apply]` purges `tif/`, `tifR/`, `DIC/`, `tifC*` after
+the grace period; `dats/`, `matlabParams`, the embryoDB XML, and the DB row
+itself are preserved. Future: a similar gc for pre-import source dirs
+(`Acquisition.source_dir`) once all positions reach a terminal pipeline
+state.
+
 ## Pending v2 work (next session)
 
-In rough order:
-
-1. **`run_starrynite` step**: wrap the legacy Matlab pipeline as a
-   subprocess. The current Perl `matlab_SN_cluster.pl` is the reference
-   for the command-line shape (line 114 of that file). Capture
-   stdout/stderr to a log file at `PipelineStepRun.log_path`.
-2. **`run_red_extract` + `run_measure` steps**: wrap `acebatch3.jar
-   RedExtractor1` and `Measure1` invocations. The legacy CLI form is
-   `nice java -mx500m -cp /gpfs/fs0/l/murr/tools3/acebatch3.jar
-   <SubClass> <series_list_file>`.
-3. **Background worker process** that picks up PENDING runs in series
-   order. Per-machine queue, GUI-detachable (`subprocess.Popen` with
-   `start_new_session=True`), heartbeat into `PipelineStepRun.heartbeat_at`
-   so the GUI can show staleness if the worker died.
-4. **GUI import wizard**: multi-page `QDialog` reachable from File menu.
-   - Page 1: pick acquisition dir + protocol + parser; preview discovered
-     positions.
-   - Page 2: per-acquisition metadata + tunable parameter overrides
-     (`rangethreshold`, `intensitythreshold`, `staging`,
-     `firsttimestepdiam`, `firsttimestepnumcells`).
-   - Page 3: confirm targets + permissions; submit enqueues work for the
-     worker.
-5. **GUI status badge live updates**: QTimer polls
-   `PipelineStepRun.heartbeat_at` for series whose runs are RUNNING and
-   refreshes the Pipeline column.
+(All originally-listed items are now done — see the v2 sections of the plan
+file for the original scope.)
 
 After v2: see plan for v2.5 (LineagePhenotyping bridge + FastAPI),
 v3 (Java algorithm reimplementation), v4 (acetree_py + lifecycle).

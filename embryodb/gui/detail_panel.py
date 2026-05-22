@@ -241,6 +241,15 @@ class DetailPanel(QtWidgets.QWidget):
         self._edit_auxinfo_button.clicked.connect(self._on_edit_auxinfo)
         button_row.addWidget(self._edit_auxinfo_button)
 
+        self._delete_button = QtWidgets.QPushButton("Mark for deletion")
+        self._delete_button.setToolTip(
+            "Flag this series for deletion. Image data stays on disk until "
+            "`embryodb gc-deleted` runs (default 30-day grace). "
+            "Metadata (dats/, AuxInfo, edit.zip) is preserved indefinitely."
+        )
+        self._delete_button.clicked.connect(self._on_toggle_delete)
+        button_row.addWidget(self._delete_button)
+
         button_row.addStretch(1)
         self._reload_button = QtWidgets.QPushButton("Reload")
         self._reload_button.clicked.connect(self._on_reload)
@@ -358,6 +367,42 @@ class DetailPanel(QtWidgets.QWidget):
         layout.addWidget(close_btn)
         dlg.exec()
 
+    def _on_toggle_delete(self) -> None:
+        """Toggle the soft-delete flag on the loaded series."""
+        if not self._series_name:
+            return
+        from datetime import datetime, timezone
+        from ..config import settings
+        with self._session_factory() as session:
+            row = q_series.get_by_name(session, self._series_name)
+            if row is None:
+                return
+            if row.deleted_at is None:
+                reply = QtWidgets.QMessageBox.question(
+                    self,
+                    "Mark for deletion?",
+                    f"Mark {row.series_name!r} for deletion?\n\n"
+                    "Image data will be removed after the 30-day grace period\n"
+                    "when `embryodb gc-deleted` next runs. Metadata is preserved.\n"
+                    "You can Restore at any time before then.",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No,
+                )
+                if reply != QtWidgets.QMessageBox.Yes:
+                    return
+                row.deleted_at = datetime.now(tz=timezone.utc)
+                row.deleted_by = settings.user
+                row.status = Status.DEL1
+            else:
+                row.deleted_at = None
+                row.deleted_by = None
+                if row.status == Status.DEL1:
+                    row.status = Status.NEW
+            row.version = (row.version or 0) + 1
+            session.flush()
+        self.load_series(self._series_name)
+        self.saved.emit(self._series_name)
+
     def _on_dataset_dblclick(self, item: QtWidgets.QListWidgetItem) -> None:
         """Emit a request to switch the dataset bar to the double-clicked dataset."""
         if item is None:
@@ -413,11 +458,18 @@ class DetailPanel(QtWidgets.QWidget):
             self._datasets_list.addItem(placeholder)
         self._loaded_version = row.version
         self._populate_pipeline_table(row)
+        self._update_delete_button(row)
         self._set_enabled(True)
         self._dirty = False
         self._dirty_label.setText("")
         # Refresh combo suggestions
         self.populate_combo_choices(session)
+
+    def _update_delete_button(self, row: Series) -> None:
+        if row.deleted_at is not None:
+            self._delete_button.setText(f"Restore (marked {row.deleted_at:%Y-%m-%d})")
+        else:
+            self._delete_button.setText("Mark for deletion")
 
     def _set_value(self, column: str, value: str, kind: str) -> None:
         w = self._widgets[column]
@@ -458,6 +510,7 @@ class DetailPanel(QtWidgets.QWidget):
         self._acetree_button.setEnabled(enabled)
         self._edit_acetree_button.setEnabled(enabled)
         self._edit_auxinfo_button.setEnabled(enabled)
+        self._delete_button.setEnabled(enabled)
 
     def _on_dirty(self, *_args: object) -> None:
         self._dirty = True

@@ -665,6 +665,96 @@ def pipeline_backfill_cmd(
         console.print(f"  [yellow]?[/yellow] {n} (no matching Series row)")
 
 
+# --- deletion garbage collection --------------------------------------------
+
+
+@app.command("gc-deleted")
+def gc_deleted_cmd(
+    older_than: Annotated[
+        int,
+        typer.Option(
+            "--older-than",
+            help="Days since deleted_at after which image data is purged.",
+        ),
+    ] = 30,
+    apply: Annotated[
+        bool,
+        typer.Option(
+            "--apply",
+            help="Actually delete. Without --apply this is a dry run.",
+        ),
+    ] = False,
+) -> None:
+    """Permanently delete image data for series marked for deletion long ago.
+
+    Removes only the bulky image directories (tif/, tifR/, DIC/, tifC*) under
+    each affected series' image_loc. The dats/ directory, matlabParams, the
+    legacy embryoDB XML, and the DB row itself are all preserved — so
+    curation work (edit.zip, AuxInfo, expression CSVs) survives the purge.
+    """
+    from datetime import datetime, timedelta, timezone
+    import shutil
+    from sqlalchemy import select
+    from .models import Series
+
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=older_than)
+    BULK_SUBDIRS = ("tif", "tifR", "DIC")
+
+    with database.session_scope() as session:
+        rows = list(
+            session.execute(
+                select(Series).where(
+                    Series.deleted_at.is_not(None),
+                    Series.deleted_at < cutoff,
+                )
+            ).scalars()
+        )
+        if not rows:
+            console.print(f"[green]No series marked for deletion older than {older_than}d.[/green]")
+            return
+        console.print(
+            f"{'Would delete' if not apply else 'Deleting'} image data for {len(rows)} series "
+            f"(deleted_at older than {older_than}d):"
+        )
+        total_bytes = 0
+        for row in rows:
+            if not row.image_loc:
+                console.print(f"  [yellow]skip[/yellow] {row.series_name}: no image_loc")
+                continue
+            base = Path(row.image_loc)
+            subdirs = []
+            for name in BULK_SUBDIRS:
+                p = base / name
+                if p.exists():
+                    subdirs.append(p)
+            # Also collect tifC<n> directories (extra channels).
+            if base.exists():
+                for p in base.iterdir():
+                    if p.is_dir() and p.name.startswith("tifC"):
+                        subdirs.append(p)
+            if not subdirs:
+                console.print(f"  {row.series_name}: nothing to delete (already purged)")
+                continue
+            for sub in subdirs:
+                try:
+                    sz = sum(f.stat().st_size for f in sub.rglob("*") if f.is_file())
+                except OSError:
+                    sz = 0
+                total_bytes += sz
+                age_days = (datetime.now(tz=timezone.utc) - row.deleted_at).days
+                line = f"  {row.series_name}  {sub.name}/  {sz / 1e9:.2f} GB  (deleted {age_days}d ago)"
+                console.print(line)
+                if apply:
+                    shutil.rmtree(sub, ignore_errors=False)
+
+        console.print(
+            f"\n[bold]{'Deleted' if apply else 'Would delete'} "
+            f"~{total_bytes / 1e9:.2f} GB total[/bold]"
+        )
+        if not apply:
+            console.print("[yellow]Dry-run only.[/yellow] Re-run with --apply to commit.")
+
+
 # --- open (convenience launcher) --------------------------------------------
 
 

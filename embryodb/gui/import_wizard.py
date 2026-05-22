@@ -586,6 +586,25 @@ class ImportWizard(QtWidgets.QWizard):
         meta_page: MetadataPage = self.page(1)  # type: ignore[assignment]
         targets_page: TargetsPage = self.page(2)  # type: ignore[assignment]
 
+        # Confirm before creating a new top-level user directory under
+        # image_loc_root — guards against typos in the Person field that
+        # would silently scatter image data into /murrlab3/<wrong>/images/.
+        user_for_path = meta_page.person() or settings.user
+        if user_for_path:
+            user_root = targets_page.image_loc_root() / user_for_path
+            if not user_root.exists():
+                reply = QtWidgets.QMessageBox.question(
+                    self,
+                    "Create new user directory?",
+                    f"The directory\n  {user_root}\ndoes not exist.\n\n"
+                    "Importing will create it and stage images underneath.\n"
+                    f"Is '{user_for_path}' the correct lab username?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No,
+                )
+                if reply != QtWidgets.QMessageBox.Yes:
+                    return  # don't accept — user can go Back and fix Person
+
         source_dir = source_page.source_dir()
         proto_id = source_page.protocol_id()
         parser_name = source_page.parser_name()

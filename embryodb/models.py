@@ -161,6 +161,15 @@ class Series(Base, TimestampMixin):
         nullable=False,
     )
 
+    # --- Deletion lifecycle (v2) -------------------------------------------
+    # Soft-delete: a user marks the series for deletion via the detail panel;
+    # the row stays in the DB and metadata files (dats/, AuxInfo, edit.zip)
+    # stay on disk. After deleted_at + grace period (default 30d), the CLI
+    # `embryodb gc-deleted` permanently removes the bulky image_loc/tif*
+    # subdirectories. Restoring before that just clears these two columns.
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_by: Mapped[str | None] = mapped_column(String(64))
+
     datasets: Mapped[list[Dataset]] = relationship(
         secondary=dataset_series_table, back_populates="series"
     )

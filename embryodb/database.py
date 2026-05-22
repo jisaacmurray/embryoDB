@@ -67,7 +67,42 @@ def session_scope() -> Iterator[Session]:
 
 def create_all() -> None:
     """Create all tables. Used by tests and the first-time `init-db` CLI command."""
-    Base.metadata.create_all(bind=get_engine())
+    engine = get_engine()
+    Base.metadata.create_all(bind=engine)
+    _apply_additive_migrations(engine)
+
+
+def _apply_additive_migrations(engine: Engine) -> None:
+    """Add nullable columns that were introduced after a DB was first created.
+
+    SQLAlchemy's `create_all` is idempotent for whole tables but does NOT add
+    columns to existing tables. For dev environments where we'd rather not
+    require a full DB reset on every additive schema change, we issue
+    `ALTER TABLE ... ADD COLUMN` for any expected columns that are missing.
+
+    Only safe for purely additive, nullable changes — not for renames or
+    NOT NULL columns. Anything more involved should go through a real
+    migration once the schema stabilises post-v1.
+    """
+    from sqlalchemy import inspect, text
+
+    additive: dict[str, list[tuple[str, str]]] = {
+        # table_name -> [(column_name, DDL fragment)]
+        "series": [
+            ("deleted_at", "TIMESTAMP"),
+            ("deleted_by", "VARCHAR(64)"),
+        ],
+    }
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    with engine.begin() as conn:
+        for table, cols in additive.items():
+            if table not in existing_tables:
+                continue  # create_all just made it fresh; nothing to migrate
+            present = {c["name"] for c in inspector.get_columns(table)}
+            for col_name, ddl in cols:
+                if col_name not in present:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col_name} {ddl}"))
 
 
 def drop_all() -> None:

@@ -79,38 +79,95 @@ dependency.
 
 **Server-side install + config (one-time, ~30-45 min):**
 
+Pick a host with a local disk for the DB files. **Don't put the Postgres
+data directory on GPFS** — image data stays on GPFS as today, but the
+database needs a local POSIX filesystem.
+
+*Step 1 — install + start (pick one based on your distro):*
+
 ```bash
-# Pick a host with a local disk for the DB files. Don't put the Postgres
-# data directory on GPFS — image data stays on GPFS as today.
-sudo dnf install postgresql-server postgresql-contrib       # or apt-get on Debian/Ubuntu
+# RHEL / Fedora / CentOS / Rocky / Alma
+sudo dnf install postgresql-server postgresql-contrib
 sudo postgresql-setup --initdb
 sudo systemctl enable --now postgresql
+```
 
+```bash
+# Debian / Ubuntu / Pop!_OS
+sudo apt install postgresql postgresql-contrib
+# The Debian package starts and enables postgresql on install. Verify:
+sudo systemctl status postgresql        # should be "active (exited)"
+# Start it if needed (rare):
+sudo systemctl start postgresql && sudo systemctl enable postgresql
+```
+
+Either way you end up with a running server, a `postgres` OS user, and
+peer auth for local socket connections — so `sudo -u postgres psql` Just
+Works without a password.
+
+*Step 2 — create the role + database (same on every distro):*
+
+```bash
 sudo -u postgres psql <<SQL
 CREATE ROLE embryodb LOGIN PASSWORD 'change-me';
 CREATE DATABASE embryodb OWNER embryodb;
 SQL
+```
+
+*Step 3 — let it accept network connections.*
+
+The config file paths differ between distros (RHEL: `/var/lib/pgsql/data/`,
+Debian: `/etc/postgresql/<version>/main/`). Ask Postgres itself where
+they live rather than hard-coding:
+
+```bash
+PGHBA=$(sudo -u postgres psql -tA -c "SHOW hba_file;")
+PGCONF=$(sudo -u postgres psql -tA -c "SHOW config_file;")
+echo "Will edit:  $PGHBA  and  $PGCONF"
 
 # pg_hba.conf — allow the lab subnet (replace CIDR with your actual range).
 echo 'host  embryodb  embryodb  10.0.0.0/8  scram-sha-256' \
-  | sudo tee -a /var/lib/pgsql/data/pg_hba.conf
+  | sudo tee -a "$PGHBA"
 
 # postgresql.conf — listen on the network, not just localhost.
-sudo sed -i "s/^#listen_addresses.*/listen_addresses = '*'/" \
-  /var/lib/pgsql/data/postgresql.conf
+sudo sed -i "s/^#listen_addresses.*/listen_addresses = '*'/" "$PGCONF"
 
 sudo systemctl restart postgresql
+```
+
+*Step 4 — open the firewall (if one is active):*
+
+```bash
+# RHEL / Fedora (firewalld):
 sudo firewall-cmd --add-service=postgresql --permanent && sudo firewall-cmd --reload
 
-# Optional but recommended: nightly backup
-echo "0 2 * * * postgres pg_dump -Fc embryodb > /backup/embryodb-\$(date +\%F).pgdump" \
+# Debian / Ubuntu / Pop!_OS (ufw — only if enabled; check `sudo ufw status`):
+sudo ufw allow from 10.0.0.0/8 to any port 5432 proto tcp
+```
+
+Pop!_OS ships with `ufw` installed but inactive by default; if `ufw
+status` says `inactive`, the rule isn't needed because nothing is
+filtering. If you later run `sudo ufw enable`, remember to add the rule
+first or you'll lock workstations out.
+
+*Step 5 — nightly backup (optional but strongly recommended):*
+
+```bash
+sudo install -d -o postgres -g postgres /var/backups/embryodb
+echo '0 2 * * * postgres pg_dump -Fc embryodb > /var/backups/embryodb/embryodb-$(date +\%F).pgdump' \
   | sudo tee /etc/cron.d/embryodb-backup
 ```
+
+Add a `find /var/backups/embryodb -mtime +30 -delete` line if you want to
+keep only the last 30 nightly dumps.
 
 Common gotcha: `pg_hba.conf` auth. If a client gets `FATAL: no pg_hba
 entry for host …`, check that the CIDR actually covers the client IP and
 that the auth method matches what the client offers (`scram-sha-256`
-needs a password in the URL; `trust` is local-network-only).
+needs a password in the URL; `trust` is local-network-only). Add a line
+like `host all all <client-ip>/32 trust` *temporarily* to verify
+connectivity, then tighten back to `scram-sha-256` once you know the wire
+is open.
 
 **Per-workstation switchover (each Linux client, ~1 min):**
 

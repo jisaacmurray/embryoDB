@@ -43,6 +43,147 @@ For quick local dev use SQLite:
 export EMBRYODB_DB_URL='sqlite:////tmp/embryodb-dev.db'
 ```
 
+## Multi-user access
+
+The schema and Python code already support multiple lab members editing
+concurrently. The current default uses SQLite for local dev; for production
+multi-user deployments, switch to PostgreSQL — no code changes required,
+just configuration.
+
+### Conflict resolution
+
+Every editable row (Series, Dataset, Protocol, Acquisition) carries a
+`version` counter alongside `updated_at` and `updated_by`. The GUI's
+detail-panel Save compares the loaded version against the current DB
+version; if a second user has saved in the meantime, the local save is
+**rejected** and the user gets a "Save conflict" dialog with two choices:
+
+- **Reload** — discard the local edits and refresh the form with the
+  current DB state.
+- **Cancel** — keep the local edits on screen so the user can manually
+  reconcile against the other user's changes (e.g. open both side-by-side,
+  re-type the merged value, save again).
+
+No silent overwrites. Field-level merging is a future enhancement; for v1
+the simple version check is the right level of guard for low write rates.
+
+### PostgreSQL setup (recommended for multi-workstation use)
+
+**Why switch.** SQLite over a network filesystem (GPFS, NFS, SMB) is
+unsafe for concurrent writers — its locking model relies on POSIX advisory
+locks that distributed filesystems implement loosely. Symptoms range from
+corruption to silent lost updates. PostgreSQL handles concurrent writes
+properly and is what `EMBRYODB_DB_URL` defaults to. The schema in this
+project is vendor-agnostic; `psycopg[binary]` is already a hard
+dependency.
+
+**Server-side install + config (one-time, ~30-45 min):**
+
+```bash
+# Pick a host with a local disk for the DB files. Don't put the Postgres
+# data directory on GPFS — image data stays on GPFS as today.
+sudo dnf install postgresql-server postgresql-contrib       # or apt-get on Debian/Ubuntu
+sudo postgresql-setup --initdb
+sudo systemctl enable --now postgresql
+
+sudo -u postgres psql <<SQL
+CREATE ROLE embryodb LOGIN PASSWORD 'change-me';
+CREATE DATABASE embryodb OWNER embryodb;
+SQL
+
+# pg_hba.conf — allow the lab subnet (replace CIDR with your actual range).
+echo 'host  embryodb  embryodb  10.0.0.0/8  scram-sha-256' \
+  | sudo tee -a /var/lib/pgsql/data/pg_hba.conf
+
+# postgresql.conf — listen on the network, not just localhost.
+sudo sed -i "s/^#listen_addresses.*/listen_addresses = '*'/" \
+  /var/lib/pgsql/data/postgresql.conf
+
+sudo systemctl restart postgresql
+sudo firewall-cmd --add-service=postgresql --permanent && sudo firewall-cmd --reload
+
+# Optional but recommended: nightly backup
+echo "0 2 * * * postgres pg_dump -Fc embryodb > /backup/embryodb-\$(date +\%F).pgdump" \
+  | sudo tee /etc/cron.d/embryodb-backup
+```
+
+Common gotcha: `pg_hba.conf` auth. If a client gets `FATAL: no pg_hba
+entry for host …`, check that the CIDR actually covers the client IP and
+that the auth method matches what the client offers (`scram-sha-256`
+needs a password in the URL; `trust` is local-network-only).
+
+**Per-workstation switchover (each Linux client, ~1 min):**
+
+```bash
+# In ~/.bashrc, replace the SQLite path with the Postgres URL:
+export EMBRYODB_DB_URL='postgresql+psycopg://embryodb:change-me@dbhost.lab.local/embryodb'
+
+# First workstation only — bootstrap the schema and pull in legacy XMLs:
+embryodb init-db
+embryodb-open           # imports XMLs, lists, protocols; opens GUI
+
+# Every other workstation: just launch
+embryodb-open
+```
+
+The image data continues to live on the GPFS mount as today
+(`/murrlab3/<user>/images/...`); each workstation still needs that mount
+to view stacks in AceTree.
+
+**On migrating the existing SQLite DB.** The v1 safe-mirror property means
+the DB is fully re-derivable from `/murrlab/gpfs/fs0/l/murr/embryoDB/*.xml`.
+After switching `EMBRYODB_DB_URL`, `embryodb-open` rebuilds Postgres from
+the source XMLs on first launch. No data is lost; legacy curation lives in
+the XML files, not the DB. If anything goes wrong, the old SQLite file is
+still on GPFS untouched.
+
+### Off-network / Mac access via SSH tunnel
+
+Once Postgres is running, a Mac (or any off-network Linux) can run the
+native GUI without X11 forwarding by tunneling the Postgres connection
+over SSH. The GUI uses `qtpy`, which auto-selects a Qt binding and works
+unchanged on macOS.
+
+**One-time Mac setup:**
+
+```bash
+# Mac
+brew install python@3.12                          # any Python 3.10+ works
+python3 -m pip install --user pyside6 qtpy        # GUI binding (no system libs needed)
+git clone https://github.com/jisaacmurray/embryoDB.git
+cd embryoDB
+pip install --user -e .                           # registers embryodb / embryodb-gui / embryodb-open
+
+# Image data access (pick one — or skip if you only browse metadata):
+#   A. SSHFS, for occasional use:
+#      brew install macfuse sshfs
+#      sshfs jmurr@server.lab:/murrlab3 ~/murrlab3 -o reconnect,defer_permissions
+#   B. NFS over VPN (fastest; requires lab IT involvement)
+#   C. None — metadata-only browsing works without an image mount;
+#      AceTree launch will obviously fail.
+```
+
+**Each session:**
+
+```bash
+# Terminal 1 — open the SSH tunnel and leave it running.
+ssh -N -L 5432:dbhost.lab.local:5432 jmurr@gateway.lab.edu
+
+# Terminal 2 — point embryoDB at the tunneled port and launch.
+export EMBRYODB_DB_URL='postgresql+psycopg://embryodb:change-me@127.0.0.1:5432/embryodb'
+embryodb-open
+```
+
+The GUI thinks it's talking to a local Postgres on port 5432; SSH forwards
+every packet to the lab server. Round-trip latency is fine for typed
+queries (no UI repaint traffic over the wire) and the UI feels native
+because all Qt rendering is on the Mac. The whole tunneled connection can
+be aliased to a single command.
+
+**Future**: the v2.5 milestone adds a FastAPI tier so the Mac can connect
+via plain HTTPS without an SSH tunnel. The SSH-tunnel approach above is
+the no-code-changes-required version that works today.
+
 ## First-time setup
 
 ```bash

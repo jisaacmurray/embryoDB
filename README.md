@@ -217,6 +217,28 @@ the shared role.
 (`/murrlab3/<user>/images/...`); each workstation still needs that mount
 to view stacks in AceTree.
 
+**Qt / X11 troubleshooting (Ubuntu 20.04 / Pop!_OS focal).** If
+`embryodb-gui` fails on a fresh user with:
+
+```
+Could not load the Qt platform plugin "xcb" … even though it was found.
+```
+
+…the plugin is present but a system library it depends on is missing.
+Diagnose with `QT_DEBUG_PLUGINS=1 embryodb-gui 2>&1 | head -60` (look for
+the failing `dlopen`). On focal the usual fix is:
+
+```bash
+sudo apt install -y \
+    libxcb-cursor0 libxcb-xinerama0 libxcb-icccm4 libxcb-image0 \
+    libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 \
+    libxcb-sync1 libxcb-xfixes0 libxcb-xkb1 libxkbcommon-x11-0
+```
+
+For X11 forwarding, prefer `ssh -Y <user>@<host>` over `ssh + su` —
+`su` doesn't propagate the xauth cookie, and the GUI will refuse to
+talk to the X server even if all the libraries above are installed.
+
 **On migrating the existing SQLite DB.** The v1 safe-mirror property means
 the DB is fully re-derivable from `/murrlab/gpfs/fs0/l/murr/embryoDB/*.xml`.
 After switching `EMBRYODB_DB_URL`, `embryodb-open` rebuilds Postgres from

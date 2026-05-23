@@ -96,8 +96,25 @@ def _apply_additive_migrations(engine: Engine) -> None:
             ("not_before", "TIMESTAMP"),
         ],
     }
+    # Columns that were originally typed as VARCHAR(N) but should be TEXT to
+    # accommodate legacy corpus rows that exceed the declared length. SQLite
+    # never enforced these limits, so the issue only surfaces on PostgreSQL.
+    # ALTER COLUMN ... TYPE text is a metadata-only change in PostgreSQL for
+    # VARCHAR → TEXT (no table rewrite), and is idempotent here because we
+    # check the current type before issuing the DDL.
+    widen_to_text: list[tuple[str, str]] = [
+        ("series", "date_acquired"),
+        ("series", "person"),
+        ("series", "strain_name"),
+        ("series", "reporter_gene"),
+        ("series", "timepts"),
+        ("series", "edited_by"),
+        ("series", "edited_timepts"),
+        ("series", "edited_cells"),
+    ]
     inspector = inspect(engine)
     existing_tables = set(inspector.get_table_names())
+    dialect = engine.dialect.name
     with engine.begin() as conn:
         for table, cols in additive.items():
             if table not in existing_tables:
@@ -106,6 +123,22 @@ def _apply_additive_migrations(engine: Engine) -> None:
             for col_name, ddl in cols:
                 if col_name not in present:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col_name} {ddl}"))
+
+        # Widen VARCHAR → TEXT. SQLite doesn't enforce VARCHAR length and its
+        # ALTER COLUMN TYPE is limited, so we only do this on PostgreSQL.
+        if dialect == "postgresql":
+            for table, col_name in widen_to_text:
+                if table not in existing_tables:
+                    continue
+                cols_meta = {c["name"]: c for c in inspector.get_columns(table)}
+                col = cols_meta.get(col_name)
+                if col is None:
+                    continue
+                col_type = str(col["type"]).upper()
+                if col_type.startswith("VARCHAR") or col_type.startswith("CHARACTER VARYING"):
+                    conn.execute(text(
+                        f"ALTER TABLE {table} ALTER COLUMN {col_name} TYPE text"
+                    ))
 
 
 def drop_all() -> None:

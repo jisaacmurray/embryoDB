@@ -119,19 +119,25 @@ class Series(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
     # --- 16 XML fields (raw text; preserved exactly as imported) -----------
+    # All free-text fields are Text rather than VARCHAR(N) because the legacy
+    # XML format imposes no length limit and real-world corpus data has rows
+    # that exceed even generous caps (e.g. an old row with the partial-editing
+    # code accidentally pasted into <editedby>, ~165 chars). SQLite silently
+    # tolerates over-long values; PostgreSQL strictly enforces VARCHAR limits
+    # and would reject the row at import time.
     series_name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
-    date_acquired: Mapped[str] = mapped_column(String(32), default="")
-    person: Mapped[str] = mapped_column(String(128), default="")
-    strain_name: Mapped[str] = mapped_column(String(128), default="")
+    date_acquired: Mapped[str] = mapped_column(Text, default="")
+    person: Mapped[str] = mapped_column(Text, default="")
+    strain_name: Mapped[str] = mapped_column(Text, default="")
     treatments: Mapped[str] = mapped_column(Text, default="")
-    reporter_gene: Mapped[str] = mapped_column(String(128), default="")  # redsig
+    reporter_gene: Mapped[str] = mapped_column(Text, default="")  # redsig
     image_loc: Mapped[str] = mapped_column(Text, default="")
-    timepts: Mapped[str] = mapped_column(String(32), default="")
+    timepts: Mapped[str] = mapped_column(Text, default="")
     annot_loc: Mapped[str] = mapped_column(Text, default="")
     acetree_config: Mapped[str] = mapped_column(Text, default="")
-    edited_by: Mapped[str] = mapped_column(String(128), default="")
-    edited_timepts: Mapped[str] = mapped_column(String(32), default="")
-    edited_cells: Mapped[str] = mapped_column(String(32), default="")
+    edited_by: Mapped[str] = mapped_column(Text, default="")
+    edited_timepts: Mapped[str] = mapped_column(Text, default="")
+    edited_cells: Mapped[str] = mapped_column(Text, default="")
     partial_editing_code: Mapped[str] = mapped_column(Text, default="")  # checkedby
     comments: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[Status] = mapped_column(

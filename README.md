@@ -169,21 +169,51 @@ like `host all all <client-ip>/32 trust` *temporarily* to verify
 connectivity, then tighten back to `scram-sha-256` once you know the wire
 is open.
 
-**Per-workstation switchover (each Linux client, ~1 min):**
+**Per-user setup (each Linux account, ~1 min):**
+
+Every user — whether on the DB host or a remote workstation — needs three
+things: an installed copy of the `embryodb` Python package, the right
+`EMBRYODB_DB_URL` in their shell, and at least one Qt binding for the GUI.
 
 ```bash
-# In ~/.bashrc, replace the SQLite path with the Postgres URL:
-export EMBRYODB_DB_URL='postgresql+psycopg://embryodb:change-me@dbhost.lab.local/embryodb'
+# 1. Install the package (per-user, points at the shared GPFS source tree
+#    so a `git pull` by anyone updates everyone):
+pip install --user -e /murrlab/gpfs/fs0/l/murr/new_tools/embryoDB
+pip install --user pyqt5     # only if not already available in your env
 
-# First workstation only — bootstrap the schema and pull in legacy XMLs:
-embryodb init-db
-embryodb-open           # imports XMLs, lists, protocols; opens GUI
-
-# Every other workstation: just launch
-embryodb-open
+# 2. Add the DB URL to ~/.bashrc:
+echo "export EMBRYODB_DB_URL='postgresql+psycopg://embryodb:CHANGEME@dbhost.lab.local/embryodb'" \
+  >> ~/.bashrc
+source ~/.bashrc
 ```
 
-The image data continues to live on the GPFS mount as today
+**First user only — populate the DB from the legacy XMLs:**
+
+```bash
+embryodb-open      # init-db + import-xml + import-lists + seed-protocols + GUI
+```
+
+This is a one-time job. After the DB is populated, subsequent users (and
+subsequent launches by anyone) don't need to re-import.
+
+**Every user thereafter — just open the GUI:**
+
+```bash
+embryodb-gui       # day-to-day; opens the GUI directly
+```
+
+`embryodb-open` still works for everyone — it's idempotent and only takes
+a few extra seconds on a populated DB — but `embryodb-gui` is the
+lightweight day-to-day command. Use `embryodb-open` whenever you want to
+re-sync from the source XMLs (e.g. after a new acquisition lands).
+
+**Attribution.** All users connect as the shared `embryodb` Postgres
+role, but the `updated_by` / `imported_by` columns are populated from
+`EMBRYODB_USER` (which defaults to `$USER`). So each lab member's edits
+are attributed to their own username even though the SQL is executed by
+the shared role.
+
+**Image data.** Continues to live on the GPFS mount as today
 (`/murrlab3/<user>/images/...`); each workstation still needs that mount
 to view stacks in AceTree.
 

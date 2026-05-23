@@ -19,6 +19,7 @@ dependencies = [
   "typer>=0.12",
   "rich>=13.7",
   "qtpy>=2.4",
+  "tifffile>=2024.1",   # image staging step; pulls numpy transitively
   # One Qt binding must also be available: PyQt5, PyQt6, or PySide6.
   # qtpy auto-selects; QT_API env var overrides. On the lab cluster PyQt5
   # is pre-installed; on Macs `pip install pyside6` is the easiest path.

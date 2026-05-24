@@ -33,6 +33,9 @@ class DatasetPanel(QtWidgets.QWidget):
     addRequested = QtCore.Signal(str)  # dataset_name
     removeRequested = QtCore.Signal(str)
     exportRequested = QtCore.Signal(str, Path)
+    # Legacy analysis tools applied to every member of the active dataset.
+    extractRequested = QtCore.Signal(str)     # dataset_name
+    printTreesRequested = QtCore.Signal(str)  # dataset_name
     # Fired when the dataset selection or "Show only members" toggle changes
     # in a way that should narrow / unrestrict the browser table.
     # Args: (dataset_id_or_none, dataset_name_or_empty)
@@ -115,6 +118,20 @@ class DatasetPanel(QtWidgets.QWidget):
         self._export_btn = QtWidgets.QPushButton("Export list…")
         self._export_btn.clicked.connect(self._on_export)
         layout.addWidget(self._export_btn)
+
+        self._extract_btn = QtWidgets.QPushButton("Run extract…")
+        self._extract_btn.setToolTip(
+            "Run the legacy extract.sh steps on every member of the active dataset."
+        )
+        self._extract_btn.clicked.connect(self._on_run_extract)
+        layout.addWidget(self._extract_btn)
+
+        self._trees_btn = QtWidgets.QPushButton("Print trees…")
+        self._trees_btn.setToolTip(
+            "Run PrintTrees.pl (Tree1) on every member of the active dataset."
+        )
+        self._trees_btn.clicked.connect(self._on_print_trees)
+        layout.addWidget(self._trees_btn)
 
         layout.addStretch(1)
 
@@ -298,3 +315,23 @@ class DatasetPanel(QtWidgets.QWidget):
         if not path_str:
             return
         self.exportRequested.emit(name, Path(path_str))
+
+    def _on_run_extract(self) -> None:
+        name = self.current_dataset()
+        if not name:
+            QtWidgets.QMessageBox.information(
+                self, "No dataset selected",
+                "Pick a dataset from the dropdown first."
+            )
+            return
+        self.extractRequested.emit(name)
+
+    def _on_print_trees(self) -> None:
+        name = self.current_dataset()
+        if not name:
+            QtWidgets.QMessageBox.information(
+                self, "No dataset selected",
+                "Pick a dataset from the dropdown first."
+            )
+            return
+        self.printTreesRequested.emit(name)

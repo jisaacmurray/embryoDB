@@ -129,6 +129,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._dataset_panel.addRequested.connect(self._on_dataset_add)
         self._dataset_panel.removeRequested.connect(self._on_dataset_remove)
         self._dataset_panel.exportRequested.connect(self._on_dataset_export)
+        self._dataset_panel.extractRequested.connect(self._on_run_extract_for_dataset)
+        self._dataset_panel.printTreesRequested.connect(self._on_print_trees_for_dataset)
         self._dataset_panel.filterChanged.connect(self._on_dataset_filter_changed)
         self._dataset_filter_id: int | None = None
 
@@ -433,6 +435,14 @@ class MainWindow(QtWidgets.QMainWindow):
         act_rerun = menu.addAction(f"Re-run pipeline…{n_suffix}")
         act_rerun.triggered.connect(self._on_rerun_pipeline)
 
+        menu.addSeparator()
+
+        # Legacy analysis tools (extract.sh + PrintTrees.pl)
+        act_extract = menu.addAction(f"Run extract steps…{n_suffix}")
+        act_extract.triggered.connect(self._on_run_extract)
+        act_trees = menu.addAction(f"Print trees…{n_suffix}")
+        act_trees.triggered.connect(self._on_print_trees)
+
         menu.exec(self._table.viewport().mapToGlobal(pos))
 
     def _on_select_same_acquisition(self) -> None:
@@ -544,6 +554,64 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(
                 f"Re-queued pipeline for {len(selected)} series.", 5000
             )
+
+    # --- legacy analysis tools (extract.sh + PrintTrees.pl) ---------------
+
+    def _on_run_extract(self) -> None:
+        names = self._selected_series_names()
+        if not names:
+            return
+        from .extract_dialog import ExtractDialog
+        ExtractDialog(
+            self._session_cm, names,
+            title_hint=f"{len(names)} selected", parent=self,
+        ).exec()
+
+    def _on_print_trees(self) -> None:
+        names = self._selected_series_names()
+        if not names:
+            return
+        from .print_trees_dialog import PrintTreesDialog
+        PrintTreesDialog(
+            self._session_cm, names,
+            title_hint=f"{len(names)} selected", parent=self,
+        ).exec()
+
+    def _resolve_dataset_members(self, dataset_name: str) -> list[str]:
+        from ..queries import datasets as q_datasets
+        with self._session_cm() as session:
+            ds = q_datasets.get_by_name(session, dataset_name)
+            if ds is None:
+                return []
+            return sorted(s.series_name for s in ds.series)
+
+    def _on_run_extract_for_dataset(self, dataset_name: str) -> None:
+        names = self._resolve_dataset_members(dataset_name)
+        if not names:
+            QtWidgets.QMessageBox.information(
+                self, "Empty dataset",
+                f"Dataset {dataset_name!r} has no member series."
+            )
+            return
+        from .extract_dialog import ExtractDialog
+        ExtractDialog(
+            self._session_cm, names,
+            title_hint=f"dataset {dataset_name!r}", parent=self,
+        ).exec()
+
+    def _on_print_trees_for_dataset(self, dataset_name: str) -> None:
+        names = self._resolve_dataset_members(dataset_name)
+        if not names:
+            QtWidgets.QMessageBox.information(
+                self, "Empty dataset",
+                f"Dataset {dataset_name!r} has no member series."
+            )
+            return
+        from .print_trees_dialog import PrintTreesDialog
+        PrintTreesDialog(
+            self._session_cm, names,
+            title_hint=f"dataset {dataset_name!r}", parent=self,
+        ).exec()
 
     # --- pipeline import wizard -------------------------------------------
 

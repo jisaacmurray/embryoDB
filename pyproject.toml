@@ -19,11 +19,14 @@ dependencies = [
   "typer>=0.12",
   "rich>=13.7",
   "qtpy>=2.4",
+  # qtpy is only a shim — a real Qt binding must be importable too. Pull
+  # PyQt5 automatically on Linux (the lab cluster, where PySide6 fails for
+  # lack of libxcb-cursor0) so a bare `pip install -e .` is self-contained.
+  # macOS gets no forced binding: install with `.[mac]` (PySide6) instead.
+  # Override the active binding at runtime with the QT_API env var.
+  "PyQt5>=5.15; sys_platform == 'linux'",
   "tifffile>=2024.1",   # image staging step; pulls numpy transitively
   "readlif>=0.6.6",     # Leica .lif reader (v2.10: lif-import); pure Python, mmap-backed
-  # One Qt binding must also be available: PyQt5, PyQt6, or PySide6.
-  # qtpy auto-selects; QT_API env var overrides. On the lab cluster PyQt5
-  # is pre-installed; on Macs `pip install pyside6` is the easiest path.
 ]
 
 [project.optional-dependencies]
@@ -31,6 +34,12 @@ dev = [
   "pytest>=8.0",
   "pytest-cov>=5.0",
 ]
+# Explicit Qt-binding choices for when the platform default isn't right
+# (forcing PySide6 on a Mac, PyQt6 anywhere, or re-asserting PyQt5).
+mac = ["PySide6>=6.6"]
+pyside6 = ["PySide6>=6.6"]
+pyqt5 = ["PyQt5>=5.15"]
+pyqt6 = ["PyQt6>=6.6"]
 
 [project.scripts]
 embryodb = "embryodb.cli:app"

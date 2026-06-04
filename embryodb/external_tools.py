@@ -286,12 +286,85 @@ def run_print_trees(
     return LaunchResult(proc=proc, log_path=log_path, series_list=list_file)
 
 
+def run_lif_import(
+    lif_path: Path,
+    series: str,
+    protocol: str,
+    *,
+    user: str | None = None,
+    person: str = "",
+    strain: str = "",
+    perturbation: str = "",
+    reporter: str = "",
+    comments: str = "",
+    positions: list[str] | None = None,
+    channel_roles: dict[int, str] | None = None,
+    bit_depth_policy: str = "downcast",
+    no_compress: bool = False,
+    overwrite: bool = False,
+    image_loc_root: Path | None = None,
+    alias_root: Path | None = None,
+    run_through: str | None = None,
+) -> LaunchResult:
+    """Spawn ``embryodb pipeline import-lif`` detached.
+
+    The TIF extraction is the multi-hour part; detaching it (same mechanism
+    as ``run_extract``) lets the GUI fire-and-forget so closing the dialog
+    or the whole app doesn't kill the import. The caller already showed and
+    confirmed the channel mapping, so ``--yes`` skips the CLI's own prompt.
+
+    Progress is observable by polling the returned ``log_path`` for the
+    ``<series>: <done>/<total> planes`` lines the CLI emits.
+    """
+    cmd = [
+        shell_quote(sys.executable), "-m", "embryodb.cli",
+        "pipeline", "import-lif", shell_quote(str(lif_path)),
+        "--series", shell_quote(series),
+        "--protocol", shell_quote(protocol),
+        "--yes",
+        "--bit-depth-policy", shell_quote(bit_depth_policy),
+    ]
+    if user:
+        cmd += ["--user", shell_quote(user)]
+    if person:
+        cmd += ["--person", shell_quote(person)]
+    if strain:
+        cmd += ["--strain", shell_quote(strain)]
+    if perturbation:
+        cmd += ["--perturbation", shell_quote(perturbation)]
+    if reporter:
+        cmd += ["--reporter", shell_quote(reporter)]
+    if comments:
+        cmd += ["--comments", shell_quote(comments)]
+    for pos in positions or []:
+        cmd += ["--position", shell_quote(pos)]
+    for raw_ch, role in (channel_roles or {}).items():
+        cmd += ["--channel-role", shell_quote(f"{raw_ch}={role}")]
+    if no_compress:
+        cmd += ["--no-compress"]
+    if overwrite:
+        cmd += ["--overwrite"]
+    if image_loc_root is not None:
+        cmd += ["--image-loc-root", shell_quote(str(image_loc_root))]
+    if alias_root is not None:
+        cmd += ["--alias-root", shell_quote(str(alias_root))]
+    if run_through:
+        cmd += ["--run-through", shell_quote(run_through)]
+
+    runs = _embryodb_runs_dir()
+    runs.mkdir(parents=True, exist_ok=True)
+    log_path = runs / f"embryodb-lif-import-{int(time.time())}-{os.getpid()}.log"
+    proc = _spawn_detached("nice " + " ".join(cmd), log_path)
+    return LaunchResult(proc=proc, log_path=log_path, series_list=log_path)
+
+
 __all__ = [
     "EXTRACT_STEPS",
     "EXTRACT_STEPS_BY_KEY",
     "ExtractStep",
     "LaunchResult",
     "run_extract",
+    "run_lif_import",
     "run_print_trees",
     "shell_quote",
 ]

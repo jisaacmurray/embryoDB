@@ -20,6 +20,7 @@ dependencies = [
   "rich>=13.7",
   "qtpy>=2.4",
   "tifffile>=2024.1",   # image staging step; pulls numpy transitively
+  "readlif>=0.6.6",     # Leica .lif reader (v2.10: lif-import); pure Python, mmap-backed
   # One Qt binding must also be available: PyQt5, PyQt6, or PySide6.
   # qtpy auto-selects; QT_API env var overrides. On the lab cluster PyQt5
   # is pre-installed; on Macs `pip install pyside6` is the easiest path.

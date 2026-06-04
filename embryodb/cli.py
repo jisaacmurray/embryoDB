@@ -1030,6 +1030,436 @@ def pipeline_import_acquisition(
         console.print(line)
 
 
+@app.command("lif-inspect")
+def lif_inspect_cmd(
+    lif_path: Annotated[Path, typer.Argument(help="Path to a .lif file")],
+) -> None:
+    """List the series + channels inside a Leica .lif file.
+
+    Read-only metadata walk; no pixel data loaded. Use this before
+    ``lif-import`` to confirm which series (TileScan) you want to import
+    and to verify the channel mapping the protocol will apply.
+    """
+    from .lif import inspect_lif
+
+    size = lif_path.stat().st_size
+    console.print(f"[bold]LIF:[/bold] {lif_path} ({size / 1e9:.1f} GB)")
+    series_list = inspect_lif(lif_path)
+    for idx, s in enumerate(series_list, start=1):
+        p0 = s.positions[0] if s.positions else None
+        n_pos = len(s.positions)
+        n_tps = p0.n_timepoints if p0 else 0
+        n_pl = p0.n_planes if p0 else 0
+        size_est = s.estimated_uncompressed_bytes() / 1e9
+        cycle = f"{s.cycle_time_s:.0f}s" if s.cycle_time_s else "n/a"
+        console.print(
+            f"\n[cyan]Series {idx}[/cyan] [bold]{s.name!r}[/bold]: "
+            f"{n_pos} pos × {n_tps} tp × {n_pl} planes × {len(s.channels)} ch "
+            f"· ~{size_est:.1f} GB uncompressed · cycle {cycle}"
+        )
+        if s.objective:
+            console.print(
+                f"  objective {s.objective!r}  scope {s.microscope_model!r}"
+            )
+        if s.voxel_xy_um:
+            console.print(
+                f"  voxel  xy={s.voxel_xy_um:.4f} µm  z={s.voxel_z_um:.4f} µm"
+            )
+        for c in s.channels:
+            console.print(
+                f"  raw_ch {c.raw_index}: [bold]{c.dye_name or '(no dye)'}[/bold] "
+                f"· {c.laser_line_nm} nm · intensity={c.laser_intensity_dev}% "
+                f"· detector {c.detector_name!r} · gain={c.detector_gain}"
+            )
+        if n_pos:
+            console.print(
+                f"  positions: {', '.join(p.name for p in s.positions)}"
+            )
+
+
+@app.command("extract-lif")
+def extract_lif_cmd(
+    lif_path: Annotated[Path, typer.Argument(help="Path to a .lif file")],
+    out_dir: Annotated[
+        Path,
+        typer.Argument(help="Output directory (source-dir layout)"),
+    ],
+    series: Annotated[
+        str | None,
+        typer.Option(
+            "--series",
+            help="Series name (e.g. 'TileScan 2'). Required when LIF has >1 series.",
+        ),
+    ] = None,
+    position: Annotated[
+        str | None,
+        typer.Option(
+            "--position",
+            help="Position name (e.g. 'Position 1'). Default: all positions.",
+        ),
+    ] = None,
+    stem: Annotated[
+        str | None,
+        typer.Option(
+            "--stem",
+            help="Acquisition stem in the output filenames. Default: LIF filename stem.",
+        ),
+    ] = None,
+    bit_depth_policy: Annotated[
+        str,
+        typer.Option(
+            "--bit-depth-policy",
+            help="pass | downcast | fail. Default downcast (warns + shifts).",
+        ),
+    ] = "downcast",
+    compress: Annotated[
+        bool,
+        typer.Option("--compress/--no-compress", help="LZW compression on write"),
+    ] = True,
+    overwrite: Annotated[bool, typer.Option("--overwrite")] = False,
+) -> None:
+    """Extract a LIF's per-plane TIFs + Properties.xml to a directory.
+
+    Writes the *source-dir layout* — i.e. ``<stem>_Position N_tNNN_zNN_chNN.tif``
+    and ``<stem>_Position N_Properties.xml`` — so the output can be fed
+    to ``pipeline import-acquisition`` as if it were a LAS X TIF export.
+    No DB rows are created.
+
+    For the common case of "import this LIF straight into embryoDB", use
+    ``pipeline import-lif`` instead — it writes to the staged image_loc
+    directly, halving the I/O.
+    """
+    from .lif import LifExtractor
+
+    ex = LifExtractor(lif_path)
+    series_list = ex.list_series()
+    if series is None:
+        if len(series_list) == 1:
+            series = series_list[0].name
+        else:
+            console.print(
+                f"[red]LIF has {len(series_list)} series; pass --series to choose:[/red]"
+            )
+            for s in series_list:
+                console.print(f"  {s.name!r}")
+            raise typer.Exit(2)
+    series_info = next((s for s in series_list if s.name == series), None)
+    if series_info is None:
+        console.print(f"[red]series {series!r} not found in LIF[/red]")
+        raise typer.Exit(2)
+
+    out_stem = stem or lif_path.stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    pos_list = (
+        [p for p in series_info.positions if p.name == position]
+        if position is not None
+        else series_info.positions
+    )
+    if not pos_list:
+        console.print("[yellow]no positions selected[/yellow]")
+        raise typer.Exit(0)
+
+    total_planes = 0
+    total_skipped = 0
+    total_bytes = 0
+    from .lif.import_flow import _position_number
+
+    for pos_idx, pos in enumerate(pos_list, start=1):
+        # Output position number = the real Leica position number (readlif
+        # yields positions out of numeric order), so the source-dir layout
+        # this writes matches a LAS X export and feeds import-acquisition
+        # with identical position numbering.
+        out_pos = _position_number(pos.name, pos_idx)
+        nz = pos.n_planes
+
+        def _path_fn(t: int, z: int, raw_ch: int, _out_pos=out_pos) -> Path:
+            return out_dir / (
+                f"{out_stem}_Position {_out_pos}_t{t:03d}_z{z:02d}_ch{raw_ch:02d}.tif"
+            )
+
+        console.print(
+            f"[cyan]Position {pos_idx}/{len(pos_list)}[/cyan] "
+            f"({pos.name}): {pos.n_timepoints} tp × {nz} z × "
+            f"{len(series_info.channels)} ch = "
+            f"{pos.n_timepoints * nz * len(series_info.channels)} planes…"
+        )
+        report = ex.extract_position(
+            series, pos.name,
+            path_fn=_path_fn,
+            bit_depth_policy=bit_depth_policy,
+            compress=compress,
+            overwrite=overwrite,
+        )
+        if report.error:
+            console.print(f"  [red]ERROR:[/red] {report.error}")
+            raise typer.Exit(1)
+        console.print(
+            f"  wrote {report.planes_written} / skipped {report.planes_skipped}"
+            f" · {report.bytes_written / 1e6:.1f} MB"
+        )
+        if report.bit_depth_warning:
+            console.print(f"  [yellow]{report.bit_depth_warning}[/yellow]")
+        total_planes += report.planes_written
+        total_skipped += report.planes_skipped
+        total_bytes += report.bytes_written
+
+        # Write the per-position Properties.xml alongside.
+        xml_dst = out_dir / f"{out_stem}_Position {out_pos}_Properties.xml"
+        ex.write_position_xml(series, pos.name, xml_dst)
+
+    console.print(
+        f"\n[green]done[/green]: wrote {total_planes} planes "
+        f"(skipped {total_skipped}) · {total_bytes / 1e9:.2f} GB total"
+    )
+
+
+@pipeline_app.command("import-lif")
+def pipeline_import_lif_cmd(
+    lif_path: Annotated[Path, typer.Argument(help="Path to a .lif file")],
+    protocol: Annotated[str, typer.Option("--protocol", "-p")],
+    series: Annotated[
+        str | None,
+        typer.Option(
+            "--series",
+            help="Which top-level series (TileScan) to import. "
+                 "Required when the LIF has >1 series.",
+        ),
+    ] = None,
+    image_loc_root: Annotated[
+        Path,
+        typer.Option("--image-loc-root"),
+    ] = Path("/murrlab3"),
+    alias_root: Annotated[
+        Path | None,
+        typer.Option("--alias-root"),
+    ] = Path("/murrlab"),
+    legacy_xml_dir: Annotated[
+        Path | None,
+        typer.Option("--legacy-xml-dir"),
+    ] = None,
+    user: Annotated[str | None, typer.Option("--user")] = None,
+    run_through: Annotated[
+        str,
+        typer.Option(
+            "--run-through",
+            help=f"Last step to execute. One of: {', '.join(STEPS)}.",
+        ),
+    ] = "write_matlab_params",
+    position: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--position",
+            help="Position name(s) to import. Default: all in the series.",
+        ),
+    ] = None,
+    channel_role: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--channel-role",
+            help="Override channel role: e.g. '0=histone' (raw_ch=role). "
+                 "Repeatable. Defaults to the Protocol's channel_map.",
+        ),
+    ] = None,
+    bit_depth_policy: Annotated[
+        str, typer.Option("--bit-depth-policy")
+    ] = "downcast",
+    no_compress: Annotated[bool, typer.Option("--no-compress")] = False,
+    overwrite: Annotated[bool, typer.Option("--overwrite")] = False,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes", "-y",
+            help="Skip the channel-mapping confirmation prompt.",
+        ),
+    ] = False,
+    person: str = "",
+    strain: str = "",
+    perturbation: str = "",
+    reporter: str = "",
+    comments: str = "",
+    set_param: Annotated[
+        list[str] | None, typer.Option("--set-param", "-s")
+    ] = None,
+) -> None:
+    """Import a LIF file end-to-end (extract directly to staged layout + run pipeline).
+
+    Each position in the chosen series becomes a Series row. Per-plane
+    TIFs land in ``<image_loc_root>/<user>/images/<series>_L<N>/<role>/``
+    with LZW compression and Z-inversion (deepest plane = p01). The
+    sliced Properties.xml goes to ``<…>/dats/``. The orchestrator's
+    inline steps (stage_metadata, compute_timestamps, write_acetree_config,
+    write_embryodb_xml, create_alias_symlink, write_matlab_params) run
+    against the already-staged files.
+
+    The TIF write loop is the slow part (~30 min for a 240-tp embryo on
+    NFS). Run via the GUI dialog or behind ``nohup`` if you need it to
+    survive an SSH disconnect.
+    """
+    from sqlalchemy import select
+    from .lif import LifExtractor
+    from .lif.import_flow import import_lif
+    from .models import Protocol
+
+    if run_through not in STEPS:
+        raise typer.BadParameter(f"--run-through must be one of {STEPS}")
+
+    overrides: dict[str, str] = {}
+    for pair in set_param or []:
+        if "=" not in pair:
+            raise typer.BadParameter(f"--set-param expects k=v, got {pair!r}")
+        k, v = pair.split("=", 1)
+        overrides[k] = v
+
+    channel_role_override: dict[int, str] = {}
+    for spec in channel_role or []:
+        if "=" not in spec:
+            raise typer.BadParameter(
+                f"--channel-role expects raw_ch=role, got {spec!r}"
+            )
+        raw, role = spec.split("=", 1)
+        try:
+            channel_role_override[int(raw)] = role.strip()
+        except ValueError:
+            raise typer.BadParameter(f"raw_ch must be an integer, got {raw!r}")
+
+    # Inspect first so the user sees what they're about to import.
+    ex = LifExtractor(lif_path)
+    series_list = ex.list_series()
+    if series is None:
+        if len(series_list) == 1:
+            series = series_list[0].name
+        else:
+            console.print(
+                f"[red]LIF has {len(series_list)} series; pass --series:[/red]"
+            )
+            for s in series_list:
+                p0 = s.positions[0] if s.positions else None
+                console.print(
+                    f"  {s.name!r}  ({len(s.positions)} pos × "
+                    f"{p0.n_timepoints if p0 else 0} tp)"
+                )
+            raise typer.Exit(2)
+    series_info = next((s for s in series_list if s.name == series), None)
+    if series_info is None:
+        console.print(f"[red]series {series!r} not found[/red]")
+        raise typer.Exit(2)
+
+    # Confirmation: display channel mapping + disk estimate so a
+    # misconfigured Protocol or channel_role override is visible BEFORE
+    # the multi-hour extraction.
+    with database.session_scope() as session:
+        proto = session.execute(
+            select(Protocol).where(Protocol.name == protocol)
+        ).scalar_one_or_none()
+        if proto is None:
+            console.print(f"[red]no protocol named {protocol!r}[/red]")
+            raise typer.Exit(1)
+        # Build effective channel map for display.
+        eff_map: dict[int, str] = {}
+        for raw_idx_str, role in (proto.channel_map or {}).items():
+            try:
+                eff_map[int(raw_idx_str)] = role
+            except ValueError:
+                continue
+        eff_map.update(channel_role_override)
+
+    console.print(
+        f"\n[bold]Importing[/bold] {lif_path}  series={series!r}\n"
+        f"  positions:  {len(series_info.positions)}"
+        + (f" (filtered to {len(position)})" if position else "")
+    )
+    console.print(
+        f"  per-pos:    {series_info.positions[0].n_timepoints} tp × "
+        f"{series_info.positions[0].n_planes} planes × "
+        f"{len(series_info.channels)} ch  "
+        f"= {series_info.positions[0].n_timepoints * series_info.positions[0].n_planes * len(series_info.channels):,} planes"
+    )
+    console.print(
+        f"  est size:   ~{series_info.estimated_uncompressed_bytes() / 1e9:.1f} GB "
+        f"uncompressed (LZW typically 30-50% of that)\n"
+    )
+    console.print(f"[bold]Channel mapping[/bold] (from Protocol {protocol!r}):")
+    for c in series_info.channels:
+        role = eff_map.get(c.raw_index, "(unmapped → tifC?)")
+        # Heuristic warning: histone is usually the longer wavelength.
+        warn = ""
+        if (
+            role == "histone" and c.laser_line_nm is not None
+            and c.laser_line_nm < 500
+        ):
+            warn = "  [yellow]· note: histone on a short-wavelength channel[/yellow]"
+        elif (
+            role == "reporter" and c.laser_line_nm is not None
+            and c.laser_line_nm >= 560
+        ):
+            warn = "  [yellow]· note: reporter on a long-wavelength channel[/yellow]"
+        console.print(
+            f"  raw_ch {c.raw_index}: {c.dye_name or '(no dye)'} "
+            f"· {c.laser_line_nm} nm  →  [bold]{role}[/bold]{warn}"
+        )
+    console.print(
+        f"\n[bold]Acquisition:[/bold]  person={person!r}  strain={strain!r}  "
+        f"perturbation={perturbation!r}  reporter={reporter!r}"
+    )
+
+    if not yes:
+        console.print(
+            "\n[bold]Proceed?[/bold] (extraction can take hours; the staged "
+            "files are idempotent so it's safe to rerun.)  [y/N]: ",
+            end="",
+        )
+        ans = input().strip().lower()
+        if ans not in ("y", "yes"):
+            console.print("[yellow]aborted[/yellow]")
+            raise typer.Exit(0)
+
+    # Run the import.
+    with database.session_scope() as session:
+        proto = session.execute(
+            select(Protocol).where(Protocol.name == protocol)
+        ).scalar_one()
+        opts = ImportOptions(
+            image_loc_root=image_loc_root,
+            alias_root=alias_root,
+            user=user,
+            parameter_overrides=overrides,
+            compress_with_lzw=not no_compress,
+            overwrite_existing_images=overwrite,
+            run_through_step=run_through,
+        )
+        result = import_lif(
+            session,
+            lif_path=lif_path,
+            series_name=series,
+            protocol=proto,
+            options=opts,
+            person=person,
+            strain_name=strain,
+            treatments=perturbation,
+            reporter_gene=reporter,
+            comments=comments,
+            legacy_xml_dir=legacy_xml_dir,
+            positions=position,
+            channel_role_override=channel_role_override,
+            bit_depth_policy=bit_depth_policy,
+            compress=not no_compress,
+            on_progress=lambda sname, done, total: print(
+                f"  {sname}: {done}/{total} planes", flush=True
+            ) if done and done % 100 == 0 else None,
+        )
+    console.print(f"\n{result.summary()}")
+    for outc in result.series_outcomes:
+        st = outc.stage_outcome
+        line = (
+            f"  [bold]{outc.series_name}[/bold] -> {outc.image_loc} "
+            f"(written={st.written if st else 0} skipped={st.skipped if st else 0})"
+        )
+        if outc.failed_step:
+            line += f"  [red]FAILED at {outc.failed_step}[/red]: {outc.error}"
+        console.print(line)
+
+
 @pipeline_app.command("worker")
 def pipeline_worker_cmd() -> None:
     """Start the per-machine background worker (exits when queue is empty).

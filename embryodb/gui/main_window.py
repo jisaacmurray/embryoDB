@@ -118,6 +118,10 @@ class MainWindow(QtWidgets.QMainWindow):
         act_import.triggered.connect(self._on_import)
         file_menu.addAction(act_import)
 
+        act_import_lif = QtGui.QAction("Import from LIF…", self)
+        act_import_lif.triggered.connect(self._on_import_from_lif)
+        file_menu.addAction(act_import_lif)
+
         act_export = QtGui.QAction("Export all to export-dir…", self)
         act_export.triggered.connect(self._on_export)
         file_menu.addAction(act_export)
@@ -656,6 +660,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(
                 "Acquisition import queued; worker running in background.", 8000
             )
+
+    def _on_import_from_lif(self) -> None:
+        from .lif_import_dialog import LifImportDialog
+        LifImportDialog(self._session_cm, parent=self).exec()
+        self._refresh_all()
 
     # --- live pipeline-status polling -------------------------------------
 

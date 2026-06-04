@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -41,14 +42,34 @@ class ExtractStep:
     description: str   # tooltip
     kind: str          # "java" or "perl"
     target: str        # JAR-relative class name (java) or script filename (perl)
+    per_series: bool = False  # True = tool takes one series name, not a list file
 
 
 # Ordered exactly as in extract.sh. The default UI selection mirrors this
 # order; users can deselect any subset.
+#
+# per_series=True: the legacy tool takes a single series name as args[0] and
+# has no list-file batch mode. We must invoke it once per series.
+#   - RedExtractor1: makeConfigPathFromName() processes args[0] directly as a
+#     series name; if args[0] is a path to an existing file it strips the
+#     directory and extension to get the stem, then looks up that stem in
+#     embryoDB — so a /tmp/embryodb-extract-*.list file produces the wrong stem.
+#   - Partial.pl / UpdatePermissions.pl: $ARGV[0] is used verbatim as the
+#     series name to construct {DBloc}/{series}.xml; no list-file branch exists.
+# per_series=False: the tool checks if args[0] / $ARGV[0] refers to an
+# existing file and, if so, reads it as a newline-delimited series list.
+#
+# Step kinds:
+#   - "java"        → java -mx500m -cp acebatch3.jar <Target> <arg>
+#   - "perl"        → perl <target.pl> <arg>
+#   - "python_cli"  → <sys.executable> -m embryodb.cli <target> <arg>
+#                     (used by Partial, which has been ported off Partial.pl
+#                     so that partial_editing_code is read from the DB, not
+#                     from the stale legacy XML).
 EXTRACT_STEPS: tuple[ExtractStep, ...] = (
     ExtractStep("red_extractor", "RedExtractor1",
         "Quantitate red-channel signal per nucleus.",
-        "java", "RedExtractor1"),
+        "java", "RedExtractor1", per_series=True),
     ExtractStep("red_excel1", "RedExcel1",
         "Format RedExtractor output into per-series S<name>.csv.",
         "java", "RedExcel1"),
@@ -56,8 +77,9 @@ EXTRACT_STEPS: tuple[ExtractStep, ...] = (
         "Combine positions + expression into CD<name>.csv.",
         "java", "RedExcel2"),
     ExtractStep("partial", "Partial",
-        "Trim per-cell tables to the curated extent recorded in checkedby.",
-        "perl", "Partial.pl"),
+        "Trim per-cell tables using partial_editing_code from the new DB "
+        "(replaces legacy Partial.pl which read stale XML).",
+        "python_cli", "partial", per_series=True),
     ExtractStep("measure", "Measure1",
         "Nuclear morphometry; writes <series>AuxInfo.csv.",
         "java", "Measure1"),
@@ -65,11 +87,14 @@ EXTRACT_STEPS: tuple[ExtractStep, ...] = (
         "Sulston-lineage alignment.",
         "java", "Align1"),
     ExtractStep("process_time", "ProcessTime",
-        "Per-timepoint absolute timestamps; writes TIME<series>.csv.",
+        "Per-timepoint timestamps via legacy ProcessTime.pl (SP5 era + older "
+        "Stellaris exports). v2-imported acquisitions already have these in "
+        "the DB and on disk from the import-time compute_timestamps step; "
+        "only run this for series that pre-date the v2 pipeline.",
         "perl", "ProcessTime.pl"),
     ExtractStep("update_perms", "UpdatePermissions",
         "chgrp / chmod across dats/ so other lab members can read outputs.",
-        "perl", "UpdatePermissions.pl"),
+        "perl", "UpdatePermissions.pl", per_series=True),
 )
 
 EXTRACT_STEPS_BY_KEY: dict[str, ExtractStep] = {s.key: s for s in EXTRACT_STEPS}
@@ -136,6 +161,34 @@ class LaunchResult:
     series_list: Path
 
 
+def _step_invocation(step: ExtractStep, arg: str, base_dir: Path) -> str:
+    """Render one shell invocation for `step` against `arg`.
+
+    `arg` is either a series name (per_series steps) or a path to the
+    series-list temp file (batch-mode steps).
+    """
+    if step.kind == "java":
+        return (
+            f"nice java -mx500m "
+            f"-cp {shell_quote(str(base_dir / 'acebatch3.jar'))} "
+            f"{step.target} {shell_quote(arg)}"
+        )
+    if step.kind == "perl":
+        return (
+            f"nice perl {shell_quote(str(base_dir / step.target))} "
+            f"{shell_quote(arg)}"
+        )
+    if step.kind == "python_cli":
+        # Use sys.executable so the detached subprocess uses the same Python
+        # / venv as the GUI that spawned it — PATH lookups for `embryodb`
+        # aren't reliable in detached bash sessions.
+        return (
+            f"nice {shell_quote(sys.executable)} -m embryodb.cli "
+            f"{step.target} {shell_quote(arg)}"
+        )
+    raise AssertionError(f"unknown step kind {step.kind!r}")
+
+
 def run_extract(
     series_names: list[str],
     step_keys: list[str],
@@ -170,20 +223,20 @@ def run_extract(
     chosen = [s for s in EXTRACT_STEPS if s.key in set(step_keys)]
     parts: list[str] = []
     for step in chosen:
-        if step.kind == "java":
+        # per_series steps have no list-file batch mode: invoke once per name.
+        # All other steps accept a list file directly.
+        if step.per_series:
+            invocations: list[str] = []
+            for name in series_names:
+                invocations.append(_step_invocation(step, name, base_dir))
             parts.append(
-                f"echo '== {step.label} ==' && "
-                f"nice java -mx500m -cp {shell_quote(str(base_dir / 'acebatch3.jar'))} "
-                f"{step.target} {shell_quote(str(list_file))}"
-            )
-        elif step.kind == "perl":
-            parts.append(
-                f"echo '== {step.label} ==' && "
-                f"nice perl {shell_quote(str(base_dir / step.target))} "
-                f"{shell_quote(str(list_file))}"
+                f"echo '== {step.label} ==' && " + " && ".join(invocations)
             )
         else:
-            raise AssertionError(f"unknown step kind {step.kind!r}")
+            parts.append(
+                f"echo '== {step.label} ==' && "
+                + _step_invocation(step, str(list_file), base_dir)
+            )
     # `&&` so a failed step halts the rest. Each step echoes a banner so
     # the log is human-skimmable.
     shell = " && ".join(parts)
@@ -194,8 +247,8 @@ def run_extract(
 def run_print_trees(
     series_names: list[str],
     *,
-    min_expr: float | None = None,
-    max_expr: float | None = None,
+    min_expr: int | None = None,
+    max_expr: int | None = None,
     color_scheme: str = "rainbow",
     linewidth: int = 3,
     tools3_dir: Path | None = None,
@@ -204,6 +257,9 @@ def run_print_trees(
 
     Tree1 args (positional, per accessory inventory):
         <series_list_file> [minExpr] [maxExpr] [colorScheme|rootCell] [linewidth]
+
+    minExpr/maxExpr/linewidth are parsed by Tree1 via `Integer.parseInt` — they
+    must be ints (passing "0.0" fails with NumberFormatException).
 
     Output PNGs land in /gpfs/fs0/l/murr/trees/ (hardcoded inside Tree1).
     """
@@ -215,11 +271,11 @@ def run_print_trees(
 
     args = [shell_quote(str(list_file))]
     if min_expr is not None:
-        args.append(str(min_expr))
+        args.append(str(int(min_expr)))
         if max_expr is not None:
-            args.append(str(max_expr))
+            args.append(str(int(max_expr)))
             args.append(shell_quote(color_scheme))
-            args.append(str(linewidth))
+            args.append(str(int(linewidth)))
 
     shell = (
         f"echo '== PrintTrees ({len(series_names)} series) ==' && "

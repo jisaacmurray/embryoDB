@@ -20,6 +20,7 @@ from qtpy import QtCore, QtWidgets
 from sqlalchemy.orm import Session
 
 from .. import external
+from ..legacy_sync import sync_legacy_xml
 from ..models import RunStatus, Series, Status
 from ..queries import series as q_series
 from .acetree_config_dialog import AceTreeConfigDialog
@@ -126,34 +127,64 @@ class DetailPanel(QtWidgets.QWidget):
         self._title.setFont(title_font)
         outer.addWidget(self._title)
 
-        # Two-column body: left = editable fields (with Comments as the last,
-        # tall row); right = Provenance + Member-of. Splitter so the user can
+        # Two-column body: left = editable fields in two sub-columns + a
+        # non-editable Pipeline row with a Details… popup; right = Member-of
+        # plus a collapsible Provenance block. Splitter so the user can
         # rebalance.
         body_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         outer.addWidget(body_splitter, 1)
 
-        # --- left column: editable fields --------------------------------
+        # --- left column: editable fields in two sub-columns -------------
         left = QtWidgets.QWidget()
         left_layout = QtWidgets.QVBoxLayout(left)
         left_layout.setContentsMargins(2, 2, 2, 2)
-        form = QtWidgets.QFormLayout()
-        form.setLabelAlignment(QtCore.Qt.AlignRight)
-        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
-        for column, label, kind in EDIT_FIELDS:
+        forms_hbox = QtWidgets.QHBoxLayout()
+        form_a = QtWidgets.QFormLayout()
+        form_b = QtWidgets.QFormLayout()
+        for fl in (form_a, form_b):
+            fl.setLabelAlignment(QtCore.Qt.AlignRight)
+            fl.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+        mid = (len(EDIT_FIELDS) + 1) // 2  # first half on left, rest on right
+        for i, (column, label, kind) in enumerate(EDIT_FIELDS):
             widget = self._make_widget(kind)
             self._widgets[column] = widget
-            form.addRow(label + ":", widget)
-        left_layout.addLayout(form)
+            (form_a if i < mid else form_b).addRow(label + ":", widget)
+
+        # Pipeline summary row (not editable) — clicking Details… pops up the
+        # per-step status table + Re-run button. Lives in column A so the two
+        # form columns balance height (column B has the multi-line Comments).
+        pipe_row = QtWidgets.QWidget()
+        pipe_hbox = QtWidgets.QHBoxLayout(pipe_row)
+        pipe_hbox.setContentsMargins(0, 0, 0, 0)
+        self._pipeline_summary = QtWidgets.QLabel("—")
+        self._pipeline_summary.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        self._pipeline_details_btn = QtWidgets.QPushButton("Details…")
+        self._pipeline_details_btn.setEnabled(False)
+        self._pipeline_details_btn.clicked.connect(self._on_pipeline_details)
+        pipe_hbox.addWidget(self._pipeline_summary, 1)
+        pipe_hbox.addWidget(self._pipeline_details_btn)
+        form_a.addRow("Pipeline:", pipe_row)
+
+        forms_hbox.addLayout(form_a, 1)
+        forms_hbox.addLayout(form_b, 1)
+        left_layout.addLayout(forms_hbox)
         left_layout.addStretch(1)
         body_splitter.addWidget(left)
 
-        # --- right column: provenance + member-of ------------------------
+        # --- right column: member-of + action buttons + collapsible provenance
+        # All actions live here (vs. a bottom row) so removing the dock header
+        # bars actually pays off in vertical space. Member-of stretches to
+        # absorb extra height when the form is taller than the button stack.
         right = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right)
         right_layout.setContentsMargins(2, 2, 2, 2)
+        right_layout.setSpacing(3)
 
         ds_box = QtWidgets.QGroupBox("Member of")
         ds_layout = QtWidgets.QVBoxLayout(ds_box)
+        ds_layout.setContentsMargins(4, 12, 4, 4)
         self._datasets_list = QtWidgets.QListWidget()
         self._datasets_list.setSelectionMode(
             QtWidgets.QAbstractItemView.SingleSelection
@@ -163,66 +194,22 @@ class DetailPanel(QtWidgets.QWidget):
             "surface that dataset in the dataset bar above."
         )
         self._datasets_list.itemDoubleClicked.connect(self._on_dataset_dblclick)
+        # Cap height at ~3 rows. Series that belong to more datasets get a
+        # scroll bar — rare in practice, and not worth burning vertical space
+        # on a laptop for the common case of 0-2 memberships.
+        fm = self._datasets_list.fontMetrics()
+        self._datasets_list.setMaximumHeight(fm.height() * 3 + 12)
         ds_layout.addWidget(self._datasets_list)
         right_layout.addWidget(ds_box)
 
-        prov_box = QtWidgets.QGroupBox("Provenance")
-        prov_layout = QtWidgets.QFormLayout(prov_box)
-        prov_layout.setLabelAlignment(QtCore.Qt.AlignRight)
-        self._prov_widgets: dict[str, QtWidgets.QLabel] = {}
-        for column, label in PROVENANCE_FIELDS:
-            value_label = QtWidgets.QLabel("")
-            value_label.setWordWrap(True)
-            value_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-            self._prov_widgets[column] = value_label
-            prov_layout.addRow(label + ":", value_label)
-        right_layout.addWidget(prov_box)
-
-        # Pipeline steps table
-        pipe_box = QtWidgets.QGroupBox("Pipeline")
-        pipe_vl = QtWidgets.QVBoxLayout(pipe_box)
-        self._pipeline_table = QtWidgets.QTableWidget(0, 3)
-        self._pipeline_table.setHorizontalHeaderLabels(["Step", "Status", ""])
-        self._pipeline_table.horizontalHeader().setStretchLastSection(False)
-        self._pipeline_table.horizontalHeader().setSectionResizeMode(
-            0, QtWidgets.QHeaderView.ResizeToContents
-        )
-        self._pipeline_table.horizontalHeader().setSectionResizeMode(
-            1, QtWidgets.QHeaderView.ResizeToContents
-        )
-        self._pipeline_table.horizontalHeader().setSectionResizeMode(
-            2, QtWidgets.QHeaderView.Stretch
-        )
-        self._pipeline_table.verticalHeader().setVisible(False)
-        self._pipeline_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self._pipeline_table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
-        self._pipeline_table.setMinimumHeight(120)
-        pipe_vl.addWidget(self._pipeline_table)
-
-        self._rerun_btn = QtWidgets.QPushButton("Re-run pipeline…")
-        self._rerun_btn.setEnabled(False)
-        self._rerun_btn.clicked.connect(self._on_rerun_pipeline)
-        pipe_vl.addWidget(self._rerun_btn)
-
-        right_layout.addWidget(pipe_box)
-        right_layout.addStretch(1)
-        body_splitter.addWidget(right)
-
-        body_splitter.setStretchFactor(0, 2)
-        body_splitter.setStretchFactor(1, 1)
-
-        self._dirty_label = QtWidgets.QLabel("")
-        outer.addWidget(self._dirty_label)
-
-        # External-tool launcher + Save / Reload buttons
-        button_row = QtWidgets.QHBoxLayout()
+        # Tool-launcher buttons (one per row so long labels fit in narrow column)
         self._acetree_button = QtWidgets.QPushButton("Launch AceTree")
         self._acetree_button.setToolTip(
             "Spawn the legacy AceTree JAR against this series' config file. "
             "Equivalent to the old EmbryoDB.jar 'AceTreeX' button."
         )
         self._acetree_button.clicked.connect(self._on_launch_acetree)
-        button_row.addWidget(self._acetree_button)
+        right_layout.addWidget(self._acetree_button)
 
         self._edit_acetree_button = QtWidgets.QPushButton("Edit AceTree config…")
         self._edit_acetree_button.setToolTip(
@@ -230,7 +217,7 @@ class DetailPanel(QtWidgets.QWidget):
             "start/end timepoint, axis convention, voxel resolution."
         )
         self._edit_acetree_button.clicked.connect(self._on_edit_acetree_config)
-        button_row.addWidget(self._edit_acetree_button)
+        right_layout.addWidget(self._edit_acetree_button)
 
         self._edit_auxinfo_button = QtWidgets.QPushButton("Edit AuxInfo…")
         self._edit_auxinfo_button.setToolTip(
@@ -239,7 +226,7 @@ class DetailPanel(QtWidgets.QWidget):
             "Generated by Measure; edit when the fit is off."
         )
         self._edit_auxinfo_button.clicked.connect(self._on_edit_auxinfo)
-        button_row.addWidget(self._edit_auxinfo_button)
+        right_layout.addWidget(self._edit_auxinfo_button)
 
         self._delete_button = QtWidgets.QPushButton("Mark for deletion")
         self._delete_button.setToolTip(
@@ -248,18 +235,62 @@ class DetailPanel(QtWidgets.QWidget):
             "Metadata (dats/, AuxInfo, edit.zip) is preserved indefinitely."
         )
         self._delete_button.clicked.connect(self._on_toggle_delete)
-        button_row.addWidget(self._delete_button)
+        right_layout.addWidget(self._delete_button)
 
-        button_row.addStretch(1)
+        # Dirty indicator + Save/Reload pair — kept together at the bottom of
+        # the actions stack since Save is the most-frequent commit action.
+        self._dirty_label = QtWidgets.QLabel("")
+        self._dirty_label.setStyleSheet("color: #b06000;")
+        right_layout.addWidget(self._dirty_label)
+
+        save_row = QtWidgets.QHBoxLayout()
         self._reload_button = QtWidgets.QPushButton("Reload")
         self._reload_button.clicked.connect(self._on_reload)
-        button_row.addWidget(self._reload_button)
+        save_row.addWidget(self._reload_button)
         self._save_button = QtWidgets.QPushButton("Save")
         self._save_button.clicked.connect(self._on_save)
         self._save_button.setDefault(True)
-        button_row.addWidget(self._save_button)
-        outer.addLayout(button_row)
-        outer.addStretch(1)
+        save_row.addWidget(self._save_button)
+        right_layout.addLayout(save_row)
+
+        # Spacer so Member-of + the action stack stay clustered at the top
+        # and the Provenance toggle sticks to the bottom of the right column.
+        right_layout.addStretch(1)
+
+        # Collapsible Provenance block — hidden by default to save vertical space
+        self._prov_toggle = QtWidgets.QToolButton()
+        self._prov_toggle.setText("▸ Provenance")
+        self._prov_toggle.setCheckable(True)
+        self._prov_toggle.setChecked(False)
+        self._prov_toggle.setStyleSheet(
+            "QToolButton { border: none; text-align: left; padding: 2px; }"
+        )
+        self._prov_toggle.toggled.connect(self._on_toggle_provenance)
+        right_layout.addWidget(self._prov_toggle)
+
+        self._prov_frame = QtWidgets.QFrame()
+        prov_layout = QtWidgets.QFormLayout(self._prov_frame)
+        prov_layout.setLabelAlignment(QtCore.Qt.AlignRight)
+        prov_layout.setContentsMargins(8, 0, 0, 4)
+        self._prov_widgets: dict[str, QtWidgets.QLabel] = {}
+        for column, label in PROVENANCE_FIELDS:
+            value_label = QtWidgets.QLabel("")
+            value_label.setWordWrap(True)
+            value_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            self._prov_widgets[column] = value_label
+            prov_layout.addRow(label + ":", value_label)
+        self._prov_frame.setVisible(False)
+        right_layout.addWidget(self._prov_frame)
+
+        body_splitter.addWidget(right)
+
+        # Heavier weight on the left column — the right column holds short
+        # widgets (list, buttons, toggle) and doesn't benefit from extra width.
+        body_splitter.setStretchFactor(0, 3)
+        body_splitter.setStretchFactor(1, 1)
+        # Track whether the loaded row has a re-runnable starrynite step
+        # (used by the Pipeline-details popup to enable the Re-run button).
+        self._has_starrynite_run = False
 
         self._set_enabled(False)
 
@@ -287,11 +318,27 @@ class DetailPanel(QtWidgets.QWidget):
 
     # --- population / save ------------------------------------------------
 
-    def _populate_pipeline_table(self, row: Series) -> None:
+    def _update_pipeline_summary(self, row: Series) -> None:
+        """Refresh the inline Pipeline summary label + Details button state."""
+        from .models import _summarize_runs
+        runs_by_step = {r.step: r for r in row.runs}
+        summary = _summarize_runs(list(row.runs))
+        self._pipeline_summary.setText(summary or "(no pipeline runs)")
+        self._pipeline_details_btn.setEnabled(bool(runs_by_step))
+        self._has_starrynite_run = "run_starrynite" in runs_by_step
+
+    def _fill_pipeline_table(
+        self, table: QtWidgets.QTableWidget, row: Series
+    ) -> None:
+        """Populate `table` with one row per pipeline step.
+
+        Shared by the Details popup; takes any QTableWidget so the popup owns
+        the widget lifecycle. Expects the table already to have 3 columns
+        configured.
+        """
         from ..pipeline.orchestrate import STEPS
         runs_by_step = {r.step: r for r in row.runs}
-        has_any = bool(runs_by_step)
-        self._pipeline_table.setRowCount(len(STEPS))
+        table.setRowCount(len(STEPS))
         _STATUS_COLOR = {
             RunStatus.COMPLETE: "#2a8a2a",
             RunStatus.FAILED: "#b00000",
@@ -304,7 +351,7 @@ class DetailPanel(QtWidgets.QWidget):
             status = run.status if run else None
             short = step.replace("write_", "").replace("stage_", "stage/").replace("create_", "")
             step_item = QtWidgets.QTableWidgetItem(short)
-            self._pipeline_table.setItem(r_idx, 0, step_item)
+            table.setItem(r_idx, 0, step_item)
 
             if status is None:
                 status_item = QtWidgets.QTableWidgetItem("—")
@@ -324,29 +371,71 @@ class DetailPanel(QtWidgets.QWidget):
                         if status == RunStatus.PENDING
                         else __import__("qtpy.QtGui", fromlist=["QColor"]).QColor(color)
                     )
-            self._pipeline_table.setItem(r_idx, 1, status_item)
+            table.setItem(r_idx, 1, status_item)
 
-            # Log button for steps with a log file
             if run and run.log_path and Path(run.log_path).exists():
                 log_btn = QtWidgets.QPushButton("Log")
                 log_btn.setMaximumWidth(42)
                 log_btn.setFlat(True)
                 log_path = run.log_path
                 log_btn.clicked.connect(lambda _, p=log_path: self._open_log(p))
-                self._pipeline_table.setCellWidget(r_idx, 2, log_btn)
+                table.setCellWidget(r_idx, 2, log_btn)
             elif run and run.error_excerpt:
                 err_item = QtWidgets.QTableWidgetItem(run.error_excerpt[:80])
                 err_item.setForeground(
                     __import__("qtpy.QtGui", fromlist=["QColor"]).QColor("#b00000")
                 )
                 err_item.setToolTip(run.error_excerpt)
-                self._pipeline_table.setItem(r_idx, 2, err_item)
+                table.setItem(r_idx, 2, err_item)
             else:
-                self._pipeline_table.setItem(r_idx, 2, QtWidgets.QTableWidgetItem(""))
+                table.setItem(r_idx, 2, QtWidgets.QTableWidgetItem(""))
 
-        # Enable Re-run StarryNite if any worker step exists
-        has_sn = "run_starrynite" in runs_by_step
-        self._rerun_btn.setEnabled(has_sn)
+    def _on_pipeline_details(self) -> None:
+        """Open a dialog showing the per-step pipeline state for the loaded series."""
+        if not self._series_name:
+            return
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"Pipeline — {self._series_name}")
+        dlg.resize(560, 380)
+        layout = QtWidgets.QVBoxLayout(dlg)
+
+        table = QtWidgets.QTableWidget(0, 3)
+        table.setHorizontalHeaderLabels(["Step", "Status", ""])
+        table.horizontalHeader().setStretchLastSection(False)
+        table.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeToContents
+        )
+        table.horizontalHeader().setSectionResizeMode(
+            1, QtWidgets.QHeaderView.ResizeToContents
+        )
+        table.horizontalHeader().setSectionResizeMode(
+            2, QtWidgets.QHeaderView.Stretch
+        )
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        layout.addWidget(table)
+
+        with self._session_factory() as session:
+            row = q_series.get_by_name(session, self._series_name)
+            if row is None:
+                dlg.reject()
+                return
+            self._fill_pipeline_table(table, row)
+            has_sn = any(r.step == "run_starrynite" for r in row.runs)
+
+        button_row = QtWidgets.QHBoxLayout()
+        rerun_btn = QtWidgets.QPushButton("Re-run pipeline…")
+        rerun_btn.setEnabled(has_sn)
+        rerun_btn.clicked.connect(lambda: (dlg.accept(), self._on_rerun_pipeline()))
+        button_row.addWidget(rerun_btn)
+        button_row.addStretch(1)
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        button_row.addWidget(close_btn)
+        layout.addLayout(button_row)
+
+        dlg.exec()
 
     def _open_log(self, log_path: str) -> None:
         """Open a log file in a simple read-only viewer dialog."""
@@ -400,6 +489,9 @@ class DetailPanel(QtWidgets.QWidget):
                     row.status = Status.NEW
             row.version = (row.version or 0) + 1
             session.flush()
+        # Mirror the delete flag to the legacy XML so legacy tools also see
+        # the soft-deleted state.
+        sync_legacy_xml(self._series_name)
         self.load_series(self._series_name)
         self.saved.emit(self._series_name)
 
@@ -413,6 +505,10 @@ class DetailPanel(QtWidgets.QWidget):
             return
         if name:
             self.datasetActivationRequested.emit(name)
+
+    def _on_toggle_provenance(self, checked: bool) -> None:
+        self._prov_frame.setVisible(checked)
+        self._prov_toggle.setText(("▾" if checked else "▸") + " Provenance")
 
     def _on_rerun_pipeline(self) -> None:
         if not self._series_name:
@@ -430,8 +526,9 @@ class DetailPanel(QtWidgets.QWidget):
         for label in self._prov_widgets.values():
             label.setText("")
         self._datasets_list.clear()
-        self._pipeline_table.setRowCount(0)
-        self._rerun_btn.setEnabled(False)
+        self._pipeline_summary.setText("—")
+        self._pipeline_details_btn.setEnabled(False)
+        self._has_starrynite_run = False
         self._set_enabled(False)
         self._loaded_version = None
         self._dirty = False
@@ -457,7 +554,7 @@ class DetailPanel(QtWidgets.QWidget):
             placeholder.setFlags(QtCore.Qt.NoItemFlags)
             self._datasets_list.addItem(placeholder)
         self._loaded_version = row.version
-        self._populate_pipeline_table(row)
+        self._update_pipeline_summary(row)
         self._update_delete_button(row)
         self._set_enabled(True)
         self._dirty = False
@@ -563,6 +660,10 @@ class DetailPanel(QtWidgets.QWidget):
             row.version += 1
             session.flush()
             new_version = row.version
+        # Mirror to source-dir XML so the legacy Java/Perl tools (Tree1,
+        # Measure, etc.) see the freshly-saved values. Failure is logged
+        # but doesn't roll back the DB save.
+        sync_legacy_xml(self._series_name)
         self._loaded_version = new_version
         self._dirty = False
         self._dirty_label.setText(f"saved (version {new_version})")

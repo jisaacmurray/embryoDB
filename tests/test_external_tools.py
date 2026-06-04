@@ -42,11 +42,15 @@ def test_run_extract_builds_correct_shell(captured_popen, tmp_path):
     assert result.proc.args[0] == "bash"
     assert result.proc.args[1] == "-c"
     cmd = result.proc.args[2]
-    # canonical order — partial (perl) sits between two java steps
-    red_pos = cmd.find("RedExtractor1")
-    partial_pos = cmd.find("Partial.pl")
-    align_pos = cmd.find("Align1")
+    # Canonical order — partial (now a Python CLI step) sits between the two
+    # Java steps. The banner echo is what's stable across step kinds.
+    red_pos = cmd.find("== RedExtractor1 ==")
+    partial_pos = cmd.find("== Partial ==")
+    align_pos = cmd.find("== Align1 ==")
     assert red_pos > 0 < partial_pos < align_pos
+    # Partial is invoked via the new Python entry, not legacy Partial.pl.
+    assert "embryodb.cli partial" in cmd
+    assert "Partial.pl" not in cmd
     # acebatch3.jar path quoted with single quotes
     assert "'/fake/tools3/acebatch3.jar'" in cmd
     # detached subprocess kwargs
@@ -89,6 +93,9 @@ def test_run_print_trees_minimal(captured_popen, tmp_path):
 
 
 def test_run_print_trees_with_params(captured_popen, tmp_path):
+    # Tree1 parses min/max/linewidth with Integer.parseInt — passing a float
+    # string (e.g. "100.0") triggers NumberFormatException. Even when the
+    # caller passes a float, the wrapper must serialize as an int.
     result = external_tools.run_print_trees(
         ["seriesA"],
         min_expr=100.0,
@@ -100,8 +107,10 @@ def test_run_print_trees_with_params(captured_popen, tmp_path):
     cmd = result.proc.args[2]
     # Tree1's positional args: <list> <min> <max> <colorOrRoot> <linewidth>
     after = cmd.split("Tree1")[1]
-    assert "100.0" in after
-    assert "5000.0" in after
+    assert " 100 " in after
+    assert " 5000 " in after
+    assert "100.0" not in after
+    assert "5000.0" not in after
     assert "'ABal'" in after
     assert " 5" in after
 

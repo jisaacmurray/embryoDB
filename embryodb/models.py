@@ -186,6 +186,11 @@ class Series(Base, TimestampMixin):
     runs: Mapped[list[PipelineStepRun]] = relationship(
         back_populates="series", cascade="all, delete-orphan"
     )
+    volume_timestamps: Mapped[list["VolumeTimestamp"]] = relationship(
+        back_populates="series",
+        cascade="all, delete-orphan",
+        order_by="VolumeTimestamp.timepoint",
+    )
 
     def __repr__(self) -> str:
         return f"<Series {self.series_name!r} status={self.status} v={self.version}>"
@@ -332,7 +337,28 @@ class MicroscopyMetadata(Base):
     frame_averaging: Mapped[int | None] = mapped_column(Integer)
 
     # Free-form per-channel info (name, wavelength, LUT, fluorophore, gain…)
+    # See parsers/leica_metadata.py::_extract_active_channels for the merge
+    # logic that combines ChannelDescription + active Detector + matching
+    # Laser/LaserLineSetting into one entry per active channel.
     channels: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
+
+    # Phase 2 additive columns. JSON blobs rather than dedicated columns
+    # because they're rarely the basis for filtering — surfaced via the
+    # "Microscopy details…" dialog in the GUI, not the browser table.
+    #
+    # acquisition_settings: scalar scan/system fields not already promoted
+    #   to typed columns (bit_size, pixel_dwell_time_us, zoom, scan geometry,
+    #   z range, programmed timing, instrument identity). See
+    #   parsers/leica_metadata.py::_extract_acquisition_settings.
+    # depth_compensation: per-active-channel projected intensity/gain curves
+    #   sampled at each Z position the microscope was programmed to
+    #   compensate at. See _extract_depth_compensation.
+    acquisition_settings: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, nullable=False
+    )
+    depth_compensation: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, nullable=False
+    )
 
     stage_x_um: Mapped[float | None] = mapped_column(Float)
     stage_y_um: Mapped[float | None] = mapped_column(Float)
@@ -340,6 +366,45 @@ class MicroscopyMetadata(Base):
 
     acquired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     raw_metadata_path: Mapped[str | None] = mapped_column(Text)
+
+
+class VolumeTimestamp(Base):
+    """Per-timepoint absolute acquisition time for one Series.
+
+    Populated at import time by the ``compute_timestamps`` step from the
+    microscope vendor's metadata file (via ``parsers/timestamps.py``).
+    Replaces the legacy ``TIME{series}.csv`` artifact as the source of
+    truth — the CSV is still emitted from this table for downstream
+    tools that haven't been ported yet
+    (``LineagePhenotyping/CompareDivTime.pl``).
+
+    Times are integer seconds to match the legacy CSV format byte-for-byte;
+    the underlying microscope FILETIME is parsed at the millisecond level
+    but we round to keep round-trip output stable.
+    """
+
+    __tablename__ = "volume_timestamps"
+    __table_args__ = (
+        UniqueConstraint(
+            "series_id", "timepoint", name="uq_volume_timestamps_series_tp"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    series_id: Mapped[int] = mapped_column(
+        ForeignKey("series.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    timepoint: Mapped[int] = mapped_column(Integer, nullable=False)
+    absolute_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    delta_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    series: Mapped[Series] = relationship(back_populates="volume_timestamps")
+
+    def __repr__(self) -> str:
+        return (
+            f"<VolumeTimestamp series={self.series_id} tp={self.timepoint} "
+            f"t={self.absolute_seconds}s>"
+        )
 
 
 class PipelineStepRun(Base):
@@ -389,5 +454,6 @@ __all__ = [
     "Protocol",
     "MicroscopyMetadata",
     "PipelineStepRun",
+    "VolumeTimestamp",
     "dataset_series_table",
 ]

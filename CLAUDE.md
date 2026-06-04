@@ -32,8 +32,13 @@ the code; this is a map.
 | **v2 — Pipeline import** | done | 9 step orchestrator, background worker (handles `stage_images` + 3 subprocess steps), per-host pidfile, heartbeat-based crash recovery, GUI import wizard, live status polling, off-hours `delay_hours` scheduling, soft-delete lifecycle + `gc-deleted` CLI |
 | **v2.1 — Multi-user + Postgres** | done (docs + schema) | Schema vendor-agnostic, additive migrations on connect (`deleted_at`, `deleted_by`, `not_before`, VARCHAR→TEXT widening); README has full Postgres runbook + Mac SSH-tunnel recipe. Lab Postgres on `penticton`; `/opt/embryodb/venv` recommended install model. |
 | **v2.2 — Legacy tool launchers** | done | GUI dialogs for the 8 `extract.sh` steps and `PrintTrees.pl` (Tree1); selection-based + dataset-based |
-| v2.5 — LineagePhenotyping bridge + FastAPI | pending | |
-| **v3 — Reimplement Java/Perl tools in Python** | pending | The bigger remaining chunk. See "Legacy tools currently called" below. |
+| **v2.3 — Laptop-optimized GUI** | done | Detail dock fits a 1366×768 screen with ≥10 table rows visible. See "GUI layout — design goals" below. |
+| **v2.4 — Partial.pl ported** | done | `embryodb partial` reads `partial_editing_code` from the DB instead of the stale legacy XML. First piece of the extract chain to be reimplemented in Python. |
+| **v2.5 — Legacy XML auto-sync** | done | Every GUI save path (detail edit, bulk edit, mark-for-deletion) re-writes `source_dir/<series>.xml` so legacy tools (Tree1, Measure, RedExtractor1, …) see fresh `edited_timepts` / `partial_editing_code` / etc. immediately. CLI catch-up via `embryodb sync-legacy-xml [name…\|all]`. Bridge during the v3 rewrite — retires once the legacy tools are ported. |
+| **v2.6 — TIME at import time** | done | New `compute_timestamps` pipeline step parses the Stellaris `<TimeStampList>` (hex FILETIME) at import, fills `volume_timestamps`, and writes `TIME<series>.csv` from the DB. `ProcessTime` removed from the default extract checklist (legacy SP5 series only). Vendor-pluggable registry in `parsers/timestamps.py`. CLI: `embryodb emit-time-csv [name…\|all]`. |
+| **v2.7 — Acquisition settings + depth compensation** | done | Parser now extracts per-active-channel laser line + AOTF intensity + detector gain/dye/band, depth-compensation curves (projected per channel), and scalar scope settings (bit depth, pixel dwell, zoom, scan geometry, programmed timing, instrument serial). Stored as JSON on `MicroscopyMetadata` (`channels`, `depth_compensation`, `acquisition_settings`). Right-click → **Microscopy details…** opens a per-series dialog with the high-value table (channels + depth-comp curve). |
+| v2.8 — LineagePhenotyping bridge + FastAPI | pending | |
+| **v3 — Reimplement remaining Java/Perl tools** | pending | The bigger remaining chunk. See "Legacy tools currently called" below + the v3 ordering note. |
 | v4 — acetree_py / archive lifecycle / image tiles | pending | |
 
 ## Quickstart
@@ -121,6 +126,67 @@ new files added). This is the v1 guarantee; v2 honours it via
   create_alias_symlink, write_matlab_params, **run_starrynite,
   run_red_extract, run_measure**. Last three are PENDING stubs.
 
+## GUI layout — design goals (maintain across changes)
+
+The dock layout was tuned in v2.3 so the default open dock fits a 1366×768
+laptop with ≥10 rows of the browser table still visible. Re-arrangements
+should preserve these properties; they're load-bearing for day-to-day use.
+
+- **No vertical header rows on the dock.** The QDockWidget's title bar is
+  hidden via `setTitleBarWidget(QWidget())`; the View menu's toggle action
+  handles show/hide. Dataset and Details subsections are wrapped in
+  `QFrame(StyledPanel)` for visual separation but with no titles.
+- **Editable fields are split into two sub-columns** (`form_a` / `form_b`
+  in `gui/detail_panel.py`). Pipeline lives in column A as a read-only
+  summary + `Details…` popup; Comments (multi-line) lives in column B —
+  this balances the two columns' heights.
+- **Right column is short, fixed-content.** Member-of list is capped at
+  ~3 rows (`fm.height() * 3 + 12`) with a scroll bar for the rare case of
+  many memberships. Action buttons (Launch AceTree / Edit AceTree config /
+  Edit AuxInfo / Mark for deletion) stack vertically below it, with
+  Reload+Save in a 2-col HBox, the dirty indicator above. Provenance is a
+  collapsible block at the bottom (`▸ Provenance`), hidden by default. No
+  separate bottom-of-dock button row.
+- **Splitter is 3:1 left:right**; the user can still drag-rebalance on
+  larger monitors. The form fields stretch horizontally so wider monitors
+  give more text-input space without restructuring.
+- **Dataset bar is two rows**: row 1 = `Search` + `Dataset` combo + `New…`
+  + `Show only members`; row 2 = membership / inspection / export /
+  analysis buttons. Each row's stretch absorbs slack on wider monitors.
+
+If you're changing the detail panel or dataset bar, eyeball the result at
+1366×768 (or use `QT_QPA_PLATFORM=offscreen` + screenshot helper) and keep
+at least 10 browser rows visible with the dock at its default position.
+
+## Legacy XML auto-sync (v2.5)
+
+The legacy `source_dir/<series>.xml` files are still the source of truth
+for every Java/Perl tool (Tree1 reads `iRecord[11]` for end time;
+RedExtractor1, Measure1, etc. all open `EmbryoXML(<series>)`). The new
+GUI is the source of truth for the DB. To keep the two in lock-step
+during the v3 rewrite, every save path in the new GUI re-writes the
+legacy XML through `embryodb.legacy_sync.sync_legacy_xml(name)`:
+
+- `DetailPanel._on_save` — single-series edits
+- `DetailPanel._on_toggle_delete` — soft-delete flag flips
+- `BulkEditMetadataDialog._on_apply` — bulk metadata edits
+
+When porting a new save path, route it through `sync_legacy_xml(name)` /
+`sync_many(names)` after `session.commit()` so legacy tools see the same
+state. Failures are logged to stderr but do not abort the GUI save —
+losing the legacy mirror is recoverable via `embryodb sync-legacy-xml`.
+
+**Audit-import is preserved.** The exporter rewrites with the canonical
+form whenever `version > 1`, and the auto-sync bumps both `version` and
+`raw_xml` in the same transaction. Round-tripping a synced row through
+`audit-import` still produces a 0-byte diff because source-dir is now
+the canonical form, and that's what the exporter produces too.
+
+**Retirement.** This sync goes away once every legacy tool either reads
+from the DB directly (the Tree1/Measure ports) or has been replaced by a
+Python implementation. Search the codebase for `sync_legacy_xml` to find
+the call sites that need to be removed when the time comes.
+
 ## Gotchas
 
 - **PySide6 doesn't launch on the lab cluster.** Missing
@@ -168,7 +234,7 @@ reimplementation. Listed roughly in order of how much code depends on them.
 | `acebatch3.jar` | `RedExcel2` | `external_tools.run_extract` | Position + expression → `CD<series>.csv` |
 | `acebatch3.jar` | `Align1` | `external_tools.run_extract` | Sulston-lineage alignment |
 | `acexpress_CL2.jar` | `Tree1` | `external_tools.run_print_trees` (via the GUI "Print trees…" launcher) | Lineage-tree PNG with expression overlay; output at `/gpfs/fs0/l/murr/trees/` |
-| `partialCSV.jar` | (no class — `-jar`) | `Partial.pl` (invoked via `external_tools.run_extract`) | Trim per-cell tables to the curated extent from `checkedby` |
+| `partialCSV.jar` | (no class — `-jar`) | `embryodb.partial` (Python wrapper that replaced Partial.pl in v2.4) | Trim per-cell tables to the curated extent from the DB's `partial_editing_code` |
 | `AceTree_Santella.jar` | (no class — `-jar`) | `external.launch_acetree` (detail-panel button) | Legacy curation GUI; fire-and-forget |
 
 ### Perl scripts (`/gpfs/fs0/l/murr/tools3/`)
@@ -176,10 +242,10 @@ reimplementation. Listed roughly in order of how much code depends on them.
 | Script | Called from | What it does |
 |---|---|---|
 | `matlab_SN_cluster.pl` | `pipeline.subprocess_steps.step_run_starrynite` | Wraps the compiled-Matlab StarryNite pipeline; uses MCR v714 |
-| `Partial.pl` | `external_tools.run_extract` | Drives `partialCSV.jar` to trim CD/CA/SCD/SCA tables to curated extent |
-| `ProcessTime.pl` | `external_tools.run_extract` | Per-timepoint timestamps; writes `TIME<series>.csv` |
+| ~~`Partial.pl`~~ | ported in v2.4 → `embryodb.partial` | Replaced — reads `partial_editing_code` from the DB instead of `<checkedby>` in the legacy XML. Still drives `partialCSV.jar` for the lineage-walk trim. |
+| `ProcessTime.pl` | `external_tools.run_extract` — opt-in for legacy SP5 series only. The Stellaris branch was ported to `parsers/timestamps.py` in v2.6; the SP5 `info/_t<N>_*` branch still needs a Python port. | Per-timepoint timestamps for SP5-era data (writes `TIME<series>.csv`). |
 | `UpdatePermissions.pl` | `external_tools.run_extract` | `chgrp users` + `chmod` across each series' `dats/` |
-| `Process_Time_Stellaris.pl` | (not yet wired) | Stellaris variant of `ProcessTime.pl`; not in `extract.sh` flow today |
+| ~~`Process_Time_Stellaris.pl`~~ | ported in v2.6 → `parsers/timestamps.py::LeicaStellarisTimestampParser` | The old regex looked for `<TimeStamp RelativeTime="..."/>`; the modern Stellaris format packs timestamps as hex Windows FILETIME values in `<TimeStampList>`. The Python parser handles the new format. |
 | `GetACD.pl` | (not yet wired) | ACD coordinate normalization vs. Richards 2013 reference |
 | `PrintTrees.pl` | bypassed | Tiny wrapper around `Tree1`; we call the Java class directly |
 
@@ -197,6 +263,29 @@ emitters) to Python alongside the Java calls (already underway —
 Java workhorses (`RedBkgComp7`, `Measure`, `SeriesSulstonizer`) using
 numpy + scipy; (3) consolidate tree rendering (Tree1 + LIVEtools +
 TreeExprViewer2 → one Python renderer).
+
+### v3 ordering (negotiated 2026-05-25)
+
+- **Tree1 wrapper next.** Read `edited_timepts` from the DB and pass it as
+  an explicit CLI arg so the in-jar XML lookup stops mattering. Should be
+  a one-day port; the v2.5 auto-sync already protects against drift, but
+  the wrapper retires the XML dependency for this tool entirely.
+- **`UpdatePermissions.pl` next.** Already largely subsumed by
+  `fsutil.safe_write`; trivial to finish (just `os.chmod` + `os.chown`).
+- ~~`ProcessTime.pl` / `Process_Time_Stellaris.pl`~~ — **done in v2.6.**
+  Per-timepoint timestamps are now parsed at import time by the new
+  `compute_timestamps` pipeline step. Vendor-pluggable parser registry
+  lives in `embryodb/parsers/timestamps.py` (Leica Stellaris implemented;
+  SP5-era format + non-Leica vendors plug in by adding a `TimestampParser`
+  to `TIMESTAMP_PARSERS`). Output: `volume_timestamps` table + per-series
+  `TIME<series>.csv` for downstream consumers that haven't been ported
+  (`LineagePhenotyping/CompareDivTime.pl`). The legacy `ProcessTime`
+  extract step is unchecked by default in the GUI dialog — opt-in only
+  for series that pre-date the v2 pipeline.
+- **Then port the Java workhorses** (RedBkgComp7, Measure,
+  SeriesSulstonizer) in numpy/scipy as originally planned.
+- **Last: consolidate tree rendering** (Tree1 + LIVEtools +
+  TreeExprViewer2 → one Python renderer).
 
 ## Future-feature placeholders (designed but not yet implemented)
 

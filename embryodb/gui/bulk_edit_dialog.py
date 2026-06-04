@@ -156,6 +156,7 @@ class BulkEditMetadataDialog(QtWidgets.QDialog):
 
         applied = 0
         not_found: list[str] = []
+        applied_names: list[str] = []
         with self._session_cm() as s:
             for name in self._series_names:
                 row = q_series.get_by_name(s, name)
@@ -167,11 +168,19 @@ class BulkEditMetadataDialog(QtWidgets.QDialog):
                 row.updated_by = settings.user
                 row.version = (row.version or 0) + 1
                 applied += 1
+                applied_names.append(name)
             s.flush()
+
+        # Mirror each updated series to its legacy XML so the legacy
+        # Java/Perl tools see the bulk edits.
+        from ..legacy_sync import sync_many
+        n_written, n_failed = sync_many(applied_names)
 
         msg = f"Updated {applied} series."
         if not_found:
             msg += f"\nNot found: {len(not_found)}"
+        if n_failed:
+            msg += f"\nLegacy-XML sync failed for {n_failed} series (see stderr)."
         QtWidgets.QMessageBox.information(self, "Bulk edit complete", msg)
         self.accept()
 

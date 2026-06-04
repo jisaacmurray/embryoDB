@@ -237,6 +237,425 @@ def migrate_checkedby_anomalies_cmd(
         )
 
 
+@app.command("backfill-microscopy")
+def backfill_microscopy_cmd(
+    series_names: Annotated[
+        list[str] | None,
+        typer.Argument(help="One or more series names. Omit when using --all."),
+    ] = None,
+    all_eligible: Annotated[
+        bool,
+        typer.Option(
+            "--all",
+            help="Process every series whose name is on or after --since. "
+                 "Mutually exclusive with explicit series_names.",
+        ),
+    ] = False,
+    since: Annotated[
+        str,
+        typer.Option(
+            "--since",
+            help="With --all, only process series with name prefix >= this "
+                 "date (YYYY-MM-DD or YYYYMMDD). Default 2021-01-01 "
+                 "(Stellaris era; earlier SP5 data uses a different "
+                 "metadata format the parser doesn't claim).",
+        ),
+    ] = "2021-01-01",
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", help="Cap the number of series processed."),
+    ] = None,
+    batch_size: Annotated[
+        int,
+        typer.Option(
+            "--batch-size",
+            help="Commit every N series so a mid-run abort keeps prior "
+                 "successes. Default 50.",
+        ),
+    ] = 50,
+    verbose: Annotated[
+        bool,
+        typer.Option(
+            "--verbose",
+            help="One line per series (default: batched progress + summary).",
+        ),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Show what would change without writing to the DB.",
+        ),
+    ] = False,
+) -> None:
+    """Re-parse each series's ``Position N_Properties.xml`` and update its
+    ``MicroscopyMetadata`` row in place.
+
+    Two modes:
+
+    - **Named** — explicit series_names argument(s). Verbose by default;
+      good for one-off catch-up after editing the metadata file on disk.
+    - **Bulk** — ``--all --since YYYY-MM-DD`` walks every eligible series
+      in the corpus. Use ``--dry-run`` first to preview, then commit. The
+      command processes in batches (``--batch-size``) and commits each
+      batch, so a mid-run failure preserves the work done so far.
+
+    Per-series outcome buckets reported at the end:
+
+    - **updated** — Properties.xml found, parsed, row upserted.
+    - **no metadata file** — annot_loc/dats/ has no Position N XML
+      (legacy SP5 data, deleted directories, in-progress curation, …).
+    - **no annot_loc** — series row has an empty annot_loc.
+    - **parse error** — file was found but the parse raised
+      (damaged file / unexpected vendor format).
+    - **missing row** — explicit series_name doesn't exist in the DB.
+
+    Idempotent. Re-running over the same set is a no-op apart from
+    updated_at, thanks to skip-None upsert semantics.
+    """
+    import re
+    from sqlalchemy import select
+    from .models import MicroscopyMetadata, Series
+    from .parsers.microscopy import find_metadata_file, parse_microscopy
+
+    _LSUFFIX_RE = re.compile(r"_L(\d+)(?:_(?:xx|yy))?$")
+
+    def _position_for(name: str) -> int:
+        m = _LSUFFIX_RE.search(name)
+        return int(m.group(1)) if m else 1
+
+    def _vendor_for_file(p: Path) -> str:
+        """Map metadata-file name → vendor tag stored on MicroscopyMetadata."""
+        if p.name in ("omxml.xml", "omxml.xml.gz"):
+            return "leica_sp5"
+        return "leica_stellaris"
+
+    def _apply_to_row(row: Series, md, raw_path: Path) -> None:
+        attrs = (
+            ("objective", md.objective),
+            ("objective_NA", md.objective_NA),
+            ("magnification", md.magnification),
+            ("immersion", md.immersion),
+            ("refractive_index", md.refractive_index),
+            ("voxel_xy_um", md.voxel_xy_um),
+            ("voxel_z_um", md.voxel_z_um),
+            ("planes_per_volume", md.planes_per_volume),
+            ("channels_per_plane", len(md.channels) or None),
+            ("x_pixels", md.x_pixels),
+            ("y_pixels", md.y_pixels),
+            ("n_timepoints", md.n_timepoints),
+            ("cycle_time_s", md.cycle_time_s),
+            ("pinhole_um", md.pinhole_um),
+            ("pinhole_airy", md.pinhole_airy),
+            ("scan_speed_hz", md.scan_speed_hz),
+            ("line_averaging", md.line_averaging),
+            ("frame_averaging", md.frame_averaging),
+            ("channels", md.channels),
+            ("acquisition_settings", md.acquisition_settings or {}),
+            ("depth_compensation", md.depth_compensation or {}),
+            ("stage_x_um", md.stage_x_um),
+            ("stage_y_um", md.stage_y_um),
+            ("stage_z_um", md.stage_z_um),
+            ("raw_metadata_path", str(raw_path)),
+        )
+        if row.microscopy is None:
+            row.microscopy = MicroscopyMetadata(vendor=_vendor_for_file(raw_path))
+        target = row.microscopy
+        for col, val in attrs:
+            if val is not None:
+                setattr(target, col, val)
+
+    # --- argument validation + schema check ----------------------------
+
+    if (series_names and all_eligible) or (not series_names and not all_eligible):
+        console.print(
+            "[red]error[/red] specify either explicit series_names OR --all "
+            "(not both, not neither)."
+        )
+        raise typer.Exit(2)
+
+    # Ensure the v2.7 JSON columns exist before we try to write to them.
+    # Idempotent — `embryodb-open` does this on every launch.
+    database.create_all()
+
+    # --- candidate selection ------------------------------------------
+
+    if all_eligible:
+        since_yyyymmdd = since.replace("-", "")
+        if not (len(since_yyyymmdd) == 8 and since_yyyymmdd.isdigit()):
+            console.print(
+                f"[red]error[/red] --since must be YYYY-MM-DD or YYYYMMDD "
+                f"(got {since!r})."
+            )
+            raise typer.Exit(2)
+        with database.session_scope() as s:
+            # Series names are conventionally `<YYYYMMDD>_<…>` so plain
+            # string >= on series_name works. Also require non-empty
+            # annot_loc and not soft-deleted.
+            stmt = (
+                select(Series.series_name)
+                .where(Series.series_name >= since_yyyymmdd)
+                .where(Series.annot_loc.isnot(None))
+                .where(Series.annot_loc != "")
+                .where(Series.deleted_at.is_(None))
+                .order_by(Series.series_name)
+            )
+            if limit:
+                stmt = stmt.limit(limit)
+            names = [r[0] for r in s.execute(stmt).all()]
+        console.print(
+            f"Selected [bold]{len(names)}[/bold] series with name >= "
+            f"{since_yyyymmdd} and annot_loc set."
+        )
+    else:
+        names = list(series_names or [])
+        if limit:
+            names = names[:limit]
+
+    if not names:
+        console.print("[yellow]nothing to do.[/yellow]")
+        raise typer.Exit(0)
+
+    # --- counters + per-bucket samples (cap to keep output sane) ------
+
+    counts = {
+        "updated": 0,
+        "no_metadata_file": 0,
+        "no_annot_loc": 0,
+        "parse_error": 0,
+        "missing_row": 0,
+    }
+    samples: dict[str, list[str]] = {k: [] for k in counts}
+
+    def _record(bucket: str, name: str, detail: str = "") -> None:
+        counts[bucket] += 1
+        if len(samples[bucket]) < 25:
+            samples[bucket].append(f"{name}" + (f" — {detail}" if detail else ""))
+
+    # --- process in batches with per-batch commits --------------------
+
+    total = len(names)
+    processed = 0
+    for batch_start in range(0, total, batch_size):
+        batch = names[batch_start : batch_start + batch_size]
+        with database.session_scope() as session:
+            for name in batch:
+                row = q_series.get_by_name(session, name)
+                if row is None:
+                    _record("missing_row", name)
+                    if verbose:
+                        console.print(f"[red]missing row[/red] {name}")
+                    continue
+                if not row.annot_loc:
+                    _record("no_annot_loc", name)
+                    if verbose:
+                        console.print(f"[yellow]no annot_loc[/yellow] {name}")
+                    continue
+                pos = _position_for(name)
+                metadata_file = find_metadata_file(Path(row.annot_loc), pos)
+                if metadata_file is None:
+                    _record(
+                        "no_metadata_file",
+                        name,
+                        f"no Properties.xml or omxml.xml(.gz) under "
+                        f"{row.annot_loc}/dats/",
+                    )
+                    if verbose:
+                        console.print(
+                            f"[yellow]no file[/yellow] {name} (pos {pos})"
+                        )
+                    continue
+                try:
+                    md = parse_microscopy(
+                        metadata_file, dats_dir=Path(row.annot_loc) / "dats"
+                    )
+                except Exception as exc:
+                    _record("parse_error", name, f"{type(exc).__name__}: {exc}")
+                    if verbose:
+                        console.print(f"[red]parse error[/red] {name}: {exc}")
+                    continue
+                if md is None:
+                    # Unknown format — file name passed our directory probe
+                    # but no parser claimed it. Treat as "no metadata file".
+                    _record(
+                        "no_metadata_file",
+                        name,
+                        f"file {metadata_file.name} found but no parser claimed it",
+                    )
+                    if verbose:
+                        console.print(
+                            f"[yellow]no parser[/yellow] {name} for {metadata_file}"
+                        )
+                    continue
+
+                n_ch = sum(1 for c in (md.channels or []) if c.get("is_active"))
+                n_dc = len((md.depth_compensation or {}).get("channels", []))
+                n_settings = len(md.acquisition_settings or {})
+                if verbose:
+                    console.print(
+                        f"[cyan]{name}[/cyan]: {n_ch} ch, {n_dc} dc-curve(s), "
+                        f"{n_settings} settings key(s) ← {metadata_file}"
+                    )
+                if not dry_run:
+                    _apply_to_row(row, md, metadata_file)
+                counts["updated"] += 1
+                if len(samples["updated"]) < 25:
+                    samples["updated"].append(
+                        f"{name} ({n_ch}ch, {n_dc}dc, {n_settings}set)"
+                    )
+            # End of batch: session_scope commits on exit.
+        processed += len(batch)
+        if not verbose:
+            console.print(
+                f"  [dim]progress[/dim] {processed}/{total} "
+                f"([green]{counts['updated']} updated[/green], "
+                f"[yellow]{counts['no_metadata_file']} no-file[/yellow], "
+                f"[red]{counts['parse_error']} errors[/red])"
+            )
+
+    # --- summary -------------------------------------------------------
+
+    console.print("")
+    if dry_run:
+        console.print("[yellow]dry-run only.[/yellow] No DB writes occurred.")
+    console.print(
+        f"[bold]Summary:[/bold] {processed} processed | "
+        f"[green]{counts['updated']} updated[/green] | "
+        f"[yellow]{counts['no_metadata_file']} no metadata file[/yellow] | "
+        f"[yellow]{counts['no_annot_loc']} no annot_loc[/yellow] | "
+        f"[red]{counts['parse_error']} parse errors[/red] | "
+        f"[red]{counts['missing_row']} missing rows[/red]"
+    )
+    for bucket, label in (
+        ("parse_error", "Parse errors"),
+        ("no_metadata_file", "No metadata file (first 25)"),
+        ("no_annot_loc", "No annot_loc (first 25)"),
+        ("missing_row", "Missing rows (first 25)"),
+    ):
+        if samples[bucket]:
+            console.print(f"\n[bold]{label}:[/bold]")
+            for sname in samples[bucket]:
+                console.print(f"  {sname}")
+            if counts[bucket] > len(samples[bucket]):
+                console.print(
+                    f"  …and {counts[bucket] - len(samples[bucket])} more"
+                )
+    raise typer.Exit(0 if counts["parse_error"] == 0 else 1)
+
+
+@app.command("emit-time-csv")
+def emit_time_csv_cmd(
+    series_names: Annotated[
+        list[str],
+        typer.Argument(help="One or more series names. Use 'all' for every row with timestamps."),
+    ],
+) -> None:
+    """Write ``<annot_loc>/dats/TIME<series>.csv`` from the DB.
+
+    The CSV is what ``LineagePhenotyping/CompareDivTime.pl`` and other
+    legacy downstream tools expect. The v2 pipeline writes it
+    automatically at import time (via the ``compute_timestamps`` step)
+    so this command is for one-off catch-up: re-emit after editing a
+    series's metadata path, or back-fill for legacy-imported series
+    once their timestamps land in the DB.
+    """
+    from sqlalchemy import select
+    from .models import Series, VolumeTimestamp
+    from .pipeline.orchestrate import step_write_time_csv
+
+    with database.session_scope() as s:
+        if series_names == ["all"]:
+            names = [
+                r.series_name
+                for r in s.execute(
+                    select(Series)
+                    .join(VolumeTimestamp, VolumeTimestamp.series_id == Series.id)
+                    .distinct()
+                ).scalars()
+            ]
+        else:
+            names = list(series_names)
+
+        ok = 0
+        skipped: list[str] = []
+        for name in names:
+            row = q_series.get_by_name(s, name)
+            if row is None:
+                skipped.append(f"{name} (not found)")
+                continue
+            if not row.volume_timestamps:
+                skipped.append(f"{name} (no timestamps in DB)")
+                continue
+            if not row.annot_loc:
+                skipped.append(f"{name} (no annot_loc)")
+                continue
+            target = step_write_time_csv(row)
+            console.print(f"[green]wrote[/green] {target}")
+            ok += 1
+
+    console.print(f"emitted {ok}, skipped {len(skipped)}")
+    for line in skipped:
+        console.print(f"  {line}")
+    raise typer.Exit(0 if ok else 1)
+
+
+@app.command("sync-legacy-xml")
+def sync_legacy_xml_cmd(
+    series_names: Annotated[
+        list[str] | None,
+        typer.Argument(
+            help="Series to sync. Omit (or pass 'all') to sync every row."
+        ),
+    ] = None,
+) -> None:
+    """Re-write source-dir/<series>.xml from the current DB state.
+
+    Useful for one-off catch-up after manual DB changes or for rebuilding
+    the legacy mirror from scratch. Save paths in the GUI auto-sync, so
+    this is rarely needed during normal use.
+    """
+    from sqlalchemy import select
+    from .legacy_sync import sync_many
+    from .models import Series
+
+    if not series_names or series_names == ["all"]:
+        with database.session_scope() as s:
+            names = [
+                r.series_name
+                for r in s.execute(select(Series)).scalars()
+            ]
+    else:
+        names = list(series_names)
+    written, failed = sync_many(names)
+    console.print(f"[green]synced[/green] {written} / failed {failed}")
+    raise typer.Exit(1 if failed else 0)
+
+
+@app.command("partial")
+def partial_cmd(
+    series_names: Annotated[
+        list[str],
+        typer.Argument(help="One or more series names to trim."),
+    ],
+) -> None:
+    """Apply partialCSV trimming to the given series.
+
+    Replaces the legacy ``Partial.pl``: the partial_editing_code is read
+    from the database (not the legacy XML), validated, then handed to
+    ``partialCSV.jar`` which writes trimmed CD/CA/SCD/SCA CSVs into
+    ``<annot_loc>/dats/``. Series whose code is missing/invalid are
+    skipped with a message and exit 0 (so the surrounding extract chain
+    keeps running).
+    """
+    from .partial import run_partial_for_series
+    worst = 0
+    for name in series_names:
+        rc = run_partial_for_series(name)
+        if rc != 0:
+            worst = rc
+    raise typer.Exit(worst)
+
+
 @app.command("find-checkedby-anomalies")
 def find_checkedby_anomalies_cmd() -> None:
     """Flag series whose checkedBy (partial editing code) looks malformed.

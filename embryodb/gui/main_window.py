@@ -65,17 +65,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addToolBar(QtCore.Qt.TopToolBarArea, self._filter_toolbar)
 
         # Detail + Dataset live in a single dockable widget at the bottom.
-        # Inside the dock: a thin dataset bar on top, and a two-column
-        # detail view below (handled inside DetailPanel itself).
+        # Each is wrapped in a thin styled frame (no title) so the two
+        # sections are visually separated without spending vertical rows on
+        # header text — laptop real estate is at a premium.
         self._detail = DetailPanel(self._session_cm)
         self._dataset_panel = DatasetPanel(self._session_cm)
+
+        dataset_frame = QtWidgets.QFrame()
+        dataset_frame.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        dataset_frame_layout = QtWidgets.QVBoxLayout(dataset_frame)
+        dataset_frame_layout.setContentsMargins(4, 4, 4, 4)
+        dataset_frame_layout.addWidget(self._dataset_panel)
+
+        detail_frame = QtWidgets.QFrame()
+        detail_frame.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        detail_frame_layout = QtWidgets.QVBoxLayout(detail_frame)
+        detail_frame_layout.setContentsMargins(4, 4, 4, 4)
+        detail_frame_layout.addWidget(self._detail)
 
         dock_container = QtWidgets.QWidget()
         dock_layout = QtWidgets.QVBoxLayout(dock_container)
         dock_layout.setContentsMargins(2, 2, 2, 2)
-        dock_layout.setSpacing(2)
-        dock_layout.addWidget(self._dataset_panel)
-        dock_layout.addWidget(self._detail, 1)
+        dock_layout.setSpacing(4)
+        dock_layout.addWidget(dataset_frame)
+        dock_layout.addWidget(detail_frame, 1)
 
         self._detail_dock = QtWidgets.QDockWidget("Detail / Dataset", self)
         self._detail_dock.setObjectName("DetailDock")  # for saveState/restoreState
@@ -84,6 +97,11 @@ class MainWindow(QtWidgets.QMainWindow):
             | QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.TopDockWidgetArea
         )
         self._detail_dock.setWidget(dock_container)
+        # Hide the dock's own title bar — it's redundant with the framed
+        # subsections, and the View menu's toggle action covers show/hide.
+        # An empty title-bar widget removes the drag handle too; that's an
+        # accepted trade-off for ~22px of vertical room on laptops.
+        self._detail_dock.setTitleBarWidget(QtWidgets.QWidget())
         self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self._detail_dock)
 
         self._build_menu()
@@ -431,6 +449,14 @@ class MainWindow(QtWidgets.QMainWindow):
         act_bulk = menu.addAction(f"Bulk edit metadata…{n_suffix}")
         act_bulk.triggered.connect(self._on_bulk_edit_metadata)
 
+        # Microscopy details — single-series only (the dialog is per-series).
+        # Greyed out when more than one row is selected; the rest of the menu
+        # works as before.
+        act_micro = menu.addAction("Microscopy details…")
+        act_micro.setEnabled(n == 1)
+        if n == 1:
+            act_micro.triggered.connect(self._on_microscopy_details)
+
         # Re-run pipeline
         act_rerun = menu.addAction(f"Re-run pipeline…{n_suffix}")
         act_rerun.triggered.connect(self._on_rerun_pipeline)
@@ -533,6 +559,13 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Selection expanded to {len(all_names)} series ({len(acq_ids)} acquisitions).",
             5000,
         )
+
+    def _on_microscopy_details(self) -> None:
+        names = self._selected_series_names()
+        if len(names) != 1:
+            return
+        from .microscopy_dialog import MicroscopyDialog
+        MicroscopyDialog(self._session_cm, names[0], parent=self).exec()
 
     def _on_bulk_edit_metadata(self) -> None:
         selected = self._selected_series_names()

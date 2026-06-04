@@ -198,6 +198,49 @@ def synth_acquisition(tmp_path):
     return src
 
 
+def _stellaris_properties_xml(*, planes: int, channels: int, timepoints: int) -> str:
+    """A minimal Stellaris-shaped Properties.xml with one FILETIME per plane.
+
+    Volume 1 starts at FILETIME 0x1dbcf207ea07660 (2025-05-27 16:00:40 UTC);
+    each subsequent volume is +90 seconds; the in-volume planes are 100
+    ticks apart (irrelevant — they're decimated out).
+    """
+    first_ft = 0x1DBCF207EA07660
+    per_vol = planes * channels
+    ticks = 10_000_000  # 100ns per second
+    fts: list[int] = []
+    for tp in range(timepoints):
+        vol_start = first_ft + tp * 90 * ticks
+        for k in range(per_vol):
+            fts.append(vol_start + k * 100)
+    body = " ".join(format(v, "x") for v in fts)
+    total = per_vol * timepoints
+    return f"""<?xml version='1.0' encoding='utf-8'?>
+<Data><Image>
+<ImageDescription>
+  <NumberOfChannels>{channels}</NumberOfChannels>
+  <ATLConfocalSettings>
+    <ATLConfocalSettingDefinition Sections="{planes}" CycleCount="{timepoints}"
+        CycleTime="90" ObjectiveName="HC PL APO 63x" NumericalAperture="1.3"/>
+  </ATLConfocalSettings>
+</ImageDescription>
+<TimeStampList NumberOfTimeStamps="{total}" FirstTimeStampDate="5/27/2025"
+               FirstTimeStampTime="12:00:40 PM"
+               FirstTimeStampMiliSeconds="790">{body}</TimeStampList>
+</Image></Data>
+"""
+
+
+@pytest.fixture
+def synth_acquisition_with_metadata(synth_acquisition):
+    """Adds Properties.xml for each position so compute_timestamps has data."""
+    for pos in (1, 2):
+        (synth_acquisition / f"acq_Position {pos}_Properties.xml").write_text(
+            _stellaris_properties_xml(planes=3, channels=2, timepoints=2)
+        )
+    return synth_acquisition
+
+
 @pytest.fixture
 def seeded_protocols(db_session, tmp_path):
     params_dir = tmp_path / "params"
@@ -308,13 +351,110 @@ def test_import_acquisition_end_to_end(
     assert "xyres=0.087" in params_text or "xyres=" in params_text
     assert "end_time=2;" in params_text  # number of timepoints
 
-    # 8) PipelineStepRun rows: 6 complete, 3 pending per series (×2 series)
+    # 8) PipelineStepRun rows: 7 complete, 3 pending per series (×2 series).
+    # Inline (complete after orchestrator returns): stage_images,
+    # stage_metadata, compute_timestamps, write_acetree_config,
+    # write_embryodb_xml, create_alias_symlink, write_matlab_params.
+    # Worker (still pending): run_starrynite, run_red_extract, run_measure.
+    # compute_timestamps soft-succeeds when there's no Properties.xml in
+    # the fixture (which is the case here), so it still counts as COMPLETE.
     runs = list(db_session.execute(select(PipelineStepRun)).scalars())
     assert len(runs) == len(STEPS) * 2
     complete = [r for r in runs if r.status == RunStatus.COMPLETE]
     pending = [r for r in runs if r.status == RunStatus.PENDING]
-    assert len(complete) == 6 * 2
+    assert len(complete) == 7 * 2
     assert len(pending) == 3 * 2
+
+
+def test_compute_timestamps_populates_db_and_csv(
+    db_session, seeded_protocols, synth_acquisition_with_metadata, tmp_path
+):
+    """End-to-end check that the import step parses Stellaris metadata,
+    fills the volume_timestamps table, and writes a legacy-format
+    TIME{series}.csv."""
+    from sqlalchemy import select
+    from embryodb.models import VolumeTimestamp
+
+    proto = db_session.execute(
+        select(Protocol).where(Protocol.name == "Stellaris_JIM113")
+    ).scalar_one()
+    img_root = tmp_path / "images"
+    legacy_dir = tmp_path / "legacy_xml"
+    legacy_dir.mkdir()
+
+    opts = ImportOptions(
+        image_loc_root=img_root,
+        alias_root=None,
+        user="testuser",
+        run_through_step="compute_timestamps",
+    )
+    result = import_acquisition(
+        db_session,
+        source_dir=synth_acquisition_with_metadata,
+        protocol=proto,
+        options=opts,
+        person="alice",
+        strain_name="N2",
+        legacy_xml_dir=legacy_dir,
+    )
+
+    # 1) Each series gets 2 rows in volume_timestamps (we wrote 2 timepoints).
+    series = result.acquisition.series_list
+    assert len(series) == 2
+    for s in series:
+        rows = (
+            db_session.query(VolumeTimestamp)
+            .filter_by(series_id=s.id)
+            .order_by(VolumeTimestamp.timepoint)
+            .all()
+        )
+        assert [r.timepoint for r in rows] == [1, 2]
+        assert rows[0].absolute_seconds == 0
+        assert rows[0].delta_seconds == 0
+        assert rows[1].absolute_seconds == 90
+        assert rows[1].delta_seconds == 90
+
+    # 2) TIME<series>.csv is emitted in the right shape.
+    from pathlib import Path
+    s1 = next(s for s in series if s.series_name == "acq_L1")
+    csv = Path(s1.annot_loc) / "dats" / f"TIME{s1.series_name}.csv"
+    assert csv.is_file()
+    lines = csv.read_text().strip().split("\n")
+    assert len(lines) == 2
+    assert lines[0].split("\t") == [s1.series_name, "1", "0", "0"]
+    assert lines[1].split("\t") == [s1.series_name, "2", "90", "90"]
+
+    # 3) acquired_at propagated to MicroscopyMetadata.
+    s1_full = db_session.merge(s1)
+    assert s1_full.microscopy is not None
+    assert s1_full.microscopy.acquired_at is not None
+    assert s1_full.microscopy.acquired_at.year == 2025
+
+
+def test_emit_time_csv_helper_overwrites(db_session, tmp_path):
+    """``step_write_time_csv`` should produce a deterministic file from DB rows."""
+    from embryodb.models import Series, VolumeTimestamp
+    from embryodb.pipeline.orchestrate import step_write_time_csv
+
+    s = Series(series_name="foo", annot_loc=str(tmp_path / "annots"))
+    db_session.add(s)
+    db_session.flush()
+    s.volume_timestamps = [
+        VolumeTimestamp(timepoint=1, absolute_seconds=0, delta_seconds=0),
+        VolumeTimestamp(timepoint=2, absolute_seconds=90, delta_seconds=90),
+        VolumeTimestamp(timepoint=3, absolute_seconds=180, delta_seconds=90),
+    ]
+    db_session.flush()
+
+    target = step_write_time_csv(s)
+    assert target.read_text() == "foo\t1\t0\t0\nfoo\t2\t90\t90\nfoo\t3\t180\t90\n"
+
+    # Re-emit after mutating rows — should reflect the new values.
+    s.volume_timestamps[1].absolute_seconds = 95
+    s.volume_timestamps[1].delta_seconds = 95
+    db_session.flush()
+    target2 = step_write_time_csv(s)
+    assert "foo\t2\t95\t95" in target2.read_text()
 
 
 def test_import_treats_existing_legacy_xml_as_already_done(
@@ -449,7 +589,7 @@ def test_backfill_is_idempotent(db_session, tmp_path):
 
     r1 = backfill_directory(db_session, tmp_path / "images")
     r2 = backfill_directory(db_session, tmp_path / "images")
-    assert r1.runs_inserted == 9  # one per step
+    assert r1.runs_inserted == 10  # one per step
     assert r2.runs_inserted == 0  # nothing new the second time
 
 
@@ -585,8 +725,10 @@ def _make_full_pipeline_series(session, series_name: str) -> Series:
     session.add(series)
     session.flush()
 
-    inline_steps = STEPS[:6]
-    worker_steps = STEPS[6:]
+    # Inline now ends at write_matlab_params (index 6 after inserting
+    # compute_timestamps at index 2). Worker steps are the trailing three.
+    inline_steps = STEPS[:7]
+    worker_steps = STEPS[7:]
 
     for step in inline_steps:
         session.add(PipelineStepRun(

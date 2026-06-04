@@ -95,6 +95,13 @@ def _apply_additive_migrations(engine: Engine) -> None:
         "pipeline_step_runs": [
             ("not_before", "TIMESTAMP"),
         ],
+        # Phase 2: per-channel laser/detector + depth-compensation JSON
+        # blobs on MicroscopyMetadata. Both default to '{}' so existing
+        # rows can be SELECTed without manual backfill.
+        "microscopy_metadata": [
+            ("acquisition_settings", "JSON DEFAULT '{}'"),
+            ("depth_compensation", "JSON DEFAULT '{}'"),
+        ],
     }
     # Columns that were originally typed as VARCHAR(N) but should be TEXT to
     # accommodate legacy corpus rows that exceed the declared length. SQLite

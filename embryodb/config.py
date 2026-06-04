@@ -59,6 +59,10 @@ class Settings(BaseSettings):
         default=Path("/gpfs/fs0/l/murr/tools3"),
         description="Directory containing matlab_SN_cluster.pl, acebatch3.jar, etc.",
     )
+    tools4_dir: Path = Field(
+        default=Path("/gpfs/fs0/l/murr/tools4"),
+        description="Directory containing partialCSV.jar (legacy tools4 layout).",
+    )
     worker_pidfile_dir: Path = Field(
         default=Path("/tmp"),
         description="Directory for the per-machine worker pidfile.",

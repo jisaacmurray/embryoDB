@@ -36,6 +36,9 @@ class ExtractDialog(QtWidgets.QDialog):
         self.setWindowTitle("Run extract steps")
         self.setMinimumWidth(520)
         self._launched_log: Path | None = None
+        self._launch_result: LaunchResult | None = None
+        self._chosen_keys: list[str] = []
+        self._poll_timer: QtCore.QTimer | None = None
         self._build(title_hint)
 
     # --- UI ----------------------------------------------------------------
@@ -73,6 +76,12 @@ class ExtractDialog(QtWidgets.QDialog):
         for step in EXTRACT_STEPS:
             cb = QtWidgets.QCheckBox(f"{step.label} — {step.description}")
             cb.setChecked(True)
+            if step.key == "update_perms":
+                cb.setEnabled(False)  # always runs; opt-out not allowed
+            if step.key == "process_time":
+                # v2 pipeline runs this at import. Off by default; user
+                # opts in for legacy series that pre-date the new flow.
+                cb.setChecked(False)
             self._step_checks[step.key] = cb
             steps_vl.addWidget(cb)
         layout.addWidget(steps_box)
@@ -108,6 +117,7 @@ class ExtractDialog(QtWidgets.QDialog):
         )
         self._ok_btn = btns.button(QtWidgets.QDialogButtonBox.Ok)
         self._ok_btn.setText("Launch")
+        self._cancel_btn = btns.button(QtWidgets.QDialogButtonBox.Cancel)
         btns.accepted.connect(self._on_launch)
         btns.rejected.connect(self.reject)
         self._view_log_btn = QtWidgets.QPushButton("View log")
@@ -119,7 +129,9 @@ class ExtractDialog(QtWidgets.QDialog):
     # --- selection helpers ------------------------------------------------
 
     def _set_all(self, checked: bool) -> None:
-        for cb in self._step_checks.values():
+        for key, cb in self._step_checks.items():
+            if key == "update_perms" and not checked:
+                continue  # permissions step always runs
             cb.setChecked(checked)
 
     def _set_skip_pipeline(self) -> None:
@@ -147,14 +159,73 @@ class ExtractDialog(QtWidgets.QDialog):
             )
             return
         self._launched_log = result.log_path
-        self._status.setText(
-            f"<b>Launched</b> (pid {result.proc.pid}). The process runs "
-            f"detached — closing this dialog or the GUI does not stop it.<br><br>"
-            f"<b>Log file:</b> <code>{result.log_path}</code><br>"
-            f"<b>Series list:</b> <code>{result.series_list}</code>"
-        )
+        self._launch_result = result
+        self._chosen_keys = keys
         self._ok_btn.setEnabled(False)
         self._view_log_btn.setEnabled(True)
+        # After a successful launch, "Cancel" no longer makes sense — the
+        # job is already running detached and closing this dialog doesn't
+        # stop it. Rename the button so the exit path reads as "I'm done
+        # watching", not "abort the thing I just started".
+        self._cancel_btn.setText("Close")
+        # Start polling the log file for step-banner progress.
+        self._poll_timer = QtCore.QTimer(self)
+        self._poll_timer.setInterval(2000)
+        self._poll_timer.timeout.connect(self._poll_log)
+        self._poll_timer.start()
+        self._poll_log()
+
+    def _poll_log(self) -> None:
+        """Read the log and update the status label with current step progress.
+
+        Detects `== StepLabel ==` banners written by run_extract. The last
+        banner seen = current (or most-recently-run) step. Stops polling once
+        the subprocess exits.
+        """
+        if self._launch_result is None or self._launched_log is None:
+            return
+        try:
+            content = self._launched_log.read_text(errors="replace")
+        except OSError:
+            return
+
+        chosen_steps = [s for s in EXTRACT_STEPS if s.key in set(self._chosen_keys)]
+        appeared = [s for s in chosen_steps if f"== {s.label} ==" in content]
+        proc_alive = self._launch_result.proc.poll() is None
+
+        if not appeared:
+            msg = (
+                f"<b>Launched</b> (pid {self._launch_result.proc.pid}) — "
+                f"waiting for first step…"
+            )
+        elif proc_alive:
+            current = appeared[-1].label
+            done = [s.label for s in appeared[:-1]]
+            pending = [s.label for s in chosen_steps if s not in appeared]
+            parts = [f"<b>Running:</b> {current}"]
+            if done:
+                parts.append(f"Done: {', '.join(done)}")
+            if pending:
+                parts.append(f"Pending: {', '.join(pending)}")
+            msg = " | ".join(parts)
+        else:
+            rc = self._launch_result.proc.returncode
+            if rc == 0:
+                msg = f"<b>Complete</b> — {len(chosen_steps)} step(s) finished."
+            else:
+                last = appeared[-1].label if appeared else "startup"
+                msg = (
+                    f"<b>Stopped</b> after {last} "
+                    f"(exit {rc}). Check log for errors."
+                )
+            if self._poll_timer is not None:
+                self._poll_timer.stop()
+
+        self._status.setText(
+            f"{msg}<br>"
+            f"<b>Log:</b> <code>{self._launched_log}</code><br>"
+            f"<b>Series list:</b> <code>{self._launch_result.series_list}</code>"
+        )
 
     def _view_log(self) -> None:
         if self._launched_log is None:

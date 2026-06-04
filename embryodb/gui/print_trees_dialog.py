@@ -79,17 +79,16 @@ class PrintTreesDialog(QtWidgets.QDialog):
         )
         fl.addRow(self._min_expr_check)
 
-        self._min_expr = QtWidgets.QDoubleSpinBox()
-        self._min_expr.setRange(-1e6, 1e6)
-        self._min_expr.setDecimals(3)
-        self._min_expr.setValue(0.0)
+        # Tree1 parses these via Integer.parseInt — must be ints, not floats.
+        self._min_expr = QtWidgets.QSpinBox()
+        self._min_expr.setRange(-1_000_000, 1_000_000)
+        self._min_expr.setValue(0)
         self._min_expr.setEnabled(False)
         fl.addRow("Min expression:", self._min_expr)
 
-        self._max_expr = QtWidgets.QDoubleSpinBox()
-        self._max_expr.setRange(-1e6, 1e6)
-        self._max_expr.setDecimals(3)
-        self._max_expr.setValue(5000.0)
+        self._max_expr = QtWidgets.QSpinBox()
+        self._max_expr.setRange(-1_000_000, 1_000_000)
+        self._max_expr.setValue(5000)
         self._max_expr.setEnabled(False)
         fl.addRow("Max expression:", self._max_expr)
 
@@ -149,8 +148,8 @@ class PrintTreesDialog(QtWidgets.QDialog):
     def _on_launch(self) -> None:
         kwargs: dict = {}
         if self._min_expr_check.isChecked():
-            kwargs["min_expr"] = float(self._min_expr.value())
-            kwargs["max_expr"] = float(self._max_expr.value())
+            kwargs["min_expr"] = int(self._min_expr.value())
+            kwargs["max_expr"] = int(self._max_expr.value())
             kwargs["color_scheme"] = self._color_scheme.currentText().strip() or "rainbow"
             kwargs["linewidth"] = int(self._linewidth.value())
         try:

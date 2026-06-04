@@ -42,9 +42,11 @@ from ..models import (
     RunStatus,
     Series,
     Status,
+    VolumeTimestamp,
 )
 from ..parsers.leica_metadata import LeicaMetadata, parse_properties_xml
 from ..parsers.matlab_params import MatlabParams, load as load_params, render as render_params
+from ..parsers.timestamps import TimestampSeries, parse_timestamps_from_dir
 from ..parsers.xml import serialize as serialize_legacy_xml
 from .stage import PositionPlan, StageOutcome, StagePlan, plan_acquisition, stage_position
 
@@ -63,9 +65,17 @@ FALLBACK_VOXEL_Z_UM = 0.5
 
 # Step names. Strings (not enum) so that adding a new step later doesn't
 # require a schema migration on the PipelineStepRun.step column.
+#
+# compute_timestamps lives between stage_metadata (which puts the vendor
+# metadata files in dats/) and write_acetree_config (which needs none of
+# the timestamps). Adding it here means downstream stop_after indices
+# shift by one; everything is keyed off `STEPS.index(...)` so the change
+# is mechanical but easy to forget — the `_step_idx` helper is the
+# single source of truth.
 STEPS = (
     "stage_images",
     "stage_metadata",
+    "compute_timestamps",
     "write_acetree_config",
     "write_embryodb_xml",
     "create_alias_symlink",
@@ -74,6 +84,11 @@ STEPS = (
     "run_red_extract",
     "run_measure",
 )
+
+
+def _step_idx(name: str) -> int:
+    """Lookup helper so `stop_after` comparisons aren't magic numbers."""
+    return STEPS.index(name)
 
 
 @dataclass
@@ -236,6 +251,7 @@ def _apply_microscopy_row(
         "planes_per_volume", "channels_per_plane", "x_pixels", "y_pixels",
         "n_timepoints", "cycle_time_s", "pinhole_um", "pinhole_airy",
         "scan_speed_hz", "line_averaging", "frame_averaging", "channels",
+        "acquisition_settings", "depth_compensation",
         "stage_x_um", "stage_y_um", "stage_z_um", "acquired_at",
         "raw_metadata_path",
     ):
@@ -266,11 +282,86 @@ def _microscopy_row(md: LeicaMetadata, raw_path: str | None = None) -> Microscop
         line_averaging=md.line_averaging,
         frame_averaging=md.frame_averaging,
         channels=md.channels,
+        acquisition_settings=md.acquisition_settings or {},
+        depth_compensation=md.depth_compensation or {},
         stage_x_um=md.stage_x_um,
         stage_y_um=md.stage_y_um,
         stage_z_um=md.stage_z_um,
         raw_metadata_path=raw_path,
     )
+
+
+def step_compute_timestamps(
+    series: Series, position: int
+) -> tuple[int, Path | None]:
+    """Parse vendor metadata for per-timepoint times → DB rows + legacy CSV.
+
+    Reads the per-position metadata file already staged into
+    ``<annot_loc>/dats/`` (e.g. Stellaris's ``<series>_Position N_Properties.xml``)
+    via the vendor-pluggable :mod:`embryodb.parsers.timestamps` registry,
+    replaces any existing ``volume_timestamps`` rows for the series, and
+    writes ``<annot_loc>/dats/TIME<series>.csv`` so legacy downstream
+    consumers (``LineagePhenotyping/CompareDivTime.pl``) keep working.
+
+    Returns ``(n_timepoints, csv_path_or_None)``. Soft-fails by returning
+    ``(0, None)`` when no parser claims the metadata or the volumes list
+    came back empty — that way the orchestrator records a successful
+    step with empty output rather than aborting the whole import on a
+    new vendor file we haven't taught the registry about yet.
+
+    Also propagates the parsed acquisition start time to
+    ``MicroscopyMetadata.acquired_at`` when present and not already set.
+    """
+    if not series.annot_loc:
+        return (0, None)
+    dats = Path(series.annot_loc) / "dats"
+    series_ts: TimestampSeries | None = parse_timestamps_from_dir(dats, position)
+    if series_ts is None or not series_ts.volumes:
+        return (0, None)
+
+    session = Session.object_session(series)
+    if session is not None:
+        # Replace prior rows wholesale — keeps the table consistent on
+        # re-import when a series gets re-staged with new metadata.
+        session.query(VolumeTimestamp).filter_by(series_id=series.id).delete()
+        session.flush()
+    series.volume_timestamps = [
+        VolumeTimestamp(
+            timepoint=vt.timepoint,
+            absolute_seconds=vt.absolute_seconds,
+            delta_seconds=vt.delta_seconds,
+        )
+        for vt in series_ts.volumes
+    ]
+
+    if (
+        series_ts.acquired_at is not None
+        and series.microscopy is not None
+        and series.microscopy.acquired_at is None
+    ):
+        series.microscopy.acquired_at = series_ts.acquired_at
+
+    csv_path = step_write_time_csv(series)
+    return (len(series_ts.volumes), csv_path)
+
+
+def step_write_time_csv(series: Series) -> Path:
+    """Emit ``<annot_loc>/dats/TIME<series>.csv`` from ``volume_timestamps``.
+
+    Output is byte-compatible with the legacy ``ProcessTime.pl`` /
+    ``Process_Time_Stellaris.pl`` format: tab-separated
+    ``<series>\\t<tp>\\t<absolute_seconds>\\t<delta_seconds>`` lines.
+    Always overwrites.
+    """
+    dats = ensure_dir(Path(series.annot_loc) / "dats")
+    target = dats / f"TIME{series.series_name}.csv"
+    lines = [
+        f"{series.series_name}\t{vt.timepoint}\t{vt.absolute_seconds}\t{vt.delta_seconds}"
+        for vt in series.volume_timestamps
+    ]
+    body = ("\n".join(lines) + "\n") if lines else ""
+    safe_write_text(target, body)
+    return target
 
 
 def step_write_acetree_config(
@@ -549,7 +640,7 @@ def import_acquisition(
 
         # --- step 1: stage_images (or schedule it for the worker)
         outcome.image_loc = image_loc
-        if stop_after >= 0:
+        if stop_after >= _step_idx("stage_images"):
             run = _get_or_create_run(session, series.id, "stage_images")
             if opts.delay_hours > 0:
                 # Defer to worker. Set not_before so the worker waits the
@@ -604,7 +695,7 @@ def import_acquisition(
                     continue
 
         # --- step 2: stage_metadata
-        if stop_after >= 1:
+        if stop_after >= _step_idx("stage_metadata"):
             run = _get_or_create_run(session, series.id, "stage_metadata")
             _begin(run)
             try:
@@ -615,6 +706,32 @@ def import_acquisition(
                 _fail(run, exc)
                 outcome.steps["stage_metadata"] = RunStatus.FAILED
                 outcome.failed_step = "stage_metadata"
+                outcome.error = repr(exc)
+                outcomes.append(outcome)
+                continue
+
+        # --- step 3: compute_timestamps
+        # Reads the vendor metadata file already in dats/ (staged by step 2)
+        # and populates the volume_timestamps table + TIME{series}.csv.
+        # Soft-fails on missing/malformed metadata so an unrelated parser
+        # gap doesn't block the rest of the pipeline.
+        if stop_after >= _step_idx("compute_timestamps"):
+            run = _get_or_create_run(session, series.id, "compute_timestamps")
+            _begin(run)
+            try:
+                n_rows, csv_path = step_compute_timestamps(series, position)
+                _complete(
+                    run,
+                    {
+                        "timepoints": n_rows,
+                        "csv": str(csv_path) if csv_path else None,
+                    },
+                )
+                outcome.steps["compute_timestamps"] = RunStatus.COMPLETE
+            except Exception as exc:
+                _fail(run, exc)
+                outcome.steps["compute_timestamps"] = RunStatus.FAILED
+                outcome.failed_step = "compute_timestamps"
                 outcome.error = repr(exc)
                 outcomes.append(outcome)
                 continue
@@ -641,8 +758,8 @@ def import_acquisition(
         if n_tp:
             series.timepts = str(n_tp)
 
-        # --- step 3: write_acetree_config
-        if stop_after >= 2:
+        # --- step 4: write_acetree_config
+        if stop_after >= _step_idx("write_acetree_config"):
             run = _get_or_create_run(session, series.id, "write_acetree_config")
             _begin(run)
             try:
@@ -659,8 +776,8 @@ def import_acquisition(
                 outcomes.append(outcome)
                 continue
 
-        # --- step 4: write_embryodb_xml
-        if stop_after >= 3:
+        # --- step 5: write_embryodb_xml
+        if stop_after >= _step_idx("write_embryodb_xml"):
             run = _get_or_create_run(session, series.id, "write_embryodb_xml")
             _begin(run)
             try:
@@ -675,8 +792,8 @@ def import_acquisition(
                 outcomes.append(outcome)
                 continue
 
-        # --- step 5: create_alias_symlink
-        if stop_after >= 4:
+        # --- step 6: create_alias_symlink
+        if stop_after >= _step_idx("create_alias_symlink"):
             run = _get_or_create_run(session, series.id, "create_alias_symlink")
             _begin(run)
             try:
@@ -693,7 +810,8 @@ def import_acquisition(
                 continue
 
         # --- step 6: write_matlab_params
-        if stop_after >= 5:
+        # --- step 7: write_matlab_params
+        if stop_after >= _step_idx("write_matlab_params"):
             run = _get_or_create_run(session, series.id, "write_matlab_params")
             _begin(run)
             try:

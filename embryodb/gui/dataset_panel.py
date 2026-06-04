@@ -48,8 +48,14 @@ class DatasetPanel(QtWidgets.QWidget):
     ) -> None:
         super().__init__(parent)
         self._session_factory = session_factory
-        layout = QtWidgets.QHBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(4, 4, 4, 4)
+        outer.setSpacing(2)
+
+        # Row 1: dataset selection + filter toggle.
+        row1 = QtWidgets.QHBoxLayout()
+        # Row 2: operations on the active dataset.
+        row2 = QtWidgets.QHBoxLayout()
 
         # Tag dropdown is hidden for now — the search box covers the common
         # cases and the tag taxonomy is heuristic anyway. Kept in the schema
@@ -59,16 +65,16 @@ class DatasetPanel(QtWidgets.QWidget):
         self._tag_combo.currentIndexChanged.connect(self._on_filter_changed)
         self._tag_combo.hide()
 
-        layout.addWidget(QtWidgets.QLabel("Search:"))
+        row1.addWidget(QtWidgets.QLabel("Search:"))
         self._search_box = QtWidgets.QLineEdit()
         self._search_box.setPlaceholderText("filter datasets…")
-        self._search_box.setFixedWidth(220)
+        self._search_box.setFixedWidth(180)
         self._search_box.textChanged.connect(self._on_filter_changed)
-        layout.addWidget(self._search_box)
+        row1.addWidget(self._search_box)
 
-        layout.addWidget(QtWidgets.QLabel("Dataset:"))
+        row1.addWidget(QtWidgets.QLabel("Dataset:"))
         self._combo = QtWidgets.QComboBox()
-        self._combo.setMinimumWidth(260)
+        self._combo.setMinimumWidth(220)
         # Use an explicit QListView as the combo's popup so we can constrain
         # its height and force a scroll bar — without the `combobox-popup: 0`
         # stylesheet trick, which on X11-forwarded sessions sometimes fails
@@ -81,19 +87,11 @@ class DatasetPanel(QtWidgets.QWidget):
         list_view.setUniformItemSizes(True)
         list_view.setFixedHeight(_combo_popup_height(self._combo, 15))
         self._combo.setView(list_view)
-        layout.addWidget(self._combo)
+        row1.addWidget(self._combo, 1)
 
         self._new_btn = QtWidgets.QPushButton("New…")
         self._new_btn.clicked.connect(self._on_new)
-        layout.addWidget(self._new_btn)
-
-        self._add_btn = QtWidgets.QPushButton("Add selected")
-        self._add_btn.clicked.connect(self._on_add)
-        layout.addWidget(self._add_btn)
-
-        self._remove_btn = QtWidgets.QPushButton("Remove selected")
-        self._remove_btn.clicked.connect(self._on_remove)
-        layout.addWidget(self._remove_btn)
+        row1.addWidget(self._new_btn)
 
         # Toggling this narrows the browser table to the active dataset's
         # members. Updates immediately when checked or when the active dataset
@@ -104,36 +102,49 @@ class DatasetPanel(QtWidgets.QWidget):
             "dataset. Untick to see the full corpus."
         )
         self._filter_check.toggled.connect(self._on_filter_toggle)
-        layout.addWidget(self._filter_check)
+        row1.addWidget(self._filter_check)
+        row1.addStretch(1)
+
+        # Row 2: per-dataset operations.
+        self._add_btn = QtWidgets.QPushButton("Add selected")
+        self._add_btn.clicked.connect(self._on_add)
+        row2.addWidget(self._add_btn)
+
+        self._remove_btn = QtWidgets.QPushButton("Remove selected")
+        self._remove_btn.clicked.connect(self._on_remove)
+        row2.addWidget(self._remove_btn)
 
         self._notes_btn = QtWidgets.QPushButton("Notes…")
         self._notes_btn.setToolTip("Edit the description / notes for this dataset.")
         self._notes_btn.clicked.connect(self._on_notes)
-        layout.addWidget(self._notes_btn)
+        row2.addWidget(self._notes_btn)
 
         self._show_btn = QtWidgets.QPushButton("Show members")
         self._show_btn.clicked.connect(self._on_show)
-        layout.addWidget(self._show_btn)
+        row2.addWidget(self._show_btn)
 
         self._export_btn = QtWidgets.QPushButton("Export list…")
         self._export_btn.clicked.connect(self._on_export)
-        layout.addWidget(self._export_btn)
+        row2.addWidget(self._export_btn)
 
         self._extract_btn = QtWidgets.QPushButton("Run extract…")
         self._extract_btn.setToolTip(
             "Run the legacy extract.sh steps on every member of the active dataset."
         )
         self._extract_btn.clicked.connect(self._on_run_extract)
-        layout.addWidget(self._extract_btn)
+        row2.addWidget(self._extract_btn)
 
         self._trees_btn = QtWidgets.QPushButton("Print trees…")
         self._trees_btn.setToolTip(
             "Run PrintTrees.pl (Tree1) on every member of the active dataset."
         )
         self._trees_btn.clicked.connect(self._on_print_trees)
-        layout.addWidget(self._trees_btn)
+        row2.addWidget(self._trees_btn)
 
-        layout.addStretch(1)
+        row2.addStretch(1)
+
+        outer.addLayout(row1)
+        outer.addLayout(row2)
 
         # Whenever the active dataset changes, re-emit the filter signal
         # (with the new dataset id, or None) so MainWindow can refresh.

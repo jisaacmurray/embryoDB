@@ -138,6 +138,10 @@ class MainWindow(QtWidgets.QMainWindow):
         act_refresh.setShortcut("Ctrl+R")
         act_refresh.triggered.connect(self._refresh_all)
         view_menu.addAction(act_refresh)
+
+        act_jobs = QtGui.QAction("Background jobs…", self)
+        act_jobs.triggered.connect(self._on_background_jobs)
+        view_menu.addAction(act_jobs)
         view_menu.addSeparator()
         # Each dock's toggleViewAction shows up here and stays in sync with
         # docked / floating / hidden state automatically.
@@ -665,6 +669,10 @@ class MainWindow(QtWidgets.QMainWindow):
         from .lif_import_dialog import LifImportDialog
         LifImportDialog(self._session_cm, parent=self).exec()
         self._refresh_all()
+
+    def _on_background_jobs(self) -> None:
+        from .jobs_dialog import BackgroundJobsDialog
+        BackgroundJobsDialog(self._session_cm, parent=self).exec()
 
     # --- live pipeline-status polling -------------------------------------
 

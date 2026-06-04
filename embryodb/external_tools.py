@@ -21,7 +21,6 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -105,13 +104,36 @@ EXTRACT_STEPS_BY_KEY: dict[str, ExtractStep] = {s.key: s for s in EXTRACT_STEPS}
 # ---------------------------------------------------------------------------
 
 
+# Trailer line the launcher appends to every job log once the command group
+# exits, so a job's exit status is recoverable from the log alone after the
+# GUI (and its in-memory Popen handle) are gone. Read back by embryodb.jobs.
+_EXIT_TRAILER = "__EMBRYODB_EXIT"
+
+
 def _embryodb_runs_dir() -> Path:
     """Where to put the temp series-list file + log file for one invocation.
 
-    /tmp is fine — these are ephemeral. Callers can override via env if
-    they want runs to persist somewhere shared.
+    Defaults to ``~/.embryodb/runs`` — a stable, per-user location that
+    survives reboots (unlike ``/tmp``) so a restarted GUI can rediscover
+    ongoing/finished jobs (see :mod:`embryodb.jobs`). Override with
+    ``EMBRYODB_RUNS_DIR`` to point runs somewhere shared.
     """
-    return Path(os.environ.get("EMBRYODB_RUNS_DIR", tempfile.gettempdir()))
+    override = os.environ.get("EMBRYODB_RUNS_DIR")
+    if override:
+        return Path(override)
+    return Path.home() / ".embryodb" / "runs"
+
+
+def _pidfile_for(log_path: Path) -> Path:
+    """Sidecar that records the detached child's pid next to its log.
+
+    The pid encoded in the log *filename* is the launcher's (the GUI/CLI
+    process that called the run_* function), which is useless for liveness
+    once that process exits. The real, checkable pid is the detached bash
+    process; we stash it here so :mod:`embryodb.jobs` can tell running from
+    finished after a GUI restart.
+    """
+    return Path(str(log_path) + ".pid")
 
 
 def _write_series_list(series_names: list[str], tag: str) -> Path:
@@ -132,8 +154,13 @@ def _spawn_detached(shell_command: str, log_path: Path) -> subprocess.Popen:
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.touch(exist_ok=True)
-    full = f"({shell_command}) >> {shell_quote(str(log_path))} 2>&1"
-    return subprocess.Popen(
+    q = shell_quote(str(log_path))
+    # `(...)` groups the whole `&&` chain so its combined stdout/stderr land
+    # in the log; the trailing `echo` runs unconditionally and records the
+    # group's exit status ($? is unaffected by the redirect) so finished
+    # jobs report success/failure even after the GUI is gone.
+    full = f"({shell_command}) >> {q} 2>&1; echo \"{_EXIT_TRAILER}=$?\" >> {q}"
+    proc = subprocess.Popen(
         ["bash", "-c", full],
         cwd=str(settings.tools3_dir),
         stdin=subprocess.DEVNULL,
@@ -141,6 +168,11 @@ def _spawn_detached(shell_command: str, log_path: Path) -> subprocess.Popen:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+    try:
+        _pidfile_for(log_path).write_text(str(proc.pid), encoding="utf-8")
+    except OSError:
+        pass  # liveness falls back to the exit trailer / log mtime
+    return proc
 
 
 def shell_quote(s: str) -> str:

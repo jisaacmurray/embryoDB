@@ -438,6 +438,11 @@ class PipelineStepRun(Base):
     log_path: Mapped[str | None] = mapped_column(Text)
     error_excerpt: Mapped[str | None] = mapped_column(Text)
     output_summary: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    # Hostname of the worker that won the atomic PENDING→RUNNING claim.
+    # Observability only — the claim itself is enforced by the guarded UPDATE
+    # in pipeline.worker (status is the lock), so this can be NULL on rows
+    # claimed by an older worker build.
+    claimed_by: Mapped[str | None] = mapped_column(String(64))
 
     def __repr__(self) -> str:
         return f"<Run {self.step} series={self.series_id} status={self.status}>"

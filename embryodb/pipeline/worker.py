@@ -40,7 +40,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from .. import database
 from ..config import settings
@@ -240,6 +240,50 @@ def _next_work_item(session) -> tuple[Series, str, PipelineStepRun] | None:
     return None
 
 
+def _claim_next(session) -> tuple[Series, str, PipelineStepRun] | None:
+    """Atomically claim the next runnable work item for this worker.
+
+    `_next_work_item` only *reads* a candidate; on a shared DB two workers on
+    different hosts can pick the same PENDING row and both run the subprocess.
+    The claim closes that race with a conditional UPDATE that flips
+    PENDING→RUNNING only while the row is still PENDING — exactly one worker's
+    UPDATE matches the WHERE (the losers block on the row lock, then re-evaluate
+    after the winner commits, see RUNNING, and affect 0 rows). Losers retry
+    against the next candidate. Portable across SQLite and PostgreSQL; no
+    SELECT … FOR UPDATE needed.
+
+    Returns (series, step, run) for the claimed row, or None when no runnable
+    work remains. The caller must capture any scalars it needs while still
+    inside the session.
+    """
+    while True:
+        item = _next_work_item(session)
+        if item is None:
+            return None
+        series_obj, step_name, run_obj = item
+        now = datetime.now(tz=timezone.utc)
+        result = session.execute(
+            update(PipelineStepRun)
+            .where(
+                PipelineStepRun.id == run_obj.id,
+                PipelineStepRun.status == RunStatus.PENDING,
+            )
+            .values(
+                status=RunStatus.RUNNING,
+                started_at=now,
+                heartbeat_at=now,
+                claimed_by=socket.gethostname(),
+            )
+        )
+        # Sync the ORM view with what the bulk UPDATE wrote (or didn't): on a
+        # win the row reads RUNNING; on a loss the next _next_work_item re-reads
+        # the committed RUNNING status and skips it.
+        session.expire(run_obj)
+        if result.rowcount == 1:
+            return series_obj, step_name, run_obj
+        # else: lost the race — loop and pick the next candidate.
+
+
 def _get_channel_map(session, series: Series) -> dict:
     """Resolve protocol channel_map for a series. Falls back to empty dict."""
     if series.acquisition_id is None:
@@ -284,7 +328,9 @@ def run_worker() -> None:
 
         with database.session_scope() as s:
             _reset_stale_running(s)
-            item = _next_work_item(s)
+            # Atomic claim: flips PENDING→RUNNING and commits on block exit so
+            # the GUI (and other workers) see the row as RUNNING.
+            item = _claim_next(s)
             if item is None:
                 idle_count += 1
                 if idle_count >= MAX_IDLE_LOOPS:
@@ -292,10 +338,6 @@ def run_worker() -> None:
             else:
                 idle_count = 0
                 series_obj, step_name, run_obj = item
-                # Mark RUNNING before leaving the session so the GUI sees it.
-                run_obj.status = RunStatus.RUNNING
-                run_obj.started_at = datetime.now(tz=timezone.utc)
-                run_obj.heartbeat_at = run_obj.started_at
                 image_loc = Path(series_obj.image_loc)
                 channel_map = _get_channel_map(s, series_obj)
                 # Capture scalar values — ORM objects expire after session close.

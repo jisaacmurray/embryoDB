@@ -94,6 +94,7 @@ def _apply_additive_migrations(engine: Engine) -> None:
         ],
         "pipeline_step_runs": [
             ("not_before", "TIMESTAMP"),
+            ("claimed_by", "VARCHAR(64)"),
         ],
         # Phase 2: per-channel laser/detector + depth-compensation JSON
         # blobs on MicroscopyMetadata. Both default to '{}' so existing

@@ -5,6 +5,16 @@ lineage metadata DB) plus its `Stellaris_tif_pipeline*.pl` import pipeline.
 This document is for AI assistants picking up the project. Live state is
 the code; this is a map.
 
+> **Commit cadence (agents, please read).** Commit at regular intervals —
+> after each self-contained, test-green unit of work (a fix, a feature, a
+> doc pass), not in one giant batch at the end of a session. Concretely:
+> once the suite passes for a logical change, stage the related files and
+> make a focused commit. If the working tree has accumulated several
+> unrelated changes, split them into grouped commits rather than one
+> mega-commit. If a session is wrapping up with uncommitted work, prompt
+> the user to commit before ending. Do **not** push unless the user asks.
+> Never stage editor autosave files (e.g. `#README.md#`).
+
 ## Where things live
 
 | Path | Purpose |
@@ -37,6 +47,7 @@ the code; this is a map.
 | **v2.5 — Legacy XML auto-sync** | done | Every GUI save path (detail edit, bulk edit, mark-for-deletion) re-writes `source_dir/<series>.xml` so legacy tools (Tree1, Measure, RedExtractor1, …) see fresh `edited_timepts` / `partial_editing_code` / etc. immediately. CLI catch-up via `embryodb sync-legacy-xml [name…\|all]`. Bridge during the v3 rewrite — retires once the legacy tools are ported. |
 | **v2.6 — TIME at import time** | done | New `compute_timestamps` pipeline step parses the Stellaris `<TimeStampList>` (hex FILETIME) at import, fills `volume_timestamps`, and writes `TIME<series>.csv` from the DB. `ProcessTime` removed from the default extract checklist (legacy SP5 series only). Vendor-pluggable registry in `parsers/timestamps.py`. CLI: `embryodb emit-time-csv [name…\|all]`. |
 | **v2.7 — Acquisition settings + depth compensation** | done | Parser now extracts per-active-channel laser line + AOTF intensity + detector gain/dye/band, depth-compensation curves (projected per channel), and scalar scope settings (bit depth, pixel dwell, zoom, scan geometry, programmed timing, instrument serial). Stored as JSON on `MicroscopyMetadata` (`channels`, `depth_compensation`, `acquisition_settings`). Right-click → **Microscopy details…** opens a per-series dialog with the high-value table (channels + depth-comp curve). |
+| **v2.7.1 — Multi-host worker claim** | done | `_claim_next` in `pipeline/worker.py` atomically transitions PENDING→RUNNING via a guarded `UPDATE … WHERE id=? AND status='pending'` + `rowcount` check (portable across SQLite/Postgres; no `FOR UPDATE SKIP LOCKED` needed). Race losers re-evaluate and pick the next candidate. New `claimed_by` column on `PipelineStepRun` (observability; additive migration). Safe for two machines running workers against one DB. |
 | v2.8 — LineagePhenotyping bridge + FastAPI | pending | |
 | **v3 — Reimplement remaining Java/Perl tools** | pending | The bigger remaining chunk. See "Legacy tools currently called" below + the v3 ordering note. |
 | v4 — acetree_py / archive lifecycle / image tiles | pending | |
@@ -290,17 +301,6 @@ TreeExprViewer2 → one Python renderer).
 ## Future-feature placeholders (designed but not yet implemented)
 
 These are deliberate design choices recorded here so they don't get lost.
-
-### Worker DB-level claim (multi-host safety)
-
-`_next_work_item` in `embryodb/pipeline/worker.py` doesn't atomically
-transition PENDING → RUNNING. Two workers on different hosts could see the
-same row PENDING and both start the subprocess. Today's mitigation is the
-per-host pidfile, which prevents two workers per machine but doesn't help
-across machines. Fix would either add `claimed_by` / `claimed_at` columns
-with a single-row UPDATE-WHERE-status='pending', or `SELECT … FOR UPDATE
-SKIP LOCKED` on Postgres. Low priority right now (single worker per lab),
-but mandatory before two machines run workers against the same DB.
 
 ### Retry on transient `OperationalError`
 

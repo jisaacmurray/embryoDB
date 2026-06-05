@@ -843,6 +843,77 @@ def test_worker_respects_not_before(db_session):
     assert result[1] == "stage_images"
 
 
+def test_worker_claim_sets_running_and_claimed_by(db_session):
+    """_claim_next flips the chosen PENDING row to RUNNING and stamps claimed_by."""
+    import socket
+    from embryodb.pipeline.worker import _claim_next
+
+    series = _make_full_pipeline_series(db_session, "claim_test_L1")
+
+    item = _claim_next(db_session)
+    assert item is not None
+    claimed_series, step, run = item
+    assert claimed_series.id == series.id
+    assert step == "run_starrynite"
+    assert run.status == RunStatus.RUNNING
+    assert run.claimed_by == socket.gethostname()
+    assert run.started_at is not None
+    assert run.heartbeat_at is not None
+
+
+def test_worker_claim_guard_blocks_already_running(db_session):
+    """The guarded UPDATE only matches PENDING rows: re-claiming a row that is
+    already RUNNING affects 0 rows (the cross-host race-loser path)."""
+    import socket
+    from datetime import datetime, timezone
+    from sqlalchemy import update
+    from embryodb.pipeline.worker import _claim_next
+
+    _make_full_pipeline_series(db_session, "claim_guard_L1")
+
+    item = _claim_next(db_session)
+    assert item is not None
+    _, _, run = item
+    assert run.status == RunStatus.RUNNING
+
+    # Simulate a second worker issuing the same guarded UPDATE against the row
+    # the winner already flipped: the PENDING predicate no longer holds.
+    now = datetime.now(tz=timezone.utc)
+    result = db_session.execute(
+        update(PipelineStepRun)
+        .where(
+            PipelineStepRun.id == run.id,
+            PipelineStepRun.status == RunStatus.PENDING,
+        )
+        .values(status=RunStatus.RUNNING, claimed_by="other-host")
+    )
+    assert result.rowcount == 0
+
+    db_session.expire(run)
+    refreshed = db_session.get(PipelineStepRun, run.id)
+    assert refreshed.claimed_by == socket.gethostname()
+
+
+def test_worker_claim_advances_when_first_step_running(db_session):
+    """_claim_next returns the next runnable step (not the already-RUNNING one).
+
+    A row left RUNNING by another worker is not a candidate (only PENDING rows
+    are), so the claim moves on rather than re-running it."""
+    from embryodb.pipeline.worker import _claim_next
+
+    series = _make_full_pipeline_series(db_session, "claim_advance_L1")
+    # First worker step already claimed/running elsewhere.
+    for r in series.runs:
+        if r.step == "run_starrynite":
+            r.status = RunStatus.COMPLETE
+    db_session.flush()
+
+    item = _claim_next(db_session)
+    assert item is not None
+    _, step, _ = item
+    assert step == "run_red_extract"
+
+
 def test_orchestrator_delay_skips_inline_staging(
     db_session, seeded_protocols, synth_acquisition, tmp_path
 ):

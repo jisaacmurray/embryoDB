@@ -318,6 +318,47 @@ def run_print_trees(
     return LaunchResult(proc=proc, log_path=log_path, series_list=list_file)
 
 
+def run_getacd(
+    series_names: list[str],
+    *,
+    tools3_dir: Path | None = None,
+) -> LaunchResult:
+    """**TEMPORARY STOPGAP** — wrap the legacy Perl ``GetACD.pl`` to generate
+    ``ACD<series>.csv`` files (aligned/derotated cell coordinates in microns)
+    before a phenotyping freeze.
+
+    ``GetACD.pl`` takes a single series-list file, looks each series up via the
+    legacy Perl ``MakeDB`` (same embryoDB XML corpus as the Python DB), reads
+    ``CD<series>.csv`` + ``<series>AuxInfo.csv`` from each series' ``dats/``,
+    and writes ``ACD<series>.csv`` **in place** into that same ``dats/`` dir —
+    exactly where the freeze then picks it up. It also depends on
+    ``SupplementalTable2_DivisionTimes.txt`` and ``MakeDB.pm`` in the working
+    directory; both live in ``tools3_dir`` (the cwd ``_spawn_detached`` uses),
+    so we run from there. The ``CDs/``/``AuxInfos/`` scratch dirs the script
+    copies into are pre-created so its incidental ``cp`` calls don't error.
+
+    Granularity note: the script runs on a **dataset/list**, not a single
+    embryo — there is no per-embryo mode without hacking the script.
+
+    HIGH PRIORITY follow-up: replace this with the in-progress R ``GetACD``
+    rewrite and integrate ACD generation cleanly into the freeze/extract flow
+    (see embryoDB CLAUDE.md, "LineagePhenotyping bridge").
+    """
+    if not series_names:
+        raise ValueError("run_getacd: series_names is empty")
+    base_dir = Path(tools3_dir or settings.tools3_dir)
+    list_file = _write_series_list(series_names, tag="getacd")
+    log_path = list_file.with_suffix(".log")
+    shell = (
+        f"echo '== GetACD STOPGAP ({len(series_names)} series) ==' && "
+        "mkdir -p CDs AuxInfos && "
+        f"nice perl {shell_quote(str(base_dir / 'GetACD.pl'))} "
+        f"{shell_quote(str(list_file))}"
+    )
+    proc = _spawn_detached(shell, log_path)
+    return LaunchResult(proc=proc, log_path=log_path, series_list=list_file)
+
+
 def run_lif_import(
     lif_path: Path,
     series: str,
@@ -396,6 +437,7 @@ __all__ = [
     "ExtractStep",
     "LaunchResult",
     "run_extract",
+    "run_getacd",
     "run_lif_import",
     "run_print_trees",
     "shell_quote",

@@ -115,6 +115,27 @@ def test_run_print_trees_with_params(captured_popen, tmp_path):
     assert " 5" in after
 
 
+def test_run_getacd_builds_correct_shell(captured_popen, tmp_path):
+    result = external_tools.run_getacd(
+        ["seriesA", "seriesB"],
+        tools3_dir=Path("/fake/tools3"),
+    )
+    cmd = result.proc.args[2]
+    assert "GetACD STOPGAP" in cmd
+    # Invokes the legacy Perl script from tools3 on the list file.
+    assert "perl '/fake/tools3/GetACD.pl'" in cmd
+    assert f"'{result.series_list}'" in cmd
+    # Pre-creates the scratch dirs GetACD.pl copies into.
+    assert "mkdir -p CDs AuxInfos" in cmd
+    assert result.series_list.read_text() == "seriesA\nseriesB\n"
+    assert result.proc.kwargs["start_new_session"] is True
+
+
+def test_run_getacd_rejects_empty_series(captured_popen):
+    with pytest.raises(ValueError, match="series_names"):
+        external_tools.run_getacd([])
+
+
 def test_shell_quote_handles_single_quotes():
     # Bash single-quote-escape uses '\''.
     assert external_tools.shell_quote("ab'cd") == "'ab'\\''cd'"

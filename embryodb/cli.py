@@ -1755,6 +1755,34 @@ def phenotyping_freeze(
         console.print(f"  [yellow]![/yellow] {w}")
 
 
+@phenotyping_app.command("getacd")
+def phenotyping_getacd(
+    dataset: Annotated[str, typer.Argument(help="Dataset name to run GetACD on")],
+) -> None:
+    """STOPGAP: run the legacy Perl GetACD.pl on DATASET to generate
+    ACD<series>.csv files in each series' dats/ before a freeze.
+
+    Detached job; ACD files land in place. This is temporary — it will be
+    replaced by the in-progress R GetACD rewrite.
+    """
+    from .external_tools import run_getacd
+
+    with database.session_scope() as session:
+        ds = q_datasets.get_by_name(session, dataset)
+        if ds is None:
+            console.print(f"[red]no dataset named[/red] {dataset!r}")
+            raise typer.Exit(1)
+        names = sorted(s.series_name for s in ds.series)
+    if not names:
+        console.print(f"[yellow]dataset {dataset!r} has no member series[/yellow]")
+        raise typer.Exit(1)
+    result = run_getacd(names)
+    console.print(
+        f"[green]launched[/green] GetACD stopgap on {len(names)} series "
+        f"(detached)\n  log: [cyan]{result.log_path}[/cyan]"
+    )
+
+
 def open_gui() -> None:
     """Entry point for `embryodb-open`: runs `embryodb open` with no args."""
     import sys

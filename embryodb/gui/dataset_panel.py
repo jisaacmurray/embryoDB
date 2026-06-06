@@ -36,6 +36,7 @@ class DatasetPanel(QtWidgets.QWidget):
     # Legacy analysis tools applied to every member of the active dataset.
     extractRequested = QtCore.Signal(str)     # dataset_name
     printTreesRequested = QtCore.Signal(str)  # dataset_name
+    freezeRequested = QtCore.Signal(str)      # dataset_name
     # Fired when the dataset selection or "Show only members" toggle changes
     # in a way that should narrow / unrestrict the browser table.
     # Args: (dataset_id_or_none, dataset_name_or_empty)
@@ -140,6 +141,14 @@ class DatasetPanel(QtWidgets.QWidget):
         )
         self._trees_btn.clicked.connect(self._on_print_trees)
         row2.addWidget(self._trees_btn)
+
+        self._freeze_btn = QtWidgets.QPushButton("Freeze for phenotyping…")
+        self._freeze_btn.setToolTip(
+            "Freeze every member's CSVs into a per-user directory plus a "
+            "ready-to-run config for the LineagePhenotyping R pipeline."
+        )
+        self._freeze_btn.clicked.connect(self._on_freeze)
+        row2.addWidget(self._freeze_btn)
 
         row2.addStretch(1)
 
@@ -346,3 +355,13 @@ class DatasetPanel(QtWidgets.QWidget):
             )
             return
         self.printTreesRequested.emit(name)
+
+    def _on_freeze(self) -> None:
+        name = self.current_dataset()
+        if not name:
+            QtWidgets.QMessageBox.information(
+                self, "No dataset selected",
+                "Pick a dataset from the dropdown first."
+            )
+            return
+        self.freezeRequested.emit(name)

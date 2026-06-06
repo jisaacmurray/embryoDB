@@ -157,6 +157,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._dataset_panel.exportRequested.connect(self._on_dataset_export)
         self._dataset_panel.extractRequested.connect(self._on_run_extract_for_dataset)
         self._dataset_panel.printTreesRequested.connect(self._on_print_trees_for_dataset)
+        self._dataset_panel.freezeRequested.connect(self._on_freeze_for_dataset)
         self._dataset_panel.filterChanged.connect(self._on_dataset_filter_changed)
         self._dataset_filter_id: int | None = None
 
@@ -653,6 +654,98 @@ class MainWindow(QtWidgets.QMainWindow):
             self._session_cm, names,
             title_hint=f"dataset {dataset_name!r}", parent=self,
         ).exec()
+
+    def _on_freeze_for_dataset(self, dataset_name: str) -> None:
+        from ..config import settings
+        from ..phenotyping import freeze_dataset
+        from ..phenotyping.freeze import default_output_base
+
+        names = self._resolve_dataset_members(dataset_name)
+        if not names:
+            QtWidgets.QMessageBox.information(
+                self, "Empty dataset",
+                f"Dataset {dataset_name!r} has no member series."
+            )
+            return
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"Freeze for phenotyping — {dataset_name}")
+        dlg.resize(560, 0)
+        layout = QtWidgets.QFormLayout(dlg)
+        layout.addRow(QtWidgets.QLabel(
+            f"Freeze {len(names)} series (+ Sulston reference) into a per-user\n"
+            "directory with a ready-to-run R config."
+        ))
+
+        base_edit = QtWidgets.QLineEdit(str(default_output_base()))
+        browse = QtWidgets.QPushButton("Browse…")
+        def _pick_dir() -> None:
+            d = QtWidgets.QFileDialog.getExistingDirectory(
+                dlg, "Output base directory", base_edit.text()
+            )
+            if d:
+                base_edit.setText(d)
+        browse.clicked.connect(_pick_dir)
+        base_row = QtWidgets.QHBoxLayout()
+        base_row.addWidget(base_edit, 1)
+        base_row.addWidget(browse)
+        base_w = QtWidgets.QWidget()
+        base_w.setLayout(base_row)
+        layout.addRow("Output base:", base_w)
+
+        mpt_edit = QtWidgets.QLineEdit()
+        mpt_edit.setPlaceholderText("(auto from timestamps; set only if no TIME info)")
+        layout.addRow("Minutes per timepoint:", mpt_edit)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addRow(buttons)
+
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+
+        mpt: float | None = None
+        mpt_text = mpt_edit.text().strip()
+        if mpt_text:
+            try:
+                mpt = float(mpt_text)
+            except ValueError:
+                QtWidgets.QMessageBox.warning(
+                    self, "Invalid value",
+                    f"Minutes per timepoint {mpt_text!r} is not a number."
+                )
+                return
+        output_base = Path(base_edit.text().strip()) if base_edit.text().strip() else None
+
+        try:
+            with self._session_cm() as session:
+                report = freeze_dataset(
+                    session, dataset_name,
+                    output_base=output_base, minutes_per_timepoint=mpt,
+                )
+        except Exception as exc:  # surface freeze errors to the user
+            QtWidgets.QMessageBox.critical(self, "Freeze failed", str(exc))
+            return
+
+        msg = [
+            f"Froze {dataset_name} -> {report.target_dir}",
+            f"Files copied: {report.n_copied}",
+            f"Config: {report.config_path}",
+            f"List: {report.list_path}",
+            f"Report: {report.report_path}",
+        ]
+        if not report.reference_included:
+            msg.append(
+                "\nWARNING: reference series not in DB; build_inputs.R "
+                "regression will fail without it."
+            )
+        if report.warnings:
+            msg.append("\nWarnings:")
+            msg.extend(f"  {w}" for w in report.warnings[:20])
+        QtWidgets.QMessageBox.information(self, "Freeze complete", "\n".join(msg))
 
     # --- pipeline import wizard -------------------------------------------
 

@@ -48,7 +48,7 @@ the code; this is a map.
 | **v2.6 — TIME at import time** | done | New `compute_timestamps` pipeline step parses the Stellaris `<TimeStampList>` (hex FILETIME) at import, fills `volume_timestamps`, and writes `TIME<series>.csv` from the DB. `ProcessTime` removed from the default extract checklist (legacy SP5 series only). Vendor-pluggable registry in `parsers/timestamps.py`. CLI: `embryodb emit-time-csv [name…\|all]`. |
 | **v2.7 — Acquisition settings + depth compensation** | done | Parser now extracts per-active-channel laser line + AOTF intensity + detector gain/dye/band, depth-compensation curves (projected per channel), and scalar scope settings (bit depth, pixel dwell, zoom, scan geometry, programmed timing, instrument serial). Stored as JSON on `MicroscopyMetadata` (`channels`, `depth_compensation`, `acquisition_settings`). Right-click → **Microscopy details…** opens a per-series dialog with the high-value table (channels + depth-comp curve). |
 | **v2.7.1 — Multi-host worker claim** | done | `_claim_next` in `pipeline/worker.py` atomically transitions PENDING→RUNNING via a guarded `UPDATE … WHERE id=? AND status='pending'` + `rowcount` check (portable across SQLite/Postgres; no `FOR UPDATE SKIP LOCKED` needed). Race losers re-evaluate and pick the next candidate. New `claimed_by` column on `PipelineStepRun` (observability; additive migration). Safe for two machines running workers against one DB. |
-| v2.8 — LineagePhenotyping bridge + FastAPI | pending | |
+| v2.8 — LineagePhenotyping bridge | **in progress** | Phase 1 (Python dataset freeze: CLI + GUI) done — `embryodb.phenotyping.freeze`. Phase 2 (GetACD stopgap) + Phase 3 (R `build_inputs.R` port) pending. See "LineagePhenotyping bridge" section below. |
 | **v3 — Reimplement remaining Java/Perl tools** | pending | The bigger remaining chunk. See "Legacy tools currently called" below + the v3 ordering note. |
 | v4 — acetree_py / archive lifecycle / image tiles | pending | |
 
@@ -257,7 +257,8 @@ reimplementation. Listed roughly in order of how much code depends on them.
 | `ProcessTime.pl` | `external_tools.run_extract` — opt-in for legacy SP5 series only. The Stellaris branch was ported to `parsers/timestamps.py` in v2.6; the SP5 `info/_t<N>_*` branch still needs a Python port. | Per-timepoint timestamps for SP5-era data (writes `TIME<series>.csv`). |
 | `UpdatePermissions.pl` | `external_tools.run_extract` | `chgrp users` + `chmod` across each series' `dats/` |
 | ~~`Process_Time_Stellaris.pl`~~ | ported in v2.6 → `parsers/timestamps.py::LeicaStellarisTimestampParser` | The old regex looked for `<TimeStamp RelativeTime="..."/>`; the modern Stellaris format packs timestamps as hex Windows FILETIME values in `<TimeStampList>`. The Python parser handles the new format. |
-| `GetACD.pl` | (not yet wired) | ACD coordinate normalization vs. Richards 2013 reference |
+| `GetACD.pl` | (not yet wired — **stopgap planned, see phenotyping bridge below**) | ACD coordinate normalization vs. Richards 2013 reference |
+| `GetFiles.pl` | ported → `embryodb.phenotyping.freeze` (v2.8) | Per-series `dats/*.csv` freeze into a per-user directory; the embryoDB-native dataset-aware replacement. |
 | `PrintTrees.pl` | bypassed | Tiny wrapper around `Tree1`; we call the Java class directly |
 
 ### Matlab (compiled)
@@ -329,6 +330,44 @@ Phase A of "migrating away from XML dependence" (see prior session
 notes). Once `audit-import` has run clean for some weeks, flip a flag
 so detail-panel Saves write `source-dir/<series>.xml` directly instead
 of `export-dir/`. The serializer is already byte-identical.
+
+## LineagePhenotyping bridge (v2.8, in progress)
+
+Hybrid design: **embryoDB (Python)** owns dataset resolution + the file
+freeze; **LineagePhenotyping (R)** owns the numeric extraction
+(`build_inputs.R`, a port of `CompareDivTime.pl` + `ComparePositions.pl`)
+and the existing 8-step `run_pipeline.R`. The R half runs standalone from a
+freeze so a collaborator with only `dats/*.csv` and no embryoDB install can
+still run everything.
+
+**Phase 1 — DONE.** `embryodb/phenotyping/freeze.py` ::
+`freeze_dataset(session, dataset_name, output_base=None,
+minutes_per_timepoint=None) -> FreezeReport`. Copies each series'
+`<annot_loc>/dats/*.csv` (via `fsutil.safe_copy`) into a **per-user**
+directory `/murrlab3/<user>/phenotyping/<dataset>/` (overridable), always
+includes the Sulston reference series `20081128_sulston` (the regression
+baseline), and emits `configs/<dataset>.yaml` (ready-to-run; `data_dir` /
+`output_dir` point into the same tree), a legacy `.list` file, and
+`freeze_report.txt`. Missing-piece handling: missing **CD** = hard error
+(series skipped); missing **ACD** = warn (positions can't be built); missing
+**TIME** = regenerate from `volume_timestamps` if present, else fall back to
+a `minutes_per_timepoint` value (manual flag, or inferred from DB
+`delta_seconds`) written into the YAML for `build_inputs.R`. Exposed as CLI
+`embryodb phenotyping freeze <dataset> [--output-base] [--minutes-per-timepoint]`
+and a "Freeze for phenotyping…" button in the dataset panel. Tests:
+`tests/test_phenotyping_freeze.py`.
+
+**Phase 2 — TODO (GetACD stopgap).** Wrap the *existing* Perl `GetACD.pl`
+as an embryoDB step so `ACD<series>.csv` files exist before a freeze. Runs
+on a dataset/list (not per-embryo — that's a script limitation). **HIGH
+PRIORITY next step:** replace this stopgap with the in-progress R `GetACD`
+rewrite (owned by someone else — leave their effort alone) and integrate ACD
+generation cleanly into the freeze/extract flow.
+
+**Phase 3 — TODO.** `build_inputs.R` in the LineagePhenotyping repo, the
+numeric port, validated byte-for-byte against the committed `die-1/` and
+`ceh-32_mutant/` Perl outputs. `GetAngles_revRotate.pl` is retired (not
+consumed by the modern pipeline).
 
 ## Pending v2 work (next session)
 

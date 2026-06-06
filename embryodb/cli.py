@@ -1697,6 +1697,64 @@ def open_cmd(
     os.execvp("embryodb-gui", ["embryodb-gui"])
 
 
+# --- phenotyping (LineagePhenotyping bridge) --------------------------------
+
+
+phenotyping_app = typer.Typer(
+    help="LineagePhenotyping bridge — freeze a dataset's CSVs for the R pipeline"
+)
+app.add_typer(phenotyping_app, name="phenotyping")
+
+
+@phenotyping_app.command("freeze")
+def phenotyping_freeze(
+    dataset: Annotated[str, typer.Argument(help="Dataset name to freeze")],
+    output_base: Annotated[
+        Path | None,
+        typer.Option(
+            "--output-base",
+            help="Parent dir for the freeze (default: /murrlab3/<user>/phenotyping)",
+        ),
+    ] = None,
+    minutes_per_timepoint: Annotated[
+        float | None,
+        typer.Option(
+            "--minutes-per-timepoint",
+            help="Manual frame->minutes value for series lacking TIME info",
+        ),
+    ] = None,
+) -> None:
+    """Freeze every series of DATASET (plus the Sulston reference) into a
+    self-contained directory with a ready-to-run R config.
+
+    The freeze lands in ``<output-base>/<dataset>/``; downstream
+    ``build_inputs.R`` then ``run_pipeline.R`` read and write there.
+    """
+    from .phenotyping import freeze_dataset
+
+    with database.session_scope() as session:
+        report = freeze_dataset(
+            session,
+            dataset,
+            output_base=output_base,
+            minutes_per_timepoint=minutes_per_timepoint,
+        )
+    console.print(f"[green]froze[/green] {report.dataset_name} -> [cyan]{report.target_dir}[/cyan]")
+    console.print(f"  files copied: {report.n_copied}")
+    console.print(f"  config: [cyan]{report.config_path}[/cyan]")
+    console.print(f"  list:   [cyan]{report.list_path}[/cyan]")
+    console.print(f"  report: [cyan]{report.report_path}[/cyan]")
+    if not report.reference_included:
+        console.print(
+            f"  [yellow]warning[/yellow] reference series not found in DB; "
+            "build_inputs.R regression will fail without it"
+        )
+    if report.minutes_per_timepoint is not None:
+        console.print(f"  minutes_per_timepoint (fallback): {report.minutes_per_timepoint}")
+    for w in report.warnings:
+        console.print(f"  [yellow]![/yellow] {w}")
+
+
 def open_gui() -> None:
     """Entry point for `embryodb-open`: runs `embryodb open` with no args."""
     import sys

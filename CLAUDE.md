@@ -48,7 +48,7 @@ the code; this is a map.
 | **v2.6 — TIME at import time** | done | New `compute_timestamps` pipeline step parses the Stellaris `<TimeStampList>` (hex FILETIME) at import, fills `volume_timestamps`, and writes `TIME<series>.csv` from the DB. `ProcessTime` removed from the default extract checklist (legacy SP5 series only). Vendor-pluggable registry in `parsers/timestamps.py`. CLI: `embryodb emit-time-csv [name…\|all]`. |
 | **v2.7 — Acquisition settings + depth compensation** | done | Parser now extracts per-active-channel laser line + AOTF intensity + detector gain/dye/band, depth-compensation curves (projected per channel), and scalar scope settings (bit depth, pixel dwell, zoom, scan geometry, programmed timing, instrument serial). Stored as JSON on `MicroscopyMetadata` (`channels`, `depth_compensation`, `acquisition_settings`). Right-click → **Microscopy details…** opens a per-series dialog with the high-value table (channels + depth-comp curve). |
 | **v2.7.1 — Multi-host worker claim** | done | `_claim_next` in `pipeline/worker.py` atomically transitions PENDING→RUNNING via a guarded `UPDATE … WHERE id=? AND status='pending'` + `rowcount` check (portable across SQLite/Postgres; no `FOR UPDATE SKIP LOCKED` needed). Race losers re-evaluate and pick the next candidate. New `claimed_by` column on `PipelineStepRun` (observability; additive migration). Safe for two machines running workers against one DB. |
-| v2.8 — LineagePhenotyping bridge | **in progress** | Phase 1 (Python dataset freeze: CLI + GUI) done — `embryodb.phenotyping.freeze`. Phase 2 (GetACD stopgap) + Phase 3 (R `build_inputs.R` port) pending. See "LineagePhenotyping bridge" section below. |
+| v2.8 — LineagePhenotyping bridge | **done** | Phase 1 (Python dataset freeze: CLI + GUI) + Phase 2 (GetACD stopgap, `external_tools.run_getacd`) + Phase 3 (R `build_inputs.R` port) all done; Phase 3 byte-validated against `die-1/` and `ceh-32_mutant/` Perl outputs. See "LineagePhenotyping bridge" section below. |
 | **v3 — Reimplement remaining Java/Perl tools** | pending | The bigger remaining chunk. See "Legacy tools currently called" below + the v3 ordering note. |
 | v4 — acetree_py / archive lifecycle / image tiles | pending | |
 
@@ -257,7 +257,7 @@ reimplementation. Listed roughly in order of how much code depends on them.
 | `ProcessTime.pl` | `external_tools.run_extract` — opt-in for legacy SP5 series only. The Stellaris branch was ported to `parsers/timestamps.py` in v2.6; the SP5 `info/_t<N>_*` branch still needs a Python port. | Per-timepoint timestamps for SP5-era data (writes `TIME<series>.csv`). |
 | `UpdatePermissions.pl` | `external_tools.run_extract` | `chgrp users` + `chmod` across each series' `dats/` |
 | ~~`Process_Time_Stellaris.pl`~~ | ported in v2.6 → `parsers/timestamps.py::LeicaStellarisTimestampParser` | The old regex looked for `<TimeStamp RelativeTime="..."/>`; the modern Stellaris format packs timestamps as hex Windows FILETIME values in `<TimeStampList>`. The Python parser handles the new format. |
-| `GetACD.pl` | (not yet wired — **stopgap planned, see phenotyping bridge below**) | ACD coordinate normalization vs. Richards 2013 reference |
+| `GetACD.pl` | wrapped → `external_tools.run_getacd` (v2.8, **temporary stopgap** — R rewrite is the planned replacement) | ACD coordinate normalization vs. Richards 2013 reference |
 | `GetFiles.pl` | ported → `embryodb.phenotyping.freeze` (v2.8) | Per-series `dats/*.csv` freeze into a per-user directory; the embryoDB-native dataset-aware replacement. |
 | `PrintTrees.pl` | bypassed | Tiny wrapper around `Tree1`; we call the Java class directly |
 
@@ -357,17 +357,35 @@ a `minutes_per_timepoint` value (manual flag, or inferred from DB
 and a "Freeze for phenotyping…" button in the dataset panel. Tests:
 `tests/test_phenotyping_freeze.py`.
 
-**Phase 2 — TODO (GetACD stopgap).** Wrap the *existing* Perl `GetACD.pl`
-as an embryoDB step so `ACD<series>.csv` files exist before a freeze. Runs
-on a dataset/list (not per-embryo — that's a script limitation). **HIGH
-PRIORITY next step:** replace this stopgap with the in-progress R `GetACD`
-rewrite (owned by someone else — leave their effort alone) and integrate ACD
-generation cleanly into the freeze/extract flow.
+**Phase 2 — DONE (GetACD stopgap).** `external_tools.run_getacd(series_names,
+tools3_dir=...)` wraps the *existing* Perl `GetACD.pl` as a detached
+subprocess step (same launcher pattern as `run_extract` / `run_print_trees`):
+writes a series-list file, pre-creates the `CDs`/`AuxInfos` scratch dirs the
+script copies into, and shells `perl <tools3>/GetACD.pl <list>`. Runs on a
+dataset/list (not per-embryo — that's a script limitation). Tests in
+`tests/test_external_tools.py::test_run_getacd_*`. **HIGH PRIORITY next
+step:** replace this stopgap with the in-progress R `GetACD` rewrite (owned
+by someone else — leave their effort alone) and integrate ACD generation
+cleanly into the freeze/extract flow.
 
-**Phase 3 — TODO.** `build_inputs.R` in the LineagePhenotyping repo, the
-numeric port, validated byte-for-byte against the committed `die-1/` and
-`ceh-32_mutant/` Perl outputs. `GetAngles_revRotate.pl` is retired (not
-consumed by the modern pipeline).
+**Phase 3 — done, byte-validated.** `build_inputs.R` in the
+LineagePhenotyping repo (the numeric port of `CompareDivTime.pl` +
+`ComparePositions.pl`) produces all four output tables
+(`DivTimeNorm.tsv`, `CCLengthNorm.tsv`, `CCLengthMinTerminal.tsv`,
+`positions.txt`) **byte-identical** to the committed Perl outputs for
+both `die-1` (dataset 412) and `ceh-32_mutant` (dataset 388), freezing
+each via `embryodb phenotyping freeze` then running `build_inputs.R`.
+`GetAngles_revRotate.pl` is retired (not consumed by the modern pipeline).
+
+**List-order caveat (integration gotcha):** the division tables
+(`DivTime*`, `CCLength*`) order their per-series columns by the
+freeze list-file order, exactly as the Perl did; `positions.txt` uses
+sorted (byte-order) series, so it is order-independent. The freeze emits
+the `.list` in DB/query order, which need not match a *historical* Perl
+run's list order — so to reproduce an old analysis byte-for-byte you must
+feed the same list order (column *values* are identical regardless; only
+column order shifts). For new analyses the order is simply whatever the
+freeze emits.
 
 ## Pending v2 work (next session)
 

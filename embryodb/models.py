@@ -11,9 +11,24 @@ round-trips. v1 only exposes the first three in the UI.
 
 from __future__ import annotations
 
+import sys
 from datetime import datetime
-from enum import StrEnum
 from typing import Any
+
+if sys.version_info >= (3, 11):
+    from enum import StrEnum
+else:
+    # Python 3.10 backport: behaves identically to enum.StrEnum — members are
+    # str subclasses whose str()/format() yield the value, and auto() lowercases
+    # the member name. Lets the lab's 3.10 machines (e.g. lakeplacid) run embryoDB.
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        __str__ = str.__str__
+
+        @staticmethod
+        def _generate_next_value_(name, start, count, last_values):
+            return name.lower()
 
 from sqlalchemy import (
     JSON,

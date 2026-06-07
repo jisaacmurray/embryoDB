@@ -7,7 +7,7 @@ name = "embryodb"
 version = "0.1.0"
 description = "PostgreSQL-backed embryo metadata database for C. elegans lineage imaging"
 readme = "README.md"
-requires-python = ">=3.11"  # models.Status uses enum.StrEnum, which is 3.11+
+requires-python = ">=3.10"  # models.py backports enum.StrEnum (3.11+) for 3.10 hosts
 license = { text = "MIT" }
 authors = [{ name = "Murray Lab" }]
 dependencies = [
@@ -26,6 +26,7 @@ dependencies = [
   # Override the active binding at runtime with the QT_API env var.
   "PyQt5>=5.15; sys_platform == 'linux'",
   "tifffile>=2024.1",   # image staging step; pulls numpy transitively
+  "imagecodecs>=2023.1", # tifffile codec backend; required to decode LZW/compressed TIFFs
   "readlif>=0.6.6",     # Leica .lif reader (v2.10: lif-import); pure Python, mmap-backed
 ]
 

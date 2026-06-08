@@ -78,7 +78,7 @@ class _FakeLifImage:
         return np.full((self.dims.y, self.dims.x), val, dtype=self._dtype)
 
 
-def _build_lif_xml(series_specs) -> ET.Element:
+def _build_lif_xml(series_specs, n_channels: int = 2) -> ET.Element:
     """LIF-shaped xml_root for the given ``[(series, [positions]), ...]``."""
     root = ET.Element("LMSDataContainerHeader")
     project = ET.SubElement(root, "Element", Name="Project")
@@ -103,7 +103,7 @@ def _build_lif_xml(series_specs) -> ET.Element:
                     Length=repr((voxel_um * 1e-6) * n), Unit="m",
                 )
             channels = ET.SubElement(desc, "Channels")
-            for ci in range(2):
+            for ci in range(n_channels):
                 ET.SubElement(channels, "ChannelDescription", ChannelTag=str(ci))
     return root
 
@@ -119,14 +119,15 @@ class FakeLifFile:
     series_specs = [("TileScan 1", ["Position 1", "Position 2"])]
     image_dtype = np.uint8
     image_bit_depth = (8, 8)
+    n_channels = 2
 
     def __init__(self, path):
         self.path = path
-        self.xml_root = _build_lif_xml(self.series_specs)
+        self.xml_root = _build_lif_xml(self.series_specs, self.n_channels)
         self._images = [
             _FakeLifImage(
                 f"{sname}/{pname}",
-                nt=2, nz=3, channels=2,
+                nt=2, nz=3, channels=self.n_channels,
                 bit_depth=self.image_bit_depth,
                 dtype=self.image_dtype,
             )
@@ -155,7 +156,7 @@ def seeded_protocols(db_session, tmp_path):
 def install_fake_lif(monkeypatch):
     """Patch readlif.reader.LifFile; return a configurator for the fake."""
 
-    def _configure(*, series_specs=None, dtype=np.uint8, bit_depth=(8, 8)):
+    def _configure(*, series_specs=None, dtype=np.uint8, bit_depth=(8, 8), n_channels=2):
         class _Configured(FakeLifFile):
             pass
 
@@ -163,6 +164,7 @@ def install_fake_lif(monkeypatch):
             _Configured.series_specs = series_specs
         _Configured.image_dtype = dtype
         _Configured.image_bit_depth = bit_depth
+        _Configured.n_channels = n_channels
         monkeypatch.setattr("readlif.reader.LifFile", _Configured)
         return _Configured
 
@@ -397,3 +399,93 @@ def test_import_lif_names_series_by_leica_position(
     assert s1.microscopy is not None
     assert s1.microscopy.voxel_xy_um == pytest.approx(0.0865, rel=1e-3)
     assert s1.microscopy.voxel_z_um == pytest.approx(0.5002, rel=1e-3)
+
+
+def test_import_lif_single_channel_forces_histone(
+    install_fake_lif, db_session, seeded_protocols, tmp_path
+):
+    """A single-channel acquisition is always histone (tif/), even under a
+    protocol like JIM113 whose channel 0 default is reporter (tifR/)."""
+    from sqlalchemy import select
+
+    from embryodb.lif.import_flow import import_lif
+    from embryodb.models import Protocol
+    from embryodb.pipeline.orchestrate import ImportOptions
+
+    # One channel only; bit_depth tuple length matches.
+    install_fake_lif(
+        series_specs=[("TileScan 1", ["Position 1"])],
+        n_channels=1,
+        bit_depth=(8,),
+    )
+    proto = db_session.execute(
+        select(Protocol).where(Protocol.name == "Stellaris_JIM113")
+    ).scalar_one()
+
+    img_root = tmp_path / "images"
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    opts = ImportOptions(
+        image_loc_root=img_root,
+        alias_root=None,
+        user="testuser",
+        run_through_step="write_matlab_params",
+    )
+
+    import_lif(
+        db_session,
+        lif_path=tmp_path / "JIM593.lif",
+        series_name="TileScan 1",
+        protocol=proto,
+        options=opts,
+        legacy_xml_dir=legacy_dir,
+    )
+
+    l1 = img_root / "testuser" / "images" / "JIM593_L1"
+    # Histone landed in tif/; reporter dir was never created.
+    assert (l1 / "tif").is_dir()
+    assert len(list((l1 / "tif").glob("*.tif"))) == 6  # 2 t × 3 z
+    assert not (l1 / "tifR").exists()
+
+
+def test_import_lif_single_channel_override_still_wins(
+    install_fake_lif, db_session, seeded_protocols, tmp_path
+):
+    """An explicit channel_role_override beats the single-channel histone rule."""
+    from sqlalchemy import select
+
+    from embryodb.lif.import_flow import import_lif
+    from embryodb.models import Protocol
+    from embryodb.pipeline.orchestrate import ImportOptions
+
+    install_fake_lif(
+        series_specs=[("TileScan 1", ["Position 1"])],
+        n_channels=1,
+        bit_depth=(8,),
+    )
+    proto = db_session.execute(
+        select(Protocol).where(Protocol.name == "Stellaris_JIM113")
+    ).scalar_one()
+
+    opts = ImportOptions(
+        image_loc_root=tmp_path / "images",
+        alias_root=None,
+        user="testuser",
+        run_through_step="write_matlab_params",
+    )
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+
+    import_lif(
+        db_session,
+        lif_path=tmp_path / "JIM593.lif",
+        series_name="TileScan 1",
+        protocol=proto,
+        options=opts,
+        legacy_xml_dir=legacy_dir,
+        channel_role_override={0: "reporter"},
+    )
+
+    l1 = tmp_path / "images" / "testuser" / "images" / "JIM593_L1"
+    assert (l1 / "tifR").is_dir()
+    assert not (l1 / "tif").exists()

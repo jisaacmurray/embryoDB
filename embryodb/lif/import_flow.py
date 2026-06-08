@@ -157,6 +157,14 @@ def import_lif(
             channel_map[int(raw_idx_str)] = role
         except ValueError:
             continue
+    # Single-channel acquisitions are always the histone (nuclear) channel,
+    # regardless of the protocol's default role for channel 0. Some protocols
+    # (e.g. JIM113) map ch0 -> reporter, which is wrong when only the histone
+    # channel was acquired and would route the nuclei into tifR/.
+    n_channels = len(series_info.channels) or len(pos_list[0].bit_depth)
+    if n_channels == 1:
+        channel_map = {0: "histone"}
+    # An explicit caller override always wins (deliberate manual assignment).
     if channel_role_override:
         channel_map.update(channel_role_override)
 

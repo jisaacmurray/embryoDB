@@ -20,7 +20,7 @@ import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .external_tools import _EXIT_TRAILER, _embryodb_runs_dir, _pidfile_for
@@ -280,8 +280,19 @@ def list_jobs(
     rows = [JobRow.from_detached(j) for j in discover_jobs(since=since)]
     if session_cm is not None:
         rows.extend(discover_pipeline_jobs(session_cm, since=since))
-    rows.sort(key=lambda r: r.started_at or datetime.min, reverse=True)
+    rows.sort(key=lambda r: _as_aware(r.started_at), reverse=True)
     return rows
+
+
+def _as_aware(dt: datetime | None) -> datetime:
+    """Normalize to a tz-aware datetime so naive (detached-log) and aware
+    (Postgres timestamptz) values sort together. Naive values are assumed UTC;
+    missing values sort last (oldest)."""
+    if dt is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 __all__ = [

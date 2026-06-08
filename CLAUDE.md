@@ -353,9 +353,26 @@ baseline), and emits `configs/<dataset>.yaml` (ready-to-run; `data_dir` /
 **TIME** = regenerate from `volume_timestamps` if present, else fall back to
 a `minutes_per_timepoint` value (manual flag, or inferred from DB
 `delta_seconds`) written into the YAML for `build_inputs.R`. Exposed as CLI
-`embryodb phenotyping freeze <dataset> [--output-base] [--minutes-per-timepoint]`
+`embryodb phenotyping freeze <dataset> [--output-base] [--minutes-per-timepoint]
+[--expression-file PATH] [--expression-series SERIES]`
 and a "Freeze for phenotyping…" button in the dataset panel. Tests:
 `tests/test_phenotyping_freeze.py`.
+
+**Expression (CA) file selection.** `run_pipeline.R`'s peak-expression
+annotation needs a one-row-per-cell `blot` table (a CA file; read by
+`functions.R::ReadPeakExpression` via `row.names=2`). The freeze resolves it
+into `expression.csv` and sets `expression_file:` in the YAML:
+`--expression-file PATH` (a per-timepoint CD/SCD/ACD — cells repeat — is
+collapsed to a CA via **truncated-mean of `blot` per cell**; a one-row-per-cell
+file is copied verbatim), or `--expression-series SERIES` (prefers that series'
+`CA<series>.csv`, else generates from its SCD/CD/ACD). When neither is given the
+YAML omits `expression_file` and `run_pipeline.R` falls back to a bundled
+`LineagePhenotyping/data/CA*.csv` placeholder. **Caveat:** generated CA matches
+the lab's real (EPIC/Java `SeriesSulstonizer`) CA files only ~half the cells
+exactly — the rest differ from Java smoothing / valid-observation rules we don't
+reproduce; for biological exactness pass a real CA via `--expression-file` /
+`--expression-series`. The `CD_to_CA.pl` `×10` scaling is a stale convention not
+present in current data, so it is **not** applied.
 
 **Phase 2 — DONE (GetACD stopgap).** `external_tools.run_getacd(series_names,
 tools3_dir=...)` wraps the *existing* Perl `GetACD.pl` as a detached

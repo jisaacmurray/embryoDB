@@ -147,3 +147,102 @@ def test_unknown_dataset_raises(db_session, tmp_path):
 def test_default_output_base_is_user_specific():
     base = default_output_base("alice")
     assert base == Path("/murrlab3/alice/phenotyping")
+
+
+# --- expression (CA) file resolution ---------------------------------------
+
+_SCHEMA = "cellTime,cell,time,none,global,local,blot,cross,z,x,y,size,gweight"
+
+
+def _write_cd(path: Path, rows: list[tuple[str, int, float]]) -> None:
+    """Write a minimal per-timepoint CD file: rows of (cell, time, blot)."""
+    lines = [_SCHEMA]
+    for cell, t, blot in rows:
+        lines.append(f"{cell}:{t},{cell},{t},0,0,0,{blot},0,0,0,0,0,0")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _write_ca(path: Path, rows: list[tuple[str, float]]) -> None:
+    """Write a one-row-per-cell CA file: rows of (cell, blot)."""
+    lines = [_SCHEMA]
+    for cell, blot in rows:
+        lines.append(f"{cell}:1,{cell},1,0,0,0,{blot},0,0,0,0,0,0")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _read_ca_blot(path: Path) -> dict[str, str]:
+    import csv
+
+    with path.open(newline="") as f:
+        return {r["cell"]: r["blot"] for r in csv.DictReader(f)}
+
+
+def test_expression_file_passthrough_when_already_ca(db_session, tmp_path, reference_series):
+    _make_series(db_session, "20240101_mut_L1", tmp_path / "mut1")
+    _make_dataset(db_session, "mutds", ["20240101_mut_L1"])
+    ca = tmp_path / "myexpr.csv"
+    _write_ca(ca, [("ABal", 100), ("ABar", 200)])
+
+    report = freeze_dataset(
+        db_session, "mutds", output_base=tmp_path / "out", expression_file=ca
+    )
+    assert report.expression_path == report.target_dir / "expression.csv"
+    # One-row-per-cell input is copied verbatim.
+    assert report.expression_path.read_text() == ca.read_text()
+    assert 'expression_file: "expression.csv"' in report.config_path.read_text()
+
+
+def test_expression_file_cd_collapsed_to_truncated_mean(db_session, tmp_path, reference_series):
+    _make_series(db_session, "20240101_mut_L1", tmp_path / "mut1")
+    _make_dataset(db_session, "mutds", ["20240101_mut_L1"])
+    cd = tmp_path / "CDsrc.csv"
+    # ABal mean = (10+21)/2 = 15.5 -> trunc 15; ABar single value 7 -> 7.
+    _write_cd(cd, [("ABal", 1, 10), ("ABal", 2, 21), ("ABar", 1, 7)])
+
+    report = freeze_dataset(
+        db_session, "mutds", output_base=tmp_path / "out", expression_file=cd
+    )
+    blot = _read_ca_blot(report.expression_path)
+    assert blot == {"ABal": "15", "ABar": "7"}
+    assert "collapsed to CA" in report.expression_source
+
+
+def test_expression_series_uses_series_ca(db_session, tmp_path, reference_series):
+    _make_series(db_session, "20240101_mut_L1", tmp_path / "mut1")
+    _make_dataset(db_session, "mutds", ["20240101_mut_L1"])
+    # A separate series whose CA we want to borrow.
+    src = _make_series(db_session, "20240301_reporter", tmp_path / "rep", kinds=("CD",))
+    _write_ca(Path(src.annot_loc) / "dats" / "CA20240301_reporter.csv",
+              [("ABal", 50), ("ABar", 60)])
+
+    report = freeze_dataset(
+        db_session, "mutds", output_base=tmp_path / "out",
+        expression_series="20240301_reporter",
+    )
+    blot = _read_ca_blot(report.expression_path)
+    assert blot == {"ABal": "50", "ABar": "60"}
+    assert "CA20240301_reporter.csv" in report.expression_source
+
+
+def test_expression_series_generates_from_cd_when_no_ca(db_session, tmp_path, reference_series):
+    _make_series(db_session, "20240101_mut_L1", tmp_path / "mut1")
+    _make_dataset(db_session, "mutds", ["20240101_mut_L1"])
+    src = _make_series(db_session, "20240301_reporter", tmp_path / "rep", kinds=())
+    _write_cd(Path(src.annot_loc) / "dats" / "CD20240301_reporter.csv",
+              [("ABal", 1, 4), ("ABal", 2, 9)])  # mean 6.5 -> 6
+
+    report = freeze_dataset(
+        db_session, "mutds", output_base=tmp_path / "out",
+        expression_series="20240301_reporter",
+    )
+    assert _read_ca_blot(report.expression_path) == {"ABal": "6"}
+    assert "generated from CD20240301_reporter.csv" in report.expression_source
+
+
+def test_no_expression_leaves_config_unset(db_session, tmp_path, reference_series):
+    _make_series(db_session, "20240101_mut_L1", tmp_path / "mut1")
+    _make_dataset(db_session, "mutds", ["20240101_mut_L1"])
+
+    report = freeze_dataset(db_session, "mutds", output_base=tmp_path / "out")
+    assert report.expression_path is None
+    assert "expression_file:" not in report.config_path.read_text()

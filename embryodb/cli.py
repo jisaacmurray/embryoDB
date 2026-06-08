@@ -1723,6 +1723,21 @@ def phenotyping_freeze(
             help="Manual frame->minutes value for series lacking TIME info",
         ),
     ] = None,
+    expression_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--expression-file",
+            help="Per-cell expression (CA) file for peak-expression annotation; "
+            "a per-timepoint CD/SCD/ACD is collapsed to a CA automatically",
+        ),
+    ] = None,
+    expression_series: Annotated[
+        str | None,
+        typer.Option(
+            "--expression-series",
+            help="Series whose CA (or SCD/CD/ACD-derived) expression to use",
+        ),
+    ] = None,
 ) -> None:
     """Freeze every series of DATASET (plus the Sulston reference) into a
     self-contained directory with a ready-to-run R config.
@@ -1738,12 +1753,16 @@ def phenotyping_freeze(
             dataset,
             output_base=output_base,
             minutes_per_timepoint=minutes_per_timepoint,
+            expression_file=expression_file,
+            expression_series=expression_series,
         )
     console.print(f"[green]froze[/green] {report.dataset_name} -> [cyan]{report.target_dir}[/cyan]")
     console.print(f"  files copied: {report.n_copied}")
     console.print(f"  config: [cyan]{report.config_path}[/cyan]")
     console.print(f"  list:   [cyan]{report.list_path}[/cyan]")
     console.print(f"  report: [cyan]{report.report_path}[/cyan]")
+    if report.expression_source is not None:
+        console.print(f"  expression: [cyan]{report.expression_path}[/cyan] ({report.expression_source})")
     if not report.reference_included:
         console.print(
             f"  [yellow]warning[/yellow] reference series not found in DB; "

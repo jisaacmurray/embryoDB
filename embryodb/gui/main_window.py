@@ -697,6 +697,27 @@ class MainWindow(QtWidgets.QMainWindow):
         mpt_edit.setPlaceholderText("(auto from timestamps; set only if no TIME info)")
         layout.addRow("Minutes per timepoint:", mpt_edit)
 
+        expr_edit = QtWidgets.QLineEdit()
+        expr_edit.setPlaceholderText("(optional CA file; CD/SCD/ACD is collapsed to CA)")
+        expr_browse = QtWidgets.QPushButton("Browse…")
+        def _pick_expr() -> None:
+            f, _ = QtWidgets.QFileDialog.getOpenFileName(
+                dlg, "Expression source file", expr_edit.text(), "CSV files (*.csv)"
+            )
+            if f:
+                expr_edit.setText(f)
+        expr_browse.clicked.connect(_pick_expr)
+        expr_row = QtWidgets.QHBoxLayout()
+        expr_row.addWidget(expr_edit, 1)
+        expr_row.addWidget(expr_browse)
+        expr_w = QtWidgets.QWidget()
+        expr_w.setLayout(expr_row)
+        layout.addRow("Expression file:", expr_w)
+
+        expr_series_edit = QtWidgets.QLineEdit()
+        expr_series_edit.setPlaceholderText("(or a series name; uses its CA/SCD/CD/ACD)")
+        layout.addRow("Expression series:", expr_series_edit)
+
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
         )
@@ -719,12 +740,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 return
         output_base = Path(base_edit.text().strip()) if base_edit.text().strip() else None
+        expr_file = expr_edit.text().strip() or None
+        expr_series = expr_series_edit.text().strip() or None
 
         try:
             with self._session_cm() as session:
                 report = freeze_dataset(
                     session, dataset_name,
                     output_base=output_base, minutes_per_timepoint=mpt,
+                    expression_file=expr_file, expression_series=expr_series,
                 )
         except Exception as exc:  # surface freeze errors to the user
             QtWidgets.QMessageBox.critical(self, "Freeze failed", str(exc))
@@ -737,6 +761,8 @@ class MainWindow(QtWidgets.QMainWindow):
             f"List: {report.list_path}",
             f"Report: {report.report_path}",
         ]
+        if report.expression_source is not None:
+            msg.append(f"Expression: {report.expression_path} ({report.expression_source})")
         if not report.reference_included:
             msg.append(
                 "\nWARNING: reference series not in DB; build_inputs.R "

@@ -267,13 +267,22 @@ sudo install -d -o postgres -g postgres /var/backups/embryodb
 sudo tee /etc/cron.d/embryodb-backup >/dev/null <<'EOF'
 SHELL=/bin/bash
 PATH=/usr/bin:/bin
-0 2 * * * postgres pg_dump -Fc embryodb > /var/backups/embryodb/embryodb-$(date +\%F).pgdump 2>>/var/log/embryodb-backup.log && find /var/backups/embryodb -name 'embryodb-*.pgdump' -mtime +30 -delete
+0 2 * * * postgres pg_dump -Fc embryodb > /var/backups/embryodb/embryodb-$(date +\%F).pgdump 2>>/var/log/embryodb-backup.log && find /var/backups/embryodb -name 'embryodb-*.pgdump' -mtime +30 -delete && mkdir -p /murrlab3/backups/embryodb && cp /var/backups/embryodb/embryodb-$(date +\%F).pgdump /murrlab3/backups/embryodb/ 2>>/var/log/embryodb-backup.log && find /murrlab3/backups/embryodb -name 'embryodb-*.pgdump' -mtime +90 -delete
 EOF
 sudo install -o postgres -g postgres -m 0644 /dev/null /var/log/embryodb-backup.log
 ```
 
 Cron runs `pg_dump` nightly at 2 AM, logs any errors to
-`/var/log/embryodb-backup.log`, and keeps the most recent 30 days.
+`/var/log/embryodb-backup.log`, and keeps the most recent 30 days
+locally. **Why the second copy:** PGDATA *and* `/var/backups/embryodb`
+both live on the DB host's local disk, so a disk failure would take the
+database and its backups together. The tail of the cron line mirrors each
+dump off-host to `/murrlab3/backups/embryodb/` (different file server,
+ample space) with 90-day retention. Create that dir sticky+world-write
+once so the `postgres` cron user can drop files into it:
+`mkdir -p /murrlab3/backups/embryodb && chmod 1777 /murrlab3/backups/embryodb`.
+The dump is tiny (~2 MB compressed; ≤3 MB projected at 10-year growth),
+so the mirror is essentially free.
 
 Test it without waiting:
 

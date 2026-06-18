@@ -21,6 +21,7 @@ from pathlib import Path
 from qtpy import QtCore, QtWidgets
 
 from ..external_tools import LaunchResult, run_lif_import
+from ..identity import current_user, known_persons, system_users, user_has_image_dir
 
 # Roles the user can assign per channel. role_subdir() maps histone→tif/,
 # reporter→tifR/, anything else→tifC<n>/.
@@ -78,6 +79,22 @@ class LifImportDialog(QtWidgets.QDialog):
         layout.addWidget(QtWidgets.QLabel("Series (TileScan):"))
         layout.addWidget(self._series_combo)
 
+        # Append other movies onto the main time course. The scope sometimes
+        # saves a late extra volume as a SEPARATE object (often, but not
+        # reliably, named '<series>_t<N>'). Any geometry-compatible movie can
+        # be appended; the '_tN' ones are pre-checked since they're the clear
+        # case. Matched per-position by name.
+        self._append_box = QtWidgets.QGroupBox(
+            "Append other movies (same geometry) to the main time course"
+        )
+        self._append_vl = QtWidgets.QVBoxLayout(self._append_box)
+        self._append_checks: dict[str, QtWidgets.QCheckBox] = {}
+        layout.addWidget(self._append_box)
+        self._append_label = QtWidgets.QLabel("")
+        self._append_label.setWordWrap(True)
+        self._append_label.setStyleSheet("color: #555;")
+        layout.addWidget(self._append_label)
+
         # Protocol picker
         self._protocol_combo = QtWidgets.QComboBox()
         self._protocol_combo.currentIndexChanged.connect(
@@ -95,17 +112,49 @@ class LifImportDialog(QtWidgets.QDialog):
 
         # Acquisition metadata fields
         meta = QtWidgets.QFormLayout()
-        self._user_edit = QtWidgets.QLineEdit()
-        self._person_edit = QtWidgets.QLineEdit()
+
+        # User = OS account that OWNS the staged files (picks the
+        # /murrlab3/<user>/images/ tree). Restricted to real accounts so a
+        # typo can't scatter data under a non-account dir owned by the wrong
+        # uid. Defaults to whoever is running embryoDB.
+        self._user_combo = QtWidgets.QComboBox()
+        self._user_combo.setEditable(False)
+        for name in system_users():
+            self._user_combo.addItem(name)
+        _idx = self._user_combo.findText(current_user())
+        if _idx >= 0:
+            self._user_combo.setCurrentIndex(_idx)
+        self._user_combo.currentTextChanged.connect(self._update_user_warning)
+
+        # Person = free-form scientific attribution (who collected the data),
+        # NOT the filesystem owner. Editable combo of known persons so a new
+        # name is visibly absent and gets a confirm before it's created.
+        self._person_combo = QtWidgets.QComboBox()
+        self._person_combo.setEditable(True)
+        self._person_combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        try:
+            with self._session_cm() as s:
+                for name in known_persons(s):
+                    self._person_combo.addItem(name)
+        except Exception:
+            pass
+        self._person_combo.setEditText(current_user())
+
         self._strain_edit = QtWidgets.QLineEdit()
         self._perturb_edit = QtWidgets.QLineEdit()
         self._reporter_edit = QtWidgets.QLineEdit()
-        meta.addRow("User:", self._user_edit)
-        meta.addRow("Person:", self._person_edit)
+        meta.addRow("User (owns files):", self._user_combo)
+        meta.addRow("Person:", self._person_combo)
         meta.addRow("Strain:", self._strain_edit)
         meta.addRow("Perturbation:", self._perturb_edit)
         meta.addRow("Reporter:", self._reporter_edit)
         layout.addLayout(meta)
+
+        self._user_warn = QtWidgets.QLabel("")
+        self._user_warn.setStyleSheet("color: #b8860b;")  # dark-yellow
+        self._user_warn.setWordWrap(True)
+        layout.addWidget(self._user_warn)
+        self._update_user_warning()
 
         # Advanced (collapsible-ish): bit depth, compression, overwrite
         adv = QtWidgets.QGroupBox("Advanced")
@@ -120,6 +169,20 @@ class LifImportDialog(QtWidgets.QDialog):
         self._overwrite_cb = QtWidgets.QCheckBox("Overwrite existing TIFs")
         adv_form.addRow(self._overwrite_cb)
         layout.addWidget(adv)
+
+        # Scheduling: run the queued analysis steps now, or defer to off-hours.
+        self._immediate_cb = QtWidgets.QCheckBox(
+            "Run pipeline immediately (StarryNite / Red Extract / Measure)"
+        )
+        self._immediate_cb.setChecked(True)
+        self._immediate_cb.setToolTip(
+            "Checked (default): start the background worker right after the "
+            "import so StarryNite, Red Extract and Measure run as soon as a CPU "
+            "is free.\n"
+            "Unchecked: defer those steps to off-hours (~9 PM). The worker still "
+            "starts, but each step waits until then."
+        )
+        layout.addWidget(self._immediate_cb)
 
         # Status line
         self._status = QtWidgets.QLabel("")
@@ -224,7 +287,85 @@ class LifImportDialog(QtWidgets.QDialog):
 
     def _on_series_changed(self) -> None:
         self._rebuild_channel_rows()
+        self._rebuild_append_checks()
         self._update_launch_enabled()
+
+    def _rebuild_append_checks(self) -> None:
+        """List every geometry-compatible movie as a checkbox; pre-check the
+        '_tN' siblings (the confident extra-timepoint case)."""
+        while self._append_vl.count():
+            item = self._append_vl.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._append_checks.clear()
+
+        series = self._current_series()
+        if series is None:
+            self._append_box.setVisible(False)
+            self._append_label.setText("")
+            return
+        from ..lif.import_flow import (
+            appendable_candidates,
+            extra_timepoint_siblings,
+        )
+        candidates = appendable_candidates(self._series_list, series.name)
+        auto = set(extra_timepoint_siblings(self._series_list, series.name))
+        self._append_box.setVisible(bool(candidates))
+        if not candidates:
+            self._append_label.setText("")
+            return
+        for name in candidates:
+            info = next((s for s in self._series_list if s.name == name), None)
+            n = info.positions[0].n_timepoints if info and info.positions else 0
+            cb = QtWidgets.QCheckBox(f"{name}  (+{n} tp)")
+            cb.setChecked(name in auto)
+            cb.toggled.connect(self._update_append_label)
+            self._append_vl.addWidget(cb)
+            self._append_checks[name] = cb
+        self._update_append_label()
+
+    def _selected_append_names(self) -> list[str]:
+        return [n for n, cb in self._append_checks.items() if cb.isChecked()]
+
+    def _update_append_label(self) -> None:
+        series = self._current_series()
+        names = self._selected_append_names()
+        if not names:
+            self._append_label.setText("")
+            return
+        extra = 0
+        for name in names:
+            info = next((s for s in self._series_list if s.name == name), None)
+            if info and info.positions:
+                extra += info.positions[0].n_timepoints
+        base = (
+            series.positions[0].n_timepoints
+            if series and series.positions else 0
+        )
+        self._append_label.setText(
+            f"Appending {', '.join(names)} (+{extra} tp) → {base + extra} tp total"
+        )
+
+    def _update_user_warning(self) -> None:
+        user = self._user_combo.currentText().strip()
+        if not user:
+            self._user_warn.setText("")
+            return
+        msgs: list[str] = []
+        me = current_user()
+        if user != me:
+            msgs.append(
+                f"User {user!r} differs from the account running embryoDB "
+                f"({me!r}): files will be OWNED by {me!r}, which can cause "
+                "permission problems."
+            )
+        if not user_has_image_dir(user):
+            msgs.append(
+                f"/murrlab3/{user} has no image tree yet — it will be created "
+                f"and owned by {me!r}."
+            )
+        self._user_warn.setText("\n".join(msgs))
 
     def _on_protocol_changed(self) -> None:
         self._apply_protocol_roles()
@@ -293,14 +434,58 @@ class LifImportDialog(QtWidgets.QDialog):
             for raw_idx, combo in self._channel_combos.items()
         }
         # Confirm — extraction is long and irreversible-ish (writes lots of
-        # files). Surface the channel mapping one more time.
+        # files). Surface the channel mapping + any appended movies one more time.
         mapping = "\n".join(
             f"  raw_ch {i} → {r}" for i, r in sorted(channel_roles.items())
         )
+        append_names = self._selected_append_names()
+        append_msg = ""
+        if append_names:
+            base = series.positions[0].n_timepoints if series.positions else 0
+            extra = 0
+            for name in append_names:
+                info = next(
+                    (s for s in self._series_list if s.name == name), None
+                )
+                if info and info.positions:
+                    extra += info.positions[0].n_timepoints
+            append_msg = (
+                f"Appending {len(append_names)} movie(s): "
+                f"{', '.join(append_names)}\n"
+                f"  combined time course: {base} + {extra} = {base + extra} tp\n\n"
+            )
+        # Guard a brand-new person attribution (typo guard).
+        person = self._person_combo.currentText().strip()
+        if person:
+            try:
+                with self._session_cm() as s:
+                    is_new = person not in known_persons(s)
+            except Exception:
+                is_new = False
+            if is_new:
+                reply = QtWidgets.QMessageBox.question(
+                    self, "Create new person?",
+                    f"'{person}' has not been used as a person attribution "
+                    "before.\n\nCreate it as a new person?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No,
+                )
+                if reply != QtWidgets.QMessageBox.Yes:
+                    return
+
+        user = self._user_combo.currentText().strip()
+        user_msg = ""
+        if user and user != current_user():
+            user_msg = (
+                f"User {user!r} differs from {current_user()!r} — files will "
+                f"be owned by {current_user()!r}.\n\n"
+            )
         confirm = QtWidgets.QMessageBox.question(
             self, "Launch import?",
             f"Import series {series.name!r} from\n{self._lif_path}\n\n"
             f"Channel mapping:\n{mapping}\n\n"
+            f"{append_msg}"
+            f"{user_msg}"
             "Extraction can take hours; it runs detached so you can close "
             "this dialog. Proceed?",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
@@ -308,20 +493,29 @@ class LifImportDialog(QtWidgets.QDialog):
         if confirm != QtWidgets.QMessageBox.Yes:
             return
 
+        if self._immediate_cb.isChecked():
+            delay_hours = 0.0
+        else:
+            from .import_wizard import _default_delay_until_9pm
+            delay_hours = _default_delay_until_9pm()
+
         try:
             result = run_lif_import(
                 self._lif_path,
                 series.name,
                 protocol,
-                user=self._user_edit.text().strip() or None,
-                person=self._person_edit.text().strip(),
+                user=self._user_combo.currentText().strip() or None,
+                person=self._person_combo.currentText().strip(),
                 strain=self._strain_edit.text().strip(),
                 perturbation=self._perturb_edit.text().strip(),
                 reporter=self._reporter_edit.text().strip(),
                 channel_roles=channel_roles,
+                append_series=self._selected_append_names(),
+                auto_append_extra=False,
                 bit_depth_policy=self._bit_depth_combo.currentText(),
                 no_compress=self._no_compress_cb.isChecked(),
                 overwrite=self._overwrite_cb.isChecked(),
+                delay_hours=delay_hours,
             )
         except Exception as exc:  # noqa: BLE001
             QtWidgets.QMessageBox.warning(

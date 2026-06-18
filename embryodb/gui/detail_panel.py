@@ -20,6 +20,7 @@ from qtpy import QtCore, QtWidgets
 from sqlalchemy.orm import Session
 
 from .. import external
+from ..identity import known_persons
 from ..legacy_sync import sync_legacy_xml
 from ..models import RunStatus, Series, Status
 from ..queries import series as q_series
@@ -651,6 +652,19 @@ class DetailPanel(QtWidgets.QWidget):
                 )
                 if reply != QtWidgets.QMessageBox.Yes:
                     return
+            # Guard a brand-new person attribution (typo guard).
+            new_person = self._get_value("person", "combo").strip()
+            if new_person and new_person != (row.person or "").strip():
+                if new_person not in known_persons(session):
+                    reply = QtWidgets.QMessageBox.question(
+                        self, "Create new person?",
+                        f"'{new_person}' has not been used as a person "
+                        "attribution before.\n\nSave it as a new person?",
+                        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                        QtWidgets.QMessageBox.No,
+                    )
+                    if reply != QtWidgets.QMessageBox.Yes:
+                        return
             for column, _, kind in EDIT_FIELDS:
                 value = self._get_value(column, kind)
                 if column == "status":

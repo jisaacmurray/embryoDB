@@ -16,6 +16,7 @@ from collections.abc import Callable
 from qtpy import QtCore, QtWidgets
 
 from ..config import settings
+from ..identity import known_persons
 from ..models import Series, Status
 from ..queries import series as q_series
 
@@ -138,6 +139,25 @@ class BulkEditMetadataDialog(QtWidgets.QDialog):
                 self, "Nothing to do", "No fields filled in — nothing to apply."
             )
             return
+
+        # Guard a brand-new person attribution (typo guard) before mass-write.
+        if person:
+            try:
+                with self._session_cm() as s:
+                    is_new = person not in known_persons(s)
+            except Exception:
+                is_new = False
+            if is_new:
+                reply = QtWidgets.QMessageBox.question(
+                    self, "Create new person?",
+                    f"'{person}' has not been used as a person attribution "
+                    "before.\n\nApply it as a new person to the selected "
+                    "series?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No,
+                )
+                if reply != QtWidgets.QMessageBox.Yes:
+                    return
 
         # Confirm before mass-writing.
         n = len(self._series_names)

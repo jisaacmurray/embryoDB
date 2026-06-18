@@ -18,6 +18,7 @@ from typing import Callable
 from qtpy import QtCore, QtWidgets
 
 from ..config import settings
+from ..identity import current_user, known_persons, system_users, user_has_image_dir
 from ..parsers.filename import list_parsers
 
 _DEFAULT_ACQ_DIR = "/murrlab3/Images"
@@ -281,8 +282,20 @@ class MetadataPage(QtWidgets.QWizardPage):
     def _build(self) -> None:
         layout = QtWidgets.QFormLayout(self)
 
-        self._person_edit = QtWidgets.QLineEdit(settings.user)
-        layout.addRow("Person:", self._person_edit)
+        # Person = free-form scientific attribution (who the data belongs to),
+        # NOT the filesystem owner (that's the User dropdown on the Targets
+        # page). Editable combo of known persons so a brand-new name is
+        # visibly absent from the list and gets a confirm before it's created.
+        self._person_combo = QtWidgets.QComboBox()
+        self._person_combo.setEditable(True)
+        self._person_combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self._person_combo.setToolTip(
+            "Who the data belongs to scientifically (e.g. the person who "
+            "collected the movie). Pick an existing name or type a new one — "
+            "a new name is confirmed before import."
+        )
+        self._person_combo.setEditText(current_user())
+        layout.addRow("Person:", self._person_combo)
 
         self._strain_edit = QtWidgets.QLineEdit()
         layout.addRow("Strain:", self._strain_edit)
@@ -326,6 +339,21 @@ class MetadataPage(QtWidgets.QWizardPage):
         plan = getattr(wizard, "_plan", None)
         source_page: SourcePage = wizard.page(0)  # type: ignore[assignment]
         proto_id = source_page.protocol_id() if source_page else None
+
+        # Populate the person dropdown with attributions already in the DB
+        # (keeping whatever the user has already typed/selected).
+        current_person = self._person_combo.currentText().strip()
+        try:
+            with wizard._session_cm() as s:  # type: ignore[attr-defined]
+                persons = known_persons(s)
+        except Exception:
+            persons = []
+        self._person_combo.blockSignals(True)
+        self._person_combo.clear()
+        self._person_combo.addItems(persons)
+        self._person_combo.setEditText(current_person or current_user())
+        self._person_combo.blockSignals(False)
+
         if proto_id is not None:
             try:
                 with wizard._session_cm() as s:  # type: ignore[attr-defined]
@@ -370,7 +398,7 @@ class MetadataPage(QtWidgets.QWizardPage):
 
     # Accessors for wizard.accept()
     def person(self) -> str:
-        return self._person_edit.text().strip()
+        return self._person_combo.currentText().strip()
 
     def strain(self) -> str:
         return self._strain_edit.text().strip()
@@ -405,10 +433,32 @@ class TargetsPage(QtWidgets.QWizardPage):
     def _build(self) -> None:
         layout = QtWidgets.QFormLayout(self)
 
+        # User = OS/login account that OWNS the staged files; it picks the
+        # /murrlab3/<user>/images/<series>/ tree. Restricted to real accounts
+        # on this host (plus existing image-tree owners) so a typo can't
+        # scatter data under a non-account directory owned by the wrong uid.
+        self._user_combo = QtWidgets.QComboBox()
+        self._user_combo.setEditable(False)
+        self._user_combo.setToolTip(
+            "The account that owns the staged image tree "
+            "(/murrlab3/<user>/images/). Defaults to whoever is running "
+            "embryoDB. Picking a different user means files are still written "
+            "by your account, which can cause permission problems."
+        )
+        for name in system_users():
+            self._user_combo.addItem(name)
+        me = current_user()
+        idx = self._user_combo.findText(me)
+        if idx >= 0:
+            self._user_combo.setCurrentIndex(idx)
+        self._user_combo.currentTextChanged.connect(self._update_user_warning)
+        layout.addRow("User (owns files):", self._user_combo)
+
         self._image_root_edit, row1 = self._path_row(str(DEFAULT_IMAGE_LOC_ROOT))
         layout.addRow("Image loc root:", row1)
 
-        # Warn if the user-specific subdirectory doesn't exist yet.
+        # Warn if the user-specific subdirectory doesn't exist yet, or if the
+        # chosen user differs from the account running embryoDB.
         self._user_warn = QtWidgets.QLabel("")
         self._user_warn.setStyleSheet("color: #b8860b;")  # dark-yellow
         self._user_warn.setWordWrap(True)
@@ -465,6 +515,18 @@ class TargetsPage(QtWidgets.QWizardPage):
         )
         layout.addRow("Delay (hours):", self._delay_spin)
 
+        # Override the delay and run the analysis steps as soon as possible.
+        self._immediate_check = QtWidgets.QCheckBox(
+            "Run pipeline immediately (ignore delay above)"
+        )
+        self._immediate_check.setToolTip(
+            "Check to start StarryNite / Red Extract / Measure right away "
+            "(delay forced to 0) — for testing or time-critical analyses. "
+            "Leave unchecked to defer to the off-hours delay above."
+        )
+        self._immediate_check.toggled.connect(self._delay_spin.setDisabled)
+        layout.addRow("", self._immediate_check)
+
         self._disk_label = QtWidgets.QLabel("—")
         layout.addRow("Est. disk usage:", self._disk_label)
 
@@ -487,20 +549,25 @@ class TargetsPage(QtWidgets.QWizardPage):
             edit.setText(path)
 
     def _update_user_warning(self) -> None:
-        wizard = self.wizard()
-        meta: MetadataPage | None = wizard.page(1) if wizard else None  # type: ignore
-        user = meta.person() if meta else settings.user
+        user = self.user()
         if not user:
             self._user_warn.setText("")
             return
         root = Path(self._image_root_edit.text().strip())
-        user_dir = root / user / "images"
-        if not user_dir.exists():
-            self._user_warn.setText(
-                f"Note: {user_dir} does not exist yet — it will be created on import."
+        msgs: list[str] = []
+        me = current_user()
+        if user != me:
+            msgs.append(
+                f"User {user!r} differs from the account running embryoDB "
+                f"({me!r}): files will be written and OWNED by {me!r}, which "
+                "can cause permission problems."
             )
-        else:
-            self._user_warn.setText("")
+        if not user_has_image_dir(user, root):
+            msgs.append(
+                f"{root / user} has no image tree yet — it will be created "
+                f"and owned by {me!r}."
+            )
+        self._user_warn.setText("\n".join(msgs))
 
     def initializePage(self) -> None:
         plan = getattr(self.wizard(), "_plan", None)
@@ -511,6 +578,9 @@ class TargetsPage(QtWidgets.QWizardPage):
             est_gb = total_files * 4 / 2 / 1024
             self._disk_label.setText(f"~{est_gb:.1f} GB (estimate)")
         self._update_user_warning()
+
+    def user(self) -> str:
+        return self._user_combo.currentText().strip()
 
     def image_loc_root(self) -> Path:
         return Path(self._image_root_edit.text().strip())
@@ -527,6 +597,8 @@ class TargetsPage(QtWidgets.QWizardPage):
         return self._overwrite_check.isChecked()
 
     def delay_hours(self) -> float:
+        if self._immediate_check.isChecked():
+            return 0.0
         return float(self._delay_spin.value())
 
 
@@ -568,7 +640,7 @@ class ConfirmPage(QtWidgets.QWizardPage):
         meta: MetadataPage = wizard.page(1)  # type: ignore[assignment]
 
         image_root = targets.image_loc_root()
-        user = meta.person() or settings.user
+        user = targets.user() or current_user()
         metadata_summary = ", ".join(
             x for x in [meta.strain(), meta.perturbation(), meta.reporter()] if x
         ) or "—"
@@ -620,9 +692,9 @@ class ImportWizard(QtWidgets.QWizard):
         targets_page: TargetsPage = self.page(2)  # type: ignore[assignment]
 
         # Confirm before creating a new top-level user directory under
-        # image_loc_root — guards against typos in the Person field that
-        # would silently scatter image data into /murrlab3/<wrong>/images/.
-        user_for_path = meta_page.person() or settings.user
+        # image_loc_root — guards against picking a user whose tree isn't set
+        # up yet (a common sign of a cross-user mistake).
+        user_for_path = targets_page.user() or current_user()
         if user_for_path:
             user_root = targets_page.image_loc_root() / user_for_path
             if not user_root.exists():
@@ -630,13 +702,35 @@ class ImportWizard(QtWidgets.QWizard):
                     self,
                     "Create new user directory?",
                     f"The directory\n  {user_root}\ndoes not exist.\n\n"
-                    "Importing will create it and stage images underneath.\n"
+                    "Importing will create it and stage images underneath "
+                    f"(owned by {current_user()!r}).\n"
                     f"Is '{user_for_path}' the correct lab username?",
                     QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
                     QtWidgets.QMessageBox.No,
                 )
                 if reply != QtWidgets.QMessageBox.Yes:
-                    return  # don't accept — user can go Back and fix Person
+                    return  # don't accept — user can go Back and fix the User
+
+        # Confirm a brand-new person attribution (typo guard).
+        person = meta_page.person()
+        if person:
+            try:
+                with self._session_cm() as s:
+                    is_new = person not in known_persons(s)
+            except Exception:
+                is_new = False
+            if is_new:
+                reply = QtWidgets.QMessageBox.question(
+                    self,
+                    "Create new person?",
+                    f"'{person}' has not been used as a person attribution "
+                    "before.\n\nCreate it as a new person?\n"
+                    "(Cancel to go Back and pick an existing name.)",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No,
+                )
+                if reply != QtWidgets.QMessageBox.Yes:
+                    return
 
         source_dir = source_page.source_dir()
         proto_id = source_page.protocol_id()
@@ -645,7 +739,7 @@ class ImportWizard(QtWidgets.QWizard):
         opts = ImportOptions(
             image_loc_root=targets_page.image_loc_root(),
             alias_root=targets_page.alias_root(),
-            user=meta_page.person() or settings.user,
+            user=targets_page.user() or current_user(),
             parameter_overrides=meta_page.parameter_overrides(),
             overwrite_existing_images=targets_page.overwrite_existing_images(),
             delay_hours=targets_page.delay_hours(),
@@ -687,6 +781,21 @@ class ImportWizard(QtWidgets.QWizard):
         finally:
             try:
                 progress.close()
+            except Exception:
+                pass
+
+        # Mirror the new rows into the legacy <series>.xml record. The import
+        # session has committed by now (sync_many opens its own); best-effort.
+        synced_names = [
+            o.series_name
+            for o in result.series_outcomes
+            if not o.failed_step and o.series_name
+        ]
+        if synced_names:
+            try:
+                from ..legacy_sync import sync_many
+
+                sync_many(synced_names)
             except Exception:
                 pass
 

@@ -34,6 +34,35 @@ app = typer.Typer(
 console = Console()
 
 
+def _resolve_series_arg(
+    series: list[str] | None, dataset: str | None
+) -> list[str]:
+    """Resolve the series-or-dataset argument shared by the analysis launchers
+    (rerun / extract / print-trees).
+
+    Give either explicit series names or ``--dataset NAME`` (expanded to its
+    sorted member names), not both.
+    """
+    if dataset and series:
+        console.print("[red]give either series names or --dataset, not both[/red]")
+        raise typer.Exit(1)
+    if dataset:
+        with database.session_scope() as session:
+            ds = q_datasets.get_by_name(session, dataset)
+            if ds is None:
+                console.print(f"[red]no dataset named[/red] {dataset!r}")
+                raise typer.Exit(1)
+            names = sorted(s.series_name for s in ds.series)
+        if not names:
+            console.print(f"[yellow]dataset {dataset!r} has no member series[/yellow]")
+            raise typer.Exit(1)
+        return names
+    if not series:
+        console.print("[red]provide series names or --dataset[/red]")
+        raise typer.Exit(1)
+    return list(series)
+
+
 # --- lifecycle ---------------------------------------------------------------
 
 
@@ -631,6 +660,33 @@ def sync_legacy_xml_cmd(
     raise typer.Exit(1 if failed else 0)
 
 
+def _sync_legacy_xml_after_import(result) -> None:
+    """Regenerate the legacy <series>.xml mirror for freshly imported series.
+
+    Runs after the import's own session has committed (``sync_many`` opens its
+    own session), so the XML reflects the just-written DB rows. Best-effort:
+    a sync failure must not fail an otherwise-successful import.
+    """
+    from .legacy_sync import sync_many
+
+    names = [
+        o.series_name
+        for o in result.series_outcomes
+        if not o.failed_step and o.series_name
+    ]
+    if not names:
+        return
+    try:
+        written, failed = sync_many(names)
+    except Exception as exc:  # noqa: BLE001 — never let mirror sync break import
+        console.print(f"[yellow]legacy XML sync skipped:[/yellow] {exc}")
+        return
+    if failed:
+        console.print(
+            f"[yellow]legacy XML sync:[/yellow] {written} written, {failed} failed"
+        )
+
+
 @app.command("partial")
 def partial_cmd(
     series_names: Annotated[
@@ -922,6 +978,52 @@ def pipeline_list_protocols() -> None:
     console.print(table)
 
 
+def _user_person_warnings(
+    session, *, user: str | None, person: str, image_loc_root: Path
+) -> tuple[str, list[str]]:
+    """Resolve the effective owning user and collect guard warnings.
+
+    Returns ``(effective_user, warnings)``. Warnings cover (a) a user that
+    isn't a real account on this host (typo / wrong login), (b) a user that
+    differs from the account running embryoDB (files end up owned by the wrong
+    uid), (c) a user with no image tree yet (created + owned by the runner),
+    and (d) a brand-new person attribution (typo guard). The caller decides
+    whether to prompt; see :mod:`embryodb.identity`.
+    """
+    from .identity import (
+        current_user,
+        is_known_person,
+        system_users,
+        user_has_image_dir,
+    )
+
+    me = current_user()
+    eff_user = user or me
+    warnings: list[str] = []
+    if eff_user not in system_users(image_loc_root):
+        warnings.append(
+            f"user {eff_user!r} is not a known account on this host "
+            f"(typo, or not a lab login?)"
+        )
+    elif eff_user != me:
+        warnings.append(
+            f"user {eff_user!r} differs from the account running embryoDB "
+            f"({me!r}): staged files under {image_loc_root}/{eff_user}/ will be "
+            f"OWNED by {me!r}, which can cause permission problems"
+        )
+    if not user_has_image_dir(eff_user, image_loc_root):
+        warnings.append(
+            f"{image_loc_root}/{eff_user} has no image tree yet; it will be "
+            f"created and owned by {me!r}"
+        )
+    if person and not is_known_person(session, person):
+        warnings.append(
+            f"person {person!r} is new (no prior acquisition/series uses it) — "
+            f"confirm it isn't a typo of an existing name"
+        )
+    return eff_user, warnings
+
+
 @pipeline_app.command("import-acquisition")
 def pipeline_import_acquisition(
     source: Annotated[Path, typer.Argument(help="Raw acquisition directory")],
@@ -960,6 +1062,13 @@ def pipeline_import_acquisition(
     perturbation: str = "",
     reporter: str = "",
     comments: str = "",
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes", "-y",
+            help="Skip the user/person guard confirmation prompt.",
+        ),
+    ] = False,
     set_param: Annotated[
         list[str] | None,
         typer.Option(
@@ -997,10 +1106,18 @@ def pipeline_import_acquisition(
         if proto is None:
             console.print(f"[red]no protocol named[/red] {protocol!r}")
             raise typer.Exit(1)
+        eff_user, warns = _user_person_warnings(
+            session, user=user, person=person, image_loc_root=image_loc_root
+        )
+        for w in warns:
+            console.print(f"[yellow]warning:[/yellow] {w}")
+        if warns and not yes:
+            if not typer.confirm("Proceed anyway?", default=False):
+                raise typer.Exit(1)
         opts = ImportOptions(
             image_loc_root=image_loc_root,
             alias_root=alias_root,
-            user=user,
+            user=eff_user,
             parameter_overrides=overrides,
             compress_with_lzw=not no_compress,
             overwrite_existing_images=overwrite,
@@ -1028,6 +1145,8 @@ def pipeline_import_acquisition(
         if outc.failed_step:
             line += f"  [red]FAILED at {outc.failed_step}[/red]: {outc.error}"
         console.print(line)
+
+    _sync_legacy_xml_after_import(result)
 
 
 @app.command("lif-inspect")
@@ -1253,6 +1372,24 @@ def pipeline_import_lif_cmd(
             help="Position name(s) to import. Default: all in the series.",
         ),
     ] = None,
+    append_series: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--append-series",
+            help="Sibling series whose timepoints are appended onto the END "
+                 "of each matching position's time course (matched by position "
+                 "name). Repeatable. Use for late extra volumes the scope saved "
+                 "as separate objects.",
+        ),
+    ] = None,
+    no_auto_append: Annotated[
+        bool,
+        typer.Option(
+            "--no-auto-append",
+            help="Disable auto-detection of '<series>_t<N>' extra-timepoint "
+                 "siblings (which are appended by default).",
+        ),
+    ] = False,
     channel_role: Annotated[
         list[str] | None,
         typer.Option(
@@ -1278,6 +1415,22 @@ def pipeline_import_lif_cmd(
     perturbation: str = "",
     reporter: str = "",
     comments: str = "",
+    delay_hours: Annotated[
+        float,
+        typer.Option(
+            "--delay-hours",
+            help="Defer StarryNite/Red Extract/Measure this many hours "
+                 "(off-hours scheduling). 0 = run as soon as the worker is free.",
+        ),
+    ] = 0.0,
+    no_worker: Annotated[
+        bool,
+        typer.Option(
+            "--no-worker",
+            help="Don't spawn the background worker after import; just leave the "
+                 "StarryNite/extract/measure steps queued for a later worker.",
+        ),
+    ] = False,
     set_param: Annotated[
         list[str] | None, typer.Option("--set-param", "-s")
     ] = None,
@@ -1363,6 +1516,9 @@ def pipeline_import_lif_cmd(
             except ValueError:
                 continue
         eff_map.update(channel_role_override)
+        eff_user, user_warns = _user_person_warnings(
+            session, user=user, person=person, image_loc_root=image_loc_root
+        )
 
     console.print(
         f"\n[bold]Importing[/bold] {lif_path}  series={series!r}\n"
@@ -1379,6 +1535,58 @@ def pipeline_import_lif_cmd(
         f"  est size:   ~{series_info.estimated_uncompressed_bytes() / 1e9:.1f} GB "
         f"uncompressed (LZW typically 30-50% of that)\n"
     )
+
+    # Resolve siblings to append (same logic import_lif uses) so the user sees
+    # the combined timepoint count before launching, plus any OTHER
+    # geometry-compatible movies they could append by name.
+    from .lif.import_flow import (
+        appendable_candidates,
+        extra_timepoint_siblings,
+        series_compatible_for_append,
+    )
+    append_names: list[str] = []
+    if not no_auto_append:
+        append_names.extend(extra_timepoint_siblings(series_list, series))
+    for name in append_series or []:
+        if name != series and name not in append_names:
+            append_names.append(name)
+    if append_names:
+        extra_tp = 0
+        for name in append_names:
+            info = next((s for s in series_list if s.name == name), None)
+            if info is None:
+                console.print(f"  [yellow]append series {name!r} not found; skipping[/yellow]")
+                continue
+            if not series_compatible_for_append(series_info, info):
+                console.print(
+                    f"  [yellow]append series {name!r} not geometry-compatible "
+                    f"(planes/pixels/channels differ); will be skipped[/yellow]"
+                )
+                continue
+            n = info.positions[0].n_timepoints if info.positions else 0
+            extra_tp += n
+            console.print(f"  [cyan]append[/cyan] {name!r}: +{n} tp")
+        console.print(
+            f"  [bold]combined:[/bold]  "
+            f"{series_info.positions[0].n_timepoints} + {extra_tp} = "
+            f"{series_info.positions[0].n_timepoints + extra_tp} tp\n"
+        )
+    # Surface other compatible movies the user didn't pick (naming may not
+    # follow the _t<N> convention, so don't rely on auto-detection).
+    other = [
+        c for c in appendable_candidates(series_list, series)
+        if c not in append_names
+    ]
+    if other:
+        console.print(
+            "  [dim]other compatible movies you can append with "
+            "--append-series:[/dim]"
+        )
+        for name in other:
+            info = next((s for s in series_list if s.name == name), None)
+            n = info.positions[0].n_timepoints if info and info.positions else 0
+            console.print(f"    [dim]{name!r} ({n} tp)[/dim]")
+        console.print("")
     console.print(f"[bold]Channel mapping[/bold] (from Protocol {protocol!r}):")
     for c in series_info.channels:
         role = eff_map.get(c.raw_index, "(unmapped → tifC?)")
@@ -1402,6 +1610,10 @@ def pipeline_import_lif_cmd(
         f"\n[bold]Acquisition:[/bold]  person={person!r}  strain={strain!r}  "
         f"perturbation={perturbation!r}  reporter={reporter!r}"
     )
+    if user_warns:
+        console.print("")
+        for w in user_warns:
+            console.print(f"[yellow]warning:[/yellow] {w}")
 
     if not yes:
         console.print(
@@ -1422,11 +1634,12 @@ def pipeline_import_lif_cmd(
         opts = ImportOptions(
             image_loc_root=image_loc_root,
             alias_root=alias_root,
-            user=user,
+            user=eff_user,
             parameter_overrides=overrides,
             compress_with_lzw=not no_compress,
             overwrite_existing_images=overwrite,
             run_through_step=run_through,
+            delay_hours=delay_hours,
         )
         result = import_lif(
             session,
@@ -1442,6 +1655,8 @@ def pipeline_import_lif_cmd(
             legacy_xml_dir=legacy_xml_dir,
             positions=position,
             channel_role_override=channel_role_override,
+            append_series=append_series,
+            auto_append_extra=not no_auto_append,
             bit_depth_policy=bit_depth_policy,
             compress=not no_compress,
             on_progress=lambda sname, done, total: print(
@@ -1459,6 +1674,26 @@ def pipeline_import_lif_cmd(
             line += f"  [red]FAILED at {outc.failed_step}[/red]: {outc.error}"
         console.print(line)
 
+    _sync_legacy_xml_after_import(result)
+
+    # Kick the background worker so the queued StarryNite/Red Extract/Measure
+    # steps actually run. Without this the rows sit PENDING forever (the GUI
+    # LIF dialog used to never spawn a worker — that was the stall bug). The
+    # worker is a no-op if one is already alive and honours each row's
+    # `not_before`, so a delayed import still waits until off-hours.
+    if not no_worker:
+        from .pipeline.worker import spawn_worker
+        spawned = spawn_worker()
+        if spawned is None:
+            console.print("[dim]worker already running; queued steps will be picked up[/dim]")
+        elif delay_hours > 0:
+            console.print(
+                f"[green]worker started[/green]; StarryNite/extract/measure deferred "
+                f"~{delay_hours:g} h (off-hours)"
+            )
+        else:
+            console.print("[green]worker started[/green] for StarryNite/extract/measure")
+
 
 @pipeline_app.command("worker")
 def pipeline_worker_cmd() -> None:
@@ -1475,6 +1710,214 @@ def pipeline_worker_cmd() -> None:
     console.print("[green]worker starting…[/green]")
     run_worker()
     console.print("[green]worker exited (queue empty)[/green]")
+
+
+@pipeline_app.command("rerun")
+def pipeline_rerun_cmd(
+    series: Annotated[
+        list[str] | None,
+        typer.Argument(help="Series names to re-run (omit when using --dataset)"),
+    ] = None,
+    dataset: Annotated[
+        str | None,
+        typer.Option("--dataset", "-d", help="Re-run every series in this dataset"),
+    ] = None,
+    step: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--step",
+            help="Worker step(s) to reset (repeatable): run_starrynite, "
+            "run_red_extract, run_measure. Default: earliest incomplete + downstream.",
+        ),
+    ] = None,
+    set_param: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--set",
+            help="matlabParams override key=value (repeatable); applied only "
+            "when run_starrynite is reset.",
+        ),
+    ] = None,
+    run: Annotated[
+        bool,
+        typer.Option("--run/--no-run", help="Spawn the background worker now (default: yes)."),
+    ] = True,
+) -> None:
+    """Re-queue worker pipeline steps for one or more series (CLI twin of the
+    GUI "Re-run pipeline…" dialog).
+
+    Resets the chosen steps to PENDING (clearing their log/error/timestamps).
+    When run_starrynite is among them, matlabParams xyres/zres are refreshed
+    from the DB microscopy metadata and any --set overrides applied, then the
+    worker is spawned unless --no-run is given.
+    """
+    from .pipeline.rerun import requeue_series
+    from .pipeline.worker import WORKER_STEPS, spawn_worker
+
+    names = _resolve_series_arg(series, dataset)
+
+    steps = list(step) if step else None
+    if steps:
+        unknown = [s for s in steps if s not in WORKER_STEPS]
+        if unknown:
+            console.print(
+                f"[red]unknown step(s):[/red] {unknown}  "
+                f"(valid: {', '.join(WORKER_STEPS)})"
+            )
+            raise typer.Exit(1)
+
+    overrides: dict[str, str] = {}
+    for item in set_param or []:
+        if "=" not in item:
+            console.print(f"[red]--set expects key=value, got:[/red] {item!r}")
+            raise typer.Exit(1)
+        k, v = item.split("=", 1)
+        overrides[k.strip()] = v.strip()
+
+    with database.session_scope() as session:
+        result = requeue_series(
+            session, names, steps=steps, overrides=overrides
+        )
+
+    for miss in result.missing:
+        console.print(f"  [yellow]?[/yellow] {miss} (no such series — skipped)")
+    for err in result.errors:
+        console.print(f"  [yellow]![/yellow] {err}")
+    if not result.matched:
+        console.print("[red]no series re-queued[/red]")
+        raise typer.Exit(1)
+    console.print(
+        f"[green]re-queued[/green] {len(result.matched)} series; "
+        f"steps reset: {', '.join(result.steps)}"
+    )
+    if run:
+        spawn_worker()
+        console.print("  [green]worker spawned[/green]")
+    else:
+        console.print("  [dim]queued only; run `embryodb pipeline worker` to process[/dim]")
+
+
+@pipeline_app.command("recover")
+def pipeline_recover_cmd(
+    series: Annotated[
+        list[str] | None,
+        typer.Argument(help="Series names to recover (omit when using --dataset)"),
+    ] = None,
+    dataset: Annotated[
+        str | None,
+        typer.Option("--dataset", "-d", help="Recover every series in this dataset"),
+    ] = None,
+    action: Annotated[
+        str,
+        typer.Option(
+            "--action",
+            help="auto | truncate | stub. auto = truncated retry when a long "
+            "usable prefix exists, else stub.",
+        ),
+    ] = "auto",
+    min_prefix: Annotated[
+        int,
+        typer.Option(
+            "--min-prefix",
+            help="Min usable timepoints to prefer a truncated retry over the stub.",
+        ),
+    ] = 30,
+    run: Annotated[
+        bool,
+        typer.Option("--run/--no-run", help="Spawn the worker after a truncated retry."),
+    ] = True,
+) -> None:
+    """Recover a StarryNite run that failed from detection collapse (dim /
+    photobleached / drifted movie).
+
+    The worker already does this automatically after a failed run_starrynite
+    (see `sn_recovery.auto_recover`); this command is the manual escape hatch to
+    re-trigger or force a specific action.
+
+    Counts per-timepoint detected nuclei, finds the healthy prefix, and either
+    re-queues run_starrynite truncated to that prefix (`truncate`) or drops a
+    placeholder annotation so AceTree can open the images (`stub`). `auto`
+    chooses between them by prefix length.
+    """
+    from .pipeline.sn_recovery import recover_series
+
+    if action not in ("auto", "truncate", "stub"):
+        console.print(f"[red]--action must be auto|truncate|stub, got:[/red] {action!r}")
+        raise typer.Exit(1)
+
+    names = _resolve_series_arg(series, dataset)
+    spawned = False
+    results = []
+    with database.session_scope() as session:
+        for name in names:
+            try:
+                res = recover_series(
+                    session, name, action=action,
+                    min_usable_prefix=min_prefix, spawn=False,
+                )
+            except ValueError as exc:
+                console.print(f"  [yellow]![/yellow] {name}: {exc}")
+                continue
+            results.append(res)
+            color = "green" if res.action == "truncate" else "cyan"
+            console.print(f"  [{color}]{res.action}[/{color}] {name}: {res.detail}")
+            spawned = spawned or res.action == "truncate"
+
+    if not results:
+        console.print("[red]nothing recovered[/red]")
+        raise typer.Exit(1)
+    if run and spawned:
+        from .pipeline.worker import spawn_worker
+
+        spawn_worker()
+        console.print("[green]worker spawned[/green] for truncated retr(y/ies)")
+
+
+@pipeline_app.command("stub")
+def pipeline_stub_cmd(
+    series: Annotated[
+        list[str] | None,
+        typer.Argument(help="Series names to stub (omit when using --dataset)"),
+    ] = None,
+    dataset: Annotated[
+        str | None,
+        typer.Option("--dataset", "-d", help="Stub every series in this dataset"),
+    ] = None,
+) -> None:
+    """Write a placeholder StarryNite annotation so AceTree can open a series
+    that has no real lineage — CLI twin of the GUI "Write stub annotation".
+
+    Drops a one-timepoint stub zip + AceTree config into each series' dats/.
+    Useful for dim/failed movies you still want to eyeball.
+    """
+    from .pipeline.stub_annotation import write_stub_for_series
+
+    names = _resolve_series_arg(series, dataset)
+    wrote = 0
+    with database.session_scope() as session:
+        for name in names:
+            row = q_series.get_by_name(session, name)
+            if row is None:
+                console.print(f"  [yellow]?[/yellow] {name} (no such series — skipped)")
+                continue
+            try:
+                rep = write_stub_for_series(row)
+            except ValueError as exc:
+                console.print(f"  [yellow]![/yellow] {name}: {exc}")
+                continue
+            wrote += 1
+            extra = (
+                f"{rep.n_nuclei} detected nuclei"
+                if rep.mode == "detection"
+                else "placeholder"
+            )
+            console.print(
+                f"  [green]stub[/green] {name} → {rep.config_path.name} "
+                f"(1..{rep.n_timepoints}, {rep.mode}: {extra})"
+            )
+    if not wrote:
+        console.print("[red]no stubs written[/red]")
+        raise typer.Exit(1)
 
 
 @pipeline_app.command("backfill")
@@ -1695,6 +2138,162 @@ def open_cmd(
     console.print("\nopening GUI…")
     import os
     os.execvp("embryodb-gui", ["embryodb-gui"])
+
+
+# --- legacy analysis launchers (extract / trees) + jobs / acetree ----------
+
+
+@app.command("extract")
+def extract_cmd(
+    series: Annotated[
+        list[str] | None,
+        typer.Argument(help="Series names (omit when using --dataset)"),
+    ] = None,
+    dataset: Annotated[
+        str | None,
+        typer.Option("--dataset", "-d", help="Run on every series in this dataset"),
+    ] = None,
+    step: Annotated[
+        list[str] | None,
+        typer.Option("--step", help="Extract step key(s) to run (repeatable)."),
+    ] = None,
+    all_steps: Annotated[
+        bool,
+        typer.Option("--all", help="Run every extract step in canonical order."),
+    ] = False,
+    list_steps: Annotated[
+        bool,
+        typer.Option("--list-steps", help="Print available step keys and exit."),
+    ] = False,
+) -> None:
+    """Run legacy extract.sh steps on a series list (CLI twin of the GUI
+    "Run extract steps…"). Detached fire-and-forget job; outputs land in each
+    series' dats/.
+    """
+    from .external_tools import EXTRACT_STEPS, run_extract
+
+    if list_steps:
+        table = Table(title="extract steps")
+        table.add_column("key", style="cyan")
+        table.add_column("label")
+        table.add_column("description")
+        for s in EXTRACT_STEPS:
+            table.add_row(s.key, s.label, s.description)
+        console.print(table)
+        return
+
+    names = _resolve_series_arg(series, dataset)
+    if all_steps:
+        step_keys = [s.key for s in EXTRACT_STEPS]
+    elif step:
+        step_keys = list(step)
+    else:
+        console.print("[red]choose --step KEY (repeatable) or --all; see --list-steps[/red]")
+        raise typer.Exit(1)
+
+    try:
+        result = run_extract(names, step_keys)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    console.print(
+        f"[green]launched[/green] extract ({', '.join(step_keys)}) on "
+        f"{len(names)} series (detached)\n  log: [cyan]{result.log_path}[/cyan]"
+    )
+
+
+@app.command("print-trees")
+def print_trees_cmd(
+    series: Annotated[
+        list[str] | None,
+        typer.Argument(help="Series names (omit when using --dataset)"),
+    ] = None,
+    dataset: Annotated[
+        str | None,
+        typer.Option("--dataset", "-d", help="Run on every series in this dataset"),
+    ] = None,
+    min_expr: Annotated[
+        int | None, typer.Option("--min-expr", help="Min expression for color scale")
+    ] = None,
+    max_expr: Annotated[
+        int | None, typer.Option("--max-expr", help="Max expression for color scale")
+    ] = None,
+    color_scheme: Annotated[
+        str, typer.Option("--color-scheme", help="Color scheme or root cell")
+    ] = "rainbow",
+    linewidth: Annotated[int, typer.Option("--linewidth")] = 3,
+) -> None:
+    """Render lineage-tree PNGs via Tree1 (CLI twin of the GUI "Print trees…").
+    Detached job; PNGs land in /gpfs/fs0/l/murr/trees/.
+    """
+    from .external_tools import run_print_trees
+
+    names = _resolve_series_arg(series, dataset)
+    result = run_print_trees(
+        names,
+        min_expr=min_expr,
+        max_expr=max_expr,
+        color_scheme=color_scheme,
+        linewidth=linewidth,
+    )
+    console.print(
+        f"[green]launched[/green] PrintTrees on {len(names)} series (detached)\n"
+        f"  log: [cyan]{result.log_path}[/cyan]"
+    )
+
+
+@app.command("jobs")
+def jobs_cmd(
+    running_only: Annotated[
+        bool, typer.Option("--running", help="Only show running/queued jobs.")
+    ] = False,
+) -> None:
+    """List background jobs (CLI twin of the GUI "Background jobs…"): detached
+    legacy-tool launches plus worker pipeline steps.
+    """
+    from datetime import datetime
+
+    from .jobs import list_jobs
+
+    since = datetime.max if running_only else None
+    rows = list_jobs(database.session_scope, since=since)
+    if not rows:
+        console.print("[dim]no background jobs[/dim]")
+        return
+    table = Table(title="background jobs")
+    table.add_column("type", style="cyan")
+    table.add_column("job")
+    table.add_column("status")
+    table.add_column("started")
+    table.add_column("last activity")
+    for r in rows:
+        started = r.started_at.strftime("%Y-%m-%d %H:%M") if r.started_at else "—"
+        last = r.last_activity.strftime("%Y-%m-%d %H:%M") if r.last_activity else "—"
+        style = "yellow" if r.running else ""
+        table.add_row(r.kind, r.name, r.status_label, started, last, style=style)
+    console.print(table)
+
+
+@app.command("launch-acetree")
+def launch_acetree_cmd(
+    series: Annotated[str, typer.Argument(help="Series name to open in AceTree")],
+) -> None:
+    """Open a series in the legacy AceTree jar (CLI twin of the detail-panel
+    "Launch AceTree" button). Detached fire-and-forget.
+    """
+    from .external import LaunchError, launch_acetree
+
+    with database.session_scope() as session:
+        row = q_series.get_by_name(session, series)
+        if row is None:
+            console.print(f"[red]no such series:[/red] {series!r}")
+            raise typer.Exit(1)
+        try:
+            proc = launch_acetree(row)
+        except LaunchError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+    console.print(f"[green]launched[/green] AceTree for {series} (pid {proc.pid})")
 
 
 # --- phenotyping (LineagePhenotyping bridge) --------------------------------

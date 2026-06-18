@@ -25,46 +25,20 @@ from pathlib import Path
 
 from qtpy import QtCore, QtWidgets
 
-from ..fsutil import safe_write_text
-from ..models import PipelineStepRun, RunStatus
-from ..parsers.matlab_params import TUNABLE_KEYS, load as load_params, render as render_params
+from ..parsers.matlab_params import TUNABLE_KEYS, load as load_params
+from ..pipeline.rerun import (
+    _STEP_ORDER,
+    earliest_incomplete_step as _earliest_incomplete_step,
+    refresh_matlab_params,
+    reset_step as _reset_one_step,
+)
 from ..pipeline.worker import WORKER_STEPS, spawn_worker
 
-_STEP_ORDER = {s: i for i, s in enumerate(WORKER_STEPS)}
 _STEP_LABEL = {
     "run_starrynite": "StarryNite (cell detection + tracking)",
     "run_red_extract": "Red Extract (reporter signal)",
     "run_measure": "Measure (morphometry)",
 }
-
-
-def _reset_one_step(session, series_id: int, step: str) -> None:
-    """Set one worker step back to PENDING for a series."""
-    run = (
-        session.query(PipelineStepRun)
-        .filter_by(series_id=series_id, step=step)
-        .one_or_none()
-    )
-    if run is None:
-        run = PipelineStepRun(series_id=series_id, step=step)
-        session.add(run)
-    run.status = RunStatus.PENDING
-    run.started_at = None
-    run.completed_at = None
-    run.heartbeat_at = None
-    run.error_excerpt = None
-    run.log_path = None
-    run.output_summary = {}
-
-
-def _earliest_incomplete_step(runs_by_step: dict[str, RunStatus]) -> str | None:
-    """Return the first WORKER_STEP that is not COMPLETE/SKIPPED, else None."""
-    terminal = {RunStatus.COMPLETE, RunStatus.SKIPPED}
-    for step in WORKER_STEPS:
-        st = runs_by_step.get(step)
-        if st not in terminal:
-            return step
-    return None
 
 
 class RerunPipelineDialog(QtWidgets.QDialog):
@@ -101,6 +75,7 @@ class RerunPipelineDialog(QtWidgets.QDialog):
                 if row is None:
                     continue
                 runs_by_step = {r.step: r.status for r in row.runs}
+                micro = row.microscopy
                 self._series_data.append({
                     "id": row.id,
                     "name": row.series_name,
@@ -109,6 +84,8 @@ class RerunPipelineDialog(QtWidgets.QDialog):
                     "params_path": (
                         str(Path(row.image_loc) / "matlabParams") if row.image_loc else None
                     ),
+                    "voxel_xy_um": micro.voxel_xy_um if micro else None,
+                    "voxel_z_um": micro.voxel_z_um if micro else None,
                     "runs": runs_by_step,
                 })
 
@@ -237,6 +214,19 @@ class RerunPipelineDialog(QtWidgets.QDialog):
             warn.setStyleSheet("color: #b8860b;")
             layout.addWidget(warn)
 
+        # Scheduling: start the worker now, or just queue the rows for later.
+        self._immediate_check = QtWidgets.QCheckBox(
+            "Run immediately (start the background worker now)"
+        )
+        self._immediate_check.setChecked(True)
+        self._immediate_check.setToolTip(
+            "Checked (default): start the background worker as soon as you "
+            "re-queue, so the selected steps run right away.\n"
+            "Unchecked: only re-queue the rows; they'll be picked up the next "
+            "time a worker runs (e.g. the next import)."
+        )
+        layout.addWidget(self._immediate_check)
+
         btns = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
         )
@@ -292,18 +282,22 @@ class RerunPipelineDialog(QtWidgets.QDialog):
 
         with self._session_cm() as s:
             for sd in self._series_data:
-                # Update matlabParams only if SN is being re-queued and the user
-                # set at least one override.
-                if sn_checked and overrides:
+                # When StarryNite is re-queued, rewrite matlabParams to (1) refresh
+                # xyres/zres from the DB microscopy metadata — the single source of
+                # truth, matching step_write_matlab_params at import time — and (2)
+                # apply any user overrides. The resolution refresh runs even with no
+                # overrides, so a stale or hand-edited resolution gets corrected on
+                # rerun instead of feeding the wrong value to StarryNite's tracer.
+                if sn_checked:
                     params_path = sd["params_path"]
                     if params_path:
-                        pp = Path(params_path)
                         try:
-                            params = load_params(pp) if pp.exists() else None
-                            if params is not None:
-                                for k, v in overrides.items():
-                                    params.set(k, v)
-                                safe_write_text(pp, render_params(params))
+                            refresh_matlab_params(
+                                Path(params_path),
+                                voxel_xy_um=sd.get("voxel_xy_um"),
+                                voxel_z_um=sd.get("voxel_z_um"),
+                                overrides=overrides,
+                            )
                         except Exception as exc:
                             errors.append(f"{sd['name']}: {exc}")
                 for step in steps_to_run:
@@ -317,7 +311,8 @@ class RerunPipelineDialog(QtWidgets.QDialog):
                 "Parameter update failed for:\n" + "\n".join(errors[:10]),
             )
 
-        spawn_worker()
+        if self._immediate_check.isChecked():
+            spawn_worker()
         self.accept()
 
 

@@ -597,6 +597,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Re-queued pipeline for {len(selected)} series.", 5000
             )
 
+    # StarryNite detection-collapse recovery (truncated retry / stub) now runs
+    # automatically in the worker after a failed run_starrynite — see
+    # pipeline/sn_recovery.py::auto_recover. Manual escape hatches remain on the
+    # CLI: `embryodb pipeline recover` and `embryodb pipeline stub`.
+
     # --- legacy analysis tools (extract.sh + PrintTrees.pl) ---------------
 
     def _on_run_extract(self) -> None:

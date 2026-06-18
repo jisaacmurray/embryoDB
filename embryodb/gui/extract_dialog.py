@@ -105,6 +105,21 @@ class ExtractDialog(QtWidgets.QDialog):
         sel_row.addStretch(1)
         layout.addLayout(sel_row)
 
+        # Consistency with the other launch dialogs: extract steps run as a
+        # detached subprocess and start immediately — there is no off-hours
+        # worker queue for them — so this is shown checked-and-disabled.
+        immediate_note = QtWidgets.QCheckBox(
+            "Run immediately (extract steps always start now)"
+        )
+        immediate_note.setChecked(True)
+        immediate_note.setEnabled(False)
+        immediate_note.setToolTip(
+            "Extract launches a detached subprocess that begins right away; "
+            "these steps aren't queued for the background worker, so there's "
+            "nothing to defer."
+        )
+        layout.addWidget(immediate_note)
+
         # Status / log path label (populated after Launch)
         self._status = QtWidgets.QLabel("")
         self._status.setWordWrap(True)

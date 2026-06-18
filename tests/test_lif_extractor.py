@@ -120,6 +120,7 @@ class FakeLifFile:
     image_dtype = np.uint8
     image_bit_depth = (8, 8)
     n_channels = 2
+    series_nt: dict[str, int] = {}   # series name → nt; default 2
 
     def __init__(self, path):
         self.path = path
@@ -127,7 +128,8 @@ class FakeLifFile:
         self._images = [
             _FakeLifImage(
                 f"{sname}/{pname}",
-                nt=2, nz=3, channels=self.n_channels,
+                nt=self.series_nt.get(sname, 2), nz=3,
+                channels=self.n_channels,
                 bit_depth=self.image_bit_depth,
                 dtype=self.image_dtype,
             )
@@ -156,7 +158,8 @@ def seeded_protocols(db_session, tmp_path):
 def install_fake_lif(monkeypatch):
     """Patch readlif.reader.LifFile; return a configurator for the fake."""
 
-    def _configure(*, series_specs=None, dtype=np.uint8, bit_depth=(8, 8), n_channels=2):
+    def _configure(*, series_specs=None, dtype=np.uint8, bit_depth=(8, 8),
+                   n_channels=2, series_nt=None):
         class _Configured(FakeLifFile):
             pass
 
@@ -165,6 +168,7 @@ def install_fake_lif(monkeypatch):
         _Configured.image_dtype = dtype
         _Configured.image_bit_depth = bit_depth
         _Configured.n_channels = n_channels
+        _Configured.series_nt = series_nt or {}
         monkeypatch.setattr("readlif.reader.LifFile", _Configured)
         return _Configured
 
@@ -489,3 +493,371 @@ def test_import_lif_single_channel_override_still_wins(
     l1 = tmp_path / "images" / "testuser" / "images" / "JIM593_L1"
     assert (l1 / "tifR").is_dir()
     assert not (l1 / "tif").exists()
+
+
+# ---------------------------------------------------------------------------
+# Extra-timepoint append ("<series>_t<N>" siblings)
+# ---------------------------------------------------------------------------
+
+
+def test_extra_timepoint_siblings_detects_and_orders():
+    from embryodb.lif.extractor import LifSeriesInfo
+    from embryodb.lif.import_flow import extra_timepoint_siblings
+
+    series = [
+        LifSeriesInfo(name="ceh-27_JIM593"),
+        LifSeriesInfo(name="ceh-27_JIM593_t242"),
+        LifSeriesInfo(name="ceh-27_JIM593_t241"),
+        LifSeriesInfo(name="ceh-27_JIM593_setup"),   # not a _t<N> sibling
+        LifSeriesInfo(name="other_series"),
+    ]
+    assert extra_timepoint_siblings(series, "ceh-27_JIM593") == [
+        "ceh-27_JIM593_t241",
+        "ceh-27_JIM593_t242",
+    ]
+    # No false positives on an unrelated main name.
+    assert extra_timepoint_siblings(series, "other_series") == []
+
+
+def test_import_lif_appends_extra_timepoint(
+    install_fake_lif, db_session, seeded_protocols, tmp_path
+):
+    """A '<series>_t<N>' sibling is auto-appended onto the main time course:
+    its frames continue the numbering and every downstream count is combined."""
+    from sqlalchemy import select
+
+    from embryodb.lif.import_flow import import_lif
+    from embryodb.models import Protocol, Series
+    from embryodb.pipeline.orchestrate import ImportOptions
+
+    # Main = 2 tp; extra sibling = 1 tp. Same position name in both.
+    install_fake_lif(
+        series_specs=[
+            ("TileScan 1", ["Position 1"]),
+            ("TileScan 1_t3", ["Position 1"]),
+        ],
+        series_nt={"TileScan 1": 2, "TileScan 1_t3": 1},
+    )
+    proto = db_session.execute(
+        select(Protocol).where(Protocol.name == "Stellaris_JIM113")
+    ).scalar_one()
+
+    img_root = tmp_path / "images"
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    opts = ImportOptions(
+        image_loc_root=img_root,
+        alias_root=None,
+        user="testuser",
+        run_through_step="write_matlab_params",
+    )
+
+    import_lif(
+        db_session,
+        lif_path=tmp_path / "JIM593.lif",
+        series_name="TileScan 1",
+        protocol=proto,
+        options=opts,
+        legacy_xml_dir=legacy_dir,
+    )
+
+    l1 = img_root / "testuser" / "images" / "JIM593_L1"
+    tif = l1 / "tif"   # JIM113: ch1=histone → tif/
+    # 3 combined tp × 3 z = 9 planes in the histone dir.
+    assert len(list(tif.glob("*.tif"))) == 9
+    # Main frames t001/t002 plus the appended t003 (offset = 2).
+    assert (tif / "JIM593_L1-t001-p01.tif").exists()
+    assert (tif / "JIM593_L1-t002-p01.tif").exists()
+    assert (tif / "JIM593_L1-t003-p01.tif").exists()
+    assert not (tif / "JIM593_L1-t004-p01.tif").exists()
+
+    # Series.timepts is the combined total.
+    s1 = db_session.execute(
+        select(Series).where(Series.series_name == "JIM593_L1")
+    ).scalar_one()
+    assert s1.timepts == "3"
+
+    # Downstream configs carry the combined count.
+    acetree = (l1 / "dats" / "JIM593_L1.xml").read_text()
+    assert '<end index="3"/>' in acetree
+    params = (l1 / "matlabParams").read_text()
+    assert "end_time=3" in params
+
+
+def test_reimport_with_append_updates_existing_timepts(
+    install_fake_lif, db_session, seeded_protocols, tmp_path
+):
+    """Re-importing an EXISTING series with a newly-appended extra timepoint
+    raises series.timepts to track the on-disk reality, instead of keeping the
+    stale count from the first import."""
+    from sqlalchemy import select
+
+    from embryodb.lif.import_flow import import_lif
+    from embryodb.models import Protocol, Series
+    from embryodb.pipeline.orchestrate import ImportOptions
+
+    proto = db_session.execute(
+        select(Protocol).where(Protocol.name == "Stellaris_JIM113")
+    ).scalar_one()
+    img_root = tmp_path / "images"
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    opts = ImportOptions(
+        image_loc_root=img_root,
+        alias_root=None,
+        user="testuser",
+        run_through_step="write_matlab_params",
+    )
+
+    def _run():
+        import_lif(
+            db_session,
+            lif_path=tmp_path / "JIM593.lif",
+            series_name="TileScan 1",
+            protocol=proto,
+            options=opts,
+            legacy_xml_dir=legacy_dir,
+        )
+
+    # First import: main only, 2 tp.
+    install_fake_lif(
+        series_specs=[("TileScan 1", ["Position 1"])],
+        series_nt={"TileScan 1": 2},
+    )
+    _run()
+    s1 = db_session.execute(
+        select(Series).where(Series.series_name == "JIM593_L1")
+    ).scalar_one()
+    assert s1.timepts == "2"
+
+    # Re-import: a late extra-timepoint sibling now exists → 3 tp combined.
+    install_fake_lif(
+        series_specs=[
+            ("TileScan 1", ["Position 1"]),
+            ("TileScan 1_t3", ["Position 1"]),
+        ],
+        series_nt={"TileScan 1": 2, "TileScan 1_t3": 1},
+    )
+    _run()
+    db_session.refresh(s1)
+    assert s1.timepts == "3"
+    # The AceTree config (regenerated each import — the file StarryNite/AceTree
+    # actually read) carries the new combined count, not the stale 2.
+    acetree = (
+        img_root / "testuser" / "images" / "JIM593_L1" / "dats" / "JIM593_L1.xml"
+    ).read_text()
+    assert '<end index="3"/>' in acetree
+
+
+def test_appendable_candidates_is_geometry_based_not_name_based(install_fake_lif):
+    """Any geometry-compatible movie is appendable, regardless of its name; a
+    movie with a different plane count is not."""
+    from embryodb.lif.import_flow import (
+        appendable_candidates,
+        series_compatible_for_append,
+    )
+
+    install_fake_lif(
+        series_specs=[
+            ("main", ["Position 1"]),
+            ("badlyNamedExtra", ["Position 1"]),       # compatible, odd name
+            ("main_t9", ["Position 1"]),               # compatible, _tN name
+            ("differentEmbryo", ["Position 7"]),       # compatible geom, no shared pos
+        ],
+    )
+    ex = LifExtractor("ignored.lif")
+    series = ex.list_series()
+
+    cands = appendable_candidates(series, "main")
+    # Shares geometry AND a position name → appendable, even without _tN.
+    assert "badlyNamedExtra" in cands
+    assert "main_t9" in cands
+    # No shared position name → not a candidate (would append nothing).
+    assert "differentEmbryo" not in cands
+
+    main = next(s for s in series if s.name == "main")
+    odd = next(s for s in series if s.name == "badlyNamedExtra")
+    assert series_compatible_for_append(main, odd) is True
+
+
+def test_series_incompatible_when_plane_count_differs(install_fake_lif):
+    """Different nz makes a movie non-appendable (volumes can't concatenate)."""
+    from embryodb.lif.extractor import LifPositionInfo, LifSeriesInfo
+    from embryodb.lif.import_flow import series_compatible_for_append
+
+    def _series(name, nz):
+        info = LifSeriesInfo(name=name)
+        info.positions = [
+            LifPositionInfo(
+                name="Position 1", raw_index=0, n_timepoints=2, n_planes=nz,
+                x_pixels=4, y_pixels=4, bit_depth=(8, 8),
+            )
+        ]
+        info.channels = []  # n_channels falls back to len(bit_depth)=2
+        return info
+
+    main = _series("main", nz=30)
+    same = _series("extra", nz=30)
+    diff = _series("extra", nz=20)
+    assert series_compatible_for_append(main, same) is True
+    assert series_compatible_for_append(main, diff) is False
+
+
+def test_import_lif_appends_compatible_unnamed_movie(
+    install_fake_lif, db_session, seeded_protocols, tmp_path
+):
+    """A compatible movie NOT named '_tN' is appended when named explicitly."""
+    from sqlalchemy import select
+
+    from embryodb.lif.import_flow import import_lif
+    from embryodb.models import Protocol, Series
+    from embryodb.pipeline.orchestrate import ImportOptions
+
+    install_fake_lif(
+        series_specs=[
+            ("TileScan 1", ["Position 1"]),
+            ("late volume", ["Position 1"]),   # compatible, non-_tN name
+        ],
+        series_nt={"TileScan 1": 2, "late volume": 1},
+    )
+    proto = db_session.execute(
+        select(Protocol).where(Protocol.name == "Stellaris_JIM113")
+    ).scalar_one()
+
+    img_root = tmp_path / "images"
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    opts = ImportOptions(
+        image_loc_root=img_root, alias_root=None, user="testuser",
+        run_through_step="write_matlab_params",
+    )
+
+    import_lif(
+        db_session,
+        lif_path=tmp_path / "JIM593.lif",
+        series_name="TileScan 1",
+        protocol=proto,
+        options=opts,
+        legacy_xml_dir=legacy_dir,
+        append_series=["late volume"],   # explicit; auto-detect wouldn't catch it
+    )
+
+    l1 = img_root / "testuser" / "images" / "JIM593_L1"
+    assert (l1 / "tif" / "JIM593_L1-t003-p01.tif").exists()
+    s1 = db_session.execute(
+        select(Series).where(Series.series_name == "JIM593_L1")
+    ).scalar_one()
+    assert s1.timepts == "3"
+
+
+def test_import_lif_skips_incompatible_append(
+    install_fake_lif, db_session, seeded_protocols, tmp_path, monkeypatch
+):
+    """An explicitly-requested but geometry-incompatible series is skipped."""
+    from sqlalchemy import select
+
+    import embryodb.lif.extractor as extractor_mod
+    from embryodb.lif.import_flow import import_lif
+    from embryodb.models import Protocol, Series
+    from embryodb.pipeline.orchestrate import ImportOptions
+
+    # Build a fake whose "extra" series has a DIFFERENT plane count (nz=2) than
+    # the main (nz=3), so it is rejected as incompatible.
+    install_fake_lif(
+        series_specs=[
+            ("TileScan 1", ["Position 1"]),
+            ("oddball", ["Position 1"]),
+        ],
+    )
+
+    orig_list_series = extractor_mod.LifExtractor.list_series
+
+    def _patched_list_series(self):
+        out = orig_list_series(self)
+        for s in out:
+            if s.name == "oddball":
+                for p in s.positions:
+                    p.n_planes = 2   # mismatch vs main's nz=3
+        return out
+
+    monkeypatch.setattr(
+        extractor_mod.LifExtractor, "list_series", _patched_list_series
+    )
+
+    proto = db_session.execute(
+        select(Protocol).where(Protocol.name == "Stellaris_JIM113")
+    ).scalar_one()
+    img_root = tmp_path / "images"
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    opts = ImportOptions(
+        image_loc_root=img_root, alias_root=None, user="testuser",
+        run_through_step="write_matlab_params",
+    )
+
+    import_lif(
+        db_session,
+        lif_path=tmp_path / "JIM593.lif",
+        series_name="TileScan 1",
+        protocol=proto,
+        options=opts,
+        legacy_xml_dir=legacy_dir,
+        append_series=["oddball"],
+    )
+
+    # Incompatible append ignored → main-only count.
+    s1 = db_session.execute(
+        select(Series).where(Series.series_name == "JIM593_L1")
+    ).scalar_one()
+    assert s1.timepts == "2"
+
+
+def test_import_lif_no_auto_append_keeps_main_only(
+    install_fake_lif, db_session, seeded_protocols, tmp_path
+):
+    """auto_append_extra=False imports only the main series, ignoring siblings."""
+    from sqlalchemy import select
+
+    from embryodb.lif.import_flow import import_lif
+    from embryodb.models import Protocol, Series
+    from embryodb.pipeline.orchestrate import ImportOptions
+
+    install_fake_lif(
+        series_specs=[
+            ("TileScan 1", ["Position 1"]),
+            ("TileScan 1_t3", ["Position 1"]),
+        ],
+        series_nt={"TileScan 1": 2, "TileScan 1_t3": 1},
+    )
+    proto = db_session.execute(
+        select(Protocol).where(Protocol.name == "Stellaris_JIM113")
+    ).scalar_one()
+
+    img_root = tmp_path / "images"
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    opts = ImportOptions(
+        image_loc_root=img_root,
+        alias_root=None,
+        user="testuser",
+        run_through_step="write_matlab_params",
+    )
+
+    import_lif(
+        db_session,
+        lif_path=tmp_path / "JIM593.lif",
+        series_name="TileScan 1",
+        protocol=proto,
+        options=opts,
+        legacy_xml_dir=legacy_dir,
+        auto_append_extra=False,
+    )
+
+    l1 = img_root / "testuser" / "images" / "JIM593_L1"
+    tif = l1 / "tif"
+    assert len(list(tif.glob("*.tif"))) == 6   # 2 tp × 3 z, no t003
+    assert not (tif / "JIM593_L1-t003-p01.tif").exists()
+    s1 = db_session.execute(
+        select(Series).where(Series.series_name == "JIM593_L1")
+    ).scalar_one()
+    assert s1.timepts == "2"

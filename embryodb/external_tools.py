@@ -372,12 +372,16 @@ def run_lif_import(
     comments: str = "",
     positions: list[str] | None = None,
     channel_roles: dict[int, str] | None = None,
+    append_series: list[str] | None = None,
+    auto_append_extra: bool = True,
     bit_depth_policy: str = "downcast",
     no_compress: bool = False,
     overwrite: bool = False,
     image_loc_root: Path | None = None,
     alias_root: Path | None = None,
     run_through: str | None = None,
+    delay_hours: float = 0.0,
+    spawn_worker: bool = True,
 ) -> LaunchResult:
     """Spawn ``embryodb pipeline import-lif`` detached.
 
@@ -413,6 +417,10 @@ def run_lif_import(
         cmd += ["--position", shell_quote(pos)]
     for raw_ch, role in (channel_roles or {}).items():
         cmd += ["--channel-role", shell_quote(f"{raw_ch}={role}")]
+    for name in append_series or []:
+        cmd += ["--append-series", shell_quote(name)]
+    if not auto_append_extra:
+        cmd += ["--no-auto-append"]
     if no_compress:
         cmd += ["--no-compress"]
     if overwrite:
@@ -423,6 +431,10 @@ def run_lif_import(
         cmd += ["--alias-root", shell_quote(str(alias_root))]
     if run_through:
         cmd += ["--run-through", shell_quote(run_through)]
+    if delay_hours and delay_hours > 0:
+        cmd += ["--delay-hours", shell_quote(f"{delay_hours:g}")]
+    if not spawn_worker:
+        cmd += ["--no-worker"]
 
     runs = _embryodb_runs_dir()
     runs.mkdir(parents=True, exist_ok=True)

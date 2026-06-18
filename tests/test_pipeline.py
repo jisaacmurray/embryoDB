@@ -707,6 +707,50 @@ def test_step_run_starrynite_failed_on_nonzero(db_session, tmp_path, monkeypatch
     assert refreshed.status == RunStatus.FAILED
 
 
+def test_diagnose_starrynite_cell_ct_limit_overflow(tmp_path):
+    """A tracer crash after tracing began is recognized as the cell_ct_limit bug."""
+    from embryodb.pipeline.subprocess_steps import diagnose_starrynite_failure
+
+    log = tmp_path / "sn.log"
+    log.write_text(
+        "running matlab nuclear detection:\n"
+        "Elapsed time is 833.3 seconds.\n"
+        "running lineaging:\n"
+        "Start cell tracing:\n"
+        "tracing, round 1: 8300\n"
+        "allocated neighbor arrays\n"
+        "Segmentation fault\n"
+        "SN FAILED!\n"
+    )
+    msg = diagnose_starrynite_failure(log)
+    assert msg is not None
+    assert "cell_ct_limit" in msg
+
+
+def test_diagnose_starrynite_mcr_teardown(tmp_path):
+    """A heap abort after detection but before tracing is the MCR-teardown case."""
+    from embryodb.pipeline.subprocess_steps import diagnose_starrynite_failure
+
+    log = tmp_path / "sn.log"
+    log.write_text(
+        "running matlab nuclear detection:\n"
+        "Elapsed time is 800.0 seconds.\n"
+        "double free or corruption (!prev)\n"
+    )
+    msg = diagnose_starrynite_failure(log)
+    assert msg is not None
+    assert "MCR" in msg
+
+
+def test_diagnose_starrynite_none_on_success(tmp_path):
+    """A log that reached 'End time' has no recognized failure cause."""
+    from embryodb.pipeline.subprocess_steps import diagnose_starrynite_failure
+
+    log = tmp_path / "sn.log"
+    log.write_text("Start cell tracing:\nEnd time: whenever\n")
+    assert diagnose_starrynite_failure(log) is None
+
+
 # ---------------------------------------------------------------------------
 # Worker: queue logic and stale-heartbeat reset
 # ---------------------------------------------------------------------------

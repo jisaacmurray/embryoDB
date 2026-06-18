@@ -80,6 +80,82 @@ def _position_number(name: str, fallback: int) -> int:
     return int(m.group(1)) if m else fallback
 
 
+def extra_timepoint_siblings(series_list, main_name: str) -> list[str]:
+    """Sibling series that are *extra timepoints* of ``main_name``.
+
+    The microscope occasionally saves a late extra volume as a SEPARATE LIF
+    object named ``<main>_t<N>`` (e.g. ``..._t241`` next to a 240-tp main
+    series) instead of as timepoint N of the main acquisition. Those should be
+    appended to the end of the main time course so StarryNite/AceTree see one
+    continuous movie. Returns the matching names ordered by their numeric
+    suffix ascending. The suffix is informational — actual placement is by
+    append order (see :func:`_import_one_position`).
+    """
+    rx = re.compile(rf"^{re.escape(main_name)}_t(\d+)$")
+    matched: list[tuple[int, str]] = []
+    for s in series_list:
+        m = rx.match(s.name)
+        if m:
+            matched.append((int(m.group(1)), s.name))
+    return [name for _, name in sorted(matched)]
+
+
+def _series_geometry(info) -> tuple[int, int, int, int] | None:
+    """``(n_channels, n_planes, x_pixels, y_pixels)`` of a series' first
+    position, or ``None`` when the series has no positions. This is the shape
+    a movie must share to be concatenated onto another without breaking
+    StarryNite/AceTree (which assume a fixed per-volume plane count + frame
+    dimensions across the whole time course).
+    """
+    if not info.positions:
+        return None
+    p = info.positions[0]
+    n_channels = len(info.channels) or len(p.bit_depth)
+    return (n_channels, p.n_planes, p.x_pixels, p.y_pixels)
+
+
+def series_compatible_for_append(main, candidate) -> bool:
+    """Whether ``candidate``'s frames can be appended onto ``main``'s movie.
+
+    Compatibility is structural, NOT name-based (the ``_t<N>`` convention is
+    unreliable — users don't always follow it). A candidate is appendable when:
+
+    - it has the same per-volume geometry (channel count, plane count, and
+      X/Y pixel dimensions) as the main series, and
+    - it shares at least one position NAME with the main series (append is
+      matched position-by-position by name).
+
+    Timepoint count is deliberately NOT compared — the whole point is that the
+    extra movie has a different (usually much shorter) length.
+    """
+    gm = _series_geometry(main)
+    gc = _series_geometry(candidate)
+    if gm is None or gc is None or gm != gc:
+        return False
+    main_pos = {p.name for p in main.positions}
+    cand_pos = {p.name for p in candidate.positions}
+    return bool(main_pos & cand_pos)
+
+
+def appendable_candidates(series_list, main_name: str) -> list[str]:
+    """All series in ``series_list`` that could be appended onto ``main_name``.
+
+    Geometry-compatible siblings (see :func:`series_compatible_for_append`),
+    excluding the main series itself, in document order. Use this to surface
+    the full set of choices in the CLI/GUI regardless of how they're named;
+    :func:`extra_timepoint_siblings` is the subset confident enough to append
+    automatically by default.
+    """
+    main = next((s for s in series_list if s.name == main_name), None)
+    if main is None:
+        return []
+    return [
+        s.name
+        for s in series_list
+        if s.name != main_name and series_compatible_for_append(main, s)
+    ]
+
+
 def import_lif(
     session: Session,
     lif_path: Path | str,
@@ -96,6 +172,8 @@ def import_lif(
     legacy_xml_dir: Path | None = None,
     positions: list[str] | None = None,
     channel_role_override: dict[int, str] | None = None,
+    append_series: list[str] | None = None,
+    auto_append_extra: bool = True,
     bit_depth_policy: str = "downcast",
     compress: bool = True,
     on_progress: Callable[[str, int, int], None] | None = None,
@@ -111,6 +189,20 @@ def import_lif(
         channels to roles (histone / reporter / …).
       positions: optional whitelist of position names to import
         (default: all positions in the series).
+      append_series: optional sibling LIF series whose timepoints are
+        appended onto the END of each matching position's main time course
+        (matched by position name). Any geometry-compatible series may be
+        named here regardless of its name — incompatible ones (different
+        plane count / pixel dims / channel count, or no shared position) are
+        warned about and skipped (see :func:`series_compatible_for_append`).
+        Use for late extra volumes the scope saved as separate objects.
+      auto_append_extra: when True (default), also auto-detect and append
+        siblings named ``<series_name>_t<N>`` (see
+        :func:`extra_timepoint_siblings`). This is the conservative
+        auto-default; arbitrary compatible movies (see
+        :func:`appendable_candidates`) are only appended when named explicitly
+        in ``append_series``. An explicit ``append_series`` is unioned with the
+        auto-detected set; both are compatibility-gated.
       channel_role_override: optional ``{raw_index: role}`` mapping that
         overrides ``protocol.channel_map`` for this import only. Useful
         when the dye-to-role assignment differs from the protocol's
@@ -130,8 +222,9 @@ def import_lif(
     stop_after = STEPS.index(opts.run_through_step)
 
     ex = LifExtractor(lif_path)
+    all_series = ex.list_series()
     series_info = next(
-        (s for s in ex.list_series() if s.name == series_name), None
+        (s for s in all_series if s.name == series_name), None
     )
     if series_info is None:
         raise ValueError(
@@ -147,6 +240,31 @@ def import_lif(
         pos_list = [p for p in pos_list if p.name in positions]
     if not pos_list:
         raise ValueError("no positions selected for import")
+
+    # Resolve extra-timepoint sibling series to append (auto-detected
+    # ``<main>_t<N>`` + any explicit names), preserving suffix order then
+    # caller order. Skip the main itself and unknown names (warn).
+    append_names: list[str] = []
+    if auto_append_extra:
+        append_names.extend(extra_timepoint_siblings(all_series, series_name))
+    for name in append_series or []:
+        if name != series_name and name not in append_names:
+            append_names.append(name)
+    append_infos = []
+    for name in append_names:
+        info = next((s for s in all_series if s.name == name), None)
+        if info is None:
+            log.warning("append series %r not found in %s; skipping", name, lif_path)
+            continue
+        if not series_compatible_for_append(series_info, info):
+            log.warning(
+                "append series %r is not geometry-compatible with %r "
+                "(plane count / pixel dims / channel count differ, or no shared "
+                "position); skipping",
+                name, series_name,
+            )
+            continue
+        append_infos.append(info)
 
     # Resolve channel mapping. Protocol's channel_map is keyed by raw
     # channel index as a string (matches the format on Protocol rows);
@@ -216,6 +334,21 @@ def import_lif(
 
     for pos_idx, pos in enumerate(pos_list, start=1):
         position_num = _position_number(pos.name, pos_idx)
+        # Match each append series' position by NAME (positions correspond
+        # 1:1 across the main and extra-timepoint objects). A missing match
+        # is a warn-and-skip — that position simply gets no extra frames.
+        extra_segments: list[tuple[str, object]] = []
+        for info in append_infos:
+            match = next(
+                (p for p in info.positions if p.name == pos.name), None
+            )
+            if match is None:
+                log.warning(
+                    "append series %r has no position %r; not appending to %s",
+                    info.name, pos.name, series_name,
+                )
+                continue
+            extra_segments.append((info.name, match))
         outcome = _import_one_position(
             session,
             ex=ex,
@@ -225,6 +358,7 @@ def import_lif(
             series_name_in_lif=series_name,
             position_info=pos,
             position_num=position_num,
+            extra_segments=extra_segments,
             stem=stem,
             user=user,
             image_loc_root=image_loc_root,
@@ -253,6 +387,7 @@ def _import_one_position(
     series_name_in_lif: str,
     position_info,
     position_num: int,
+    extra_segments: list[tuple[str, object]] | None = None,
     stem: str,
     user: str,
     image_loc_root: Path,
@@ -271,6 +406,15 @@ def _import_one_position(
     dats_dir = ensure_dir(image_loc / "dats")
     outcome = SeriesOutcome(series_name=series_name, image_loc=image_loc)
 
+    # The main position plus any extra-timepoint segments are concatenated
+    # into one continuous time course. ``total_nt`` is the combined frame
+    # count and drives every downstream step (timepts, AceTree end index,
+    # matlabParams end_time) so StarryNite/AceTree see a single movie.
+    segments: list[tuple[str, object]] = [
+        (series_name_in_lif, position_info)
+    ] + list(extra_segments or [])
+    total_nt = sum(seg_pos.n_timepoints for _, seg_pos in segments)
+
     # ---- Series row (find-or-create) ----
     series = (
         session.query(Series).filter_by(series_name=series_name).one_or_none()
@@ -288,7 +432,7 @@ def _import_one_position(
             reporter_gene=acq.reporter_gene,
             comments=acq.comments,
             date_acquired=stem[:8] if stem[:8].isdigit() else "",
-            timepts=str(position_info.n_timepoints),
+            timepts=str(total_nt),
         )
         session.add(series)
     else:
@@ -296,8 +440,12 @@ def _import_one_position(
         series.annot_loc = str(image_loc)
         if series.acquisition_id is None:
             series.acquisition = acq
-        if not series.timepts or series.timepts == "0":
-            series.timepts = str(position_info.n_timepoints)
+        # Keep timepts in sync with what's being staged. A re-import that
+        # appends extra timepoints (e.g. a late _t<N> volume) raises the
+        # count, so the DB must track on-disk reality — not the stale value
+        # from the original series-create. This matches the acetree config /
+        # matlabParams end index, which are already driven by total_nt below.
+        series.timepts = str(total_nt)
     session.flush()
     outcome.series_id = series.id
 
@@ -311,54 +459,69 @@ def _import_one_position(
     run.started_at = datetime.now(tz=timezone.utc)
     session.flush()
 
-    def _path_fn(t: int, z: int, raw_ch: int) -> Path:
-        role = channel_map.get(raw_ch, "")
-        subdir = ensure_dir(image_loc / role_subdir(role, raw_ch))
-        t1 = t + 1
-        p1 = nz - z   # invert Z so deepest plane = p01 (AceTree convention)
-        return subdir / f"{series_name}-t{t1:03d}-p{p1:02d}.tif"
+    total_written = 0
+    total_skipped = 0
+    total_bytes = 0
+    offset = 0
+    for seg_lif_name, seg_pos in segments:
 
-    try:
-        extract_report = ex.extract_position(
-            series_name_in_lif,
-            position_info.name,
-            path_fn=_path_fn,
-            bit_depth_policy=bit_depth_policy,
-            compress=compress,
-            overwrite=overwrite,
-            on_progress=(
-                lambda done, total: on_progress(series_name, done, total)
+        def _path_fn(t: int, z: int, raw_ch: int, _offset: int = offset) -> Path:
+            role = channel_map.get(raw_ch, "")
+            subdir = ensure_dir(image_loc / role_subdir(role, raw_ch))
+            # 1-based timepoint, shifted by the running offset so appended
+            # segments continue the main movie (e.g. t241 after a 240-tp main).
+            t1 = _offset + t + 1
+            p1 = nz - z   # invert Z so deepest plane = p01 (AceTree convention)
+            return subdir / f"{series_name}-t{t1:03d}-p{p1:02d}.tif"
+
+        try:
+            extract_report = ex.extract_position(
+                seg_lif_name,
+                seg_pos.name,
+                path_fn=_path_fn,
+                bit_depth_policy=bit_depth_policy,
+                compress=compress,
+                overwrite=overwrite,
+                on_progress=(
+                    lambda done, total: on_progress(series_name, done, total)
+                )
+                if on_progress is not None
+                else None,
             )
-            if on_progress is not None
-            else None,
-        )
-    except Exception as exc:  # noqa: BLE001
-        run.status = RunStatus.FAILED
-        run.error_excerpt = repr(exc)[:1024]
-        outcome.failed_step = "stage_images"
-        outcome.error = repr(exc)
-        return outcome
+        except Exception as exc:  # noqa: BLE001
+            run.status = RunStatus.FAILED
+            run.error_excerpt = repr(exc)[:1024]
+            outcome.failed_step = "stage_images"
+            outcome.error = repr(exc)
+            return outcome
 
-    if extract_report.error is not None:
-        run.status = RunStatus.FAILED
-        run.error_excerpt = extract_report.error[:1024]
-        outcome.failed_step = "stage_images"
-        outcome.error = extract_report.error
-        return outcome
+        if extract_report.error is not None:
+            run.status = RunStatus.FAILED
+            run.error_excerpt = extract_report.error[:1024]
+            outcome.failed_step = "stage_images"
+            outcome.error = extract_report.error
+            return outcome
+        total_written += extract_report.planes_written
+        total_skipped += extract_report.planes_skipped
+        total_bytes += extract_report.bytes_written
+        offset += seg_pos.n_timepoints
+
     run.status = RunStatus.COMPLETE
     run.completed_at = datetime.now(tz=timezone.utc)
     run.output_summary = {
         "extracted_from": "lif",
-        "planes_written": extract_report.planes_written,
-        "planes_skipped": extract_report.planes_skipped,
-        "bytes_written": extract_report.bytes_written,
+        "segments": len(segments),
+        "appended_timepoints": total_nt - position_info.n_timepoints,
+        "planes_written": total_written,
+        "planes_skipped": total_skipped,
+        "bytes_written": total_bytes,
     }
     outcome.stage_outcome = StageOutcome(
         position=position_num,
         series_name=series_name,
         image_loc=image_loc,
-        written=extract_report.planes_written,
-        skipped=extract_report.planes_skipped,
+        written=total_written,
+        skipped=total_skipped,
         completed_at=datetime.now(tz=timezone.utc),
     )
     outcome.steps["stage_images"] = RunStatus.COMPLETE
@@ -423,7 +586,7 @@ def _import_one_position(
         run.started_at = datetime.now(tz=timezone.utc)
         try:
             cfg = step_write_acetree_config(
-                series, image_loc, position_info.n_timepoints, nz, voxel_xy, voxel_z
+                series, image_loc, total_nt, nz, voxel_xy, voxel_z
             )
             run.status = RunStatus.COMPLETE
             run.completed_at = datetime.now(tz=timezone.utc)
@@ -485,7 +648,7 @@ def _import_one_position(
                 opts.parameter_overrides,
                 voxel_xy,
                 voxel_z,
-                position_info.n_timepoints,
+                total_nt,
                 nz,
             )
             run.status = RunStatus.COMPLETE
@@ -500,8 +663,17 @@ def _import_one_position(
             return outcome
 
     # ---- Worker steps stay PENDING (unchanged contract with the worker) ----
+    # When a delay is requested, push `not_before` onto the worker steps so the
+    # background worker waits until off-hours before picking them up (mirrors
+    # orchestrate.import_acquisition). delay_hours == 0 leaves them immediately
+    # eligible.
+    not_before = None
+    if opts.delay_hours and opts.delay_hours > 0:
+        not_before = datetime.now(tz=timezone.utc) + timedelta(hours=opts.delay_hours)
     for ws in ("run_starrynite", "run_red_extract", "run_measure"):
-        _get_or_create_run(session, series.id, ws)
+        wrun = _get_or_create_run(session, series.id, ws)
+        if not_before is not None and wrun.status == RunStatus.PENDING:
+            wrun.not_before = not_before
 
     return outcome
 

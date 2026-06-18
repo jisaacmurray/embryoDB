@@ -22,6 +22,8 @@ the code; this is a map.
 | `embryodb/` | Python package |
 | `tests/` | pytest suite (66 tests, in-memory SQLite, <2 s) |
 | `README.md` | User-facing install + CLI cheatsheet + Postgres/Mac runbook |
+| `docs/portability.md` | What another lab would hit porting embryoDB to a different OS / directory layout / no-cluster environment (MCR v714, Java deps, hard-coded paths, POSIX permission model, …). Forward-looking, not a current work item. |
+| `docs/data_access.md` | Self-contained how-to for a **consumer** program (or AI agent) that needs to read embryoDB data without the full dev context: connect via `EMBRYODB_DB_URL`, query via CLI exports or the `queries/` Python API, the data model, and where on-disk `dats/` files live. |
 | `pyproject.toml` | Package metadata + dependencies (requires Python ≥ 3.11) |
 | **Sibling, not committed** | |
 | `../embryoDB_test_data/20250527_JIM783_efl-3_test/` | ~4.6 GB raw-image fixture: 7 positions × 67 planes × 2 channels. Position 1 has 100 real timepoints (copied from production), L2-L7 stay at 10. Used for end-to-end pipeline smoke tests. |
@@ -136,6 +138,62 @@ new files added). This is the v1 guarantee; v2 honours it via
   stage_metadata, write_acetree_config, write_embryodb_xml,
   create_alias_symlink, write_matlab_params, **run_starrynite,
   run_red_extract, run_measure**. Last three are PENDING stubs.
+- **Appending extra movies onto a time course.** The scope sometimes saves a
+  late extra volume as a SEPARATE LIF object (e.g. a 1-tp `..._t241` next to a
+  240-tp main series) rather than as timepoint 241 of the main acquisition.
+  `import_lif` appends such a movie's frames onto the END of each matching
+  position's time course — matched by position NAME, numbered with a running
+  offset so StarryNite/AceTree see one continuous movie. The combined
+  `total_nt` drives `Series.timepts`, the AceTree `<end index>`, and
+  matlabParams `end_time`.
+  - **Appendability is structural, not name-based** (`series_compatible_for_append`
+    in `lif/import_flow.py`): a candidate must share the main's per-volume
+    geometry (channel count, plane count, X/Y pixels) AND at least one position
+    name. Timepoint count is intentionally not compared. Don't trust the
+    `_t<N>` name — users aren't reliable about it; it's only used as the
+    *auto-check* heuristic (`extra_timepoint_siblings`).
+  - **Auto vs. explicit.** `auto_append_extra` (default on) auto-appends only
+    the confident `_t<N>` siblings. ANY other compatible movie
+    (`appendable_candidates`) must be named explicitly via `--append-series`
+    (CLI) or ticked in the GUI's compatible-movie checklist. Both paths are
+    compatibility-gated — incompatible names are warned about and skipped.
+    The GUI passes its full checklist selection as `append_series` with
+    `auto_append_extra=False` (it owns the selection). CLI opt-out of the auto
+    `_t<N>` behavior: `--no-auto-append`.
+  - Caveat: timestamps still come from the main position's `Properties.xml`,
+    so appended frames get no TIME row — fine, since only phenotyping reads
+    TIME csvs.
+  - **Re-import updates the count.** `_import_one_position` always sets
+    `series.timepts = str(total_nt)` for an existing series (not just when
+    blank), so re-importing a movie that gained a late `_t<N>` volume raises
+    the stored count (240 → 241). The AceTree config and matlabParams are
+    regenerated each import and carry the new count too. The legacy embryoDB
+    XML (`step_write_embryodb_xml`) deliberately never *overwrites* a new-series
+    file during staging, but every import/edit path now re-syncs the mirror
+    after its session commits (see "legacy XML mirror" below), so `<timepts>`
+    and other fields no longer go stale on a re-import. DB + pipeline configs
+    remain authoritative; the XML is a parallel record for the old Java/Perl
+    tools (Tree1/Measure).
+
+- **user vs. person guards** (`identity.py`, GUI-free core shared by CLI + GUI).
+  Two distinct identity fields, NOT interchangeable:
+  - **user** = the OS/login account that OWNS staged files; it picks the
+    `/murrlab3/<user>/images/<series>/` tree. Restricted to real accounts
+    (`system_users()` = login accounts with uid ≥ 1000 ∪ existing image-tree
+    owners), defaults to whoever runs embryoDB (`current_user()`). Picking a
+    different user is allowed but warned: files are still WRITTEN by the runner,
+    so they end up owned by the wrong uid → permission grief. GUI presents user
+    as a non-editable dropdown; CLI `--user` is checked by `_user_person_warnings`
+    and prompts unless `--yes`.
+  - **person** = free-form scientific attribution (e.g. `jmurr` pipelining a
+    movie `eli` collected records `person="eli"`). Not tied to the filesystem.
+    Guarded only against typos: a brand-new name (absent from
+    `known_persons()` = distinct `Acquisition.person` ∪ `Series.person`) gets an
+    "are you sure?" confirm before it's created. GUI presents person as an
+    editable combo of known names; CLI warns on a new person.
+  - The import_wizard previously conflated the two (the Person field doubled as
+    the directory owner) — they're now separate widgets. Don't reintroduce
+    `user = person or settings.user`.
 
 ## GUI layout — design goals (maintain across changes)
 
@@ -181,6 +239,13 @@ legacy XML through `embryodb.legacy_sync.sync_legacy_xml(name)`:
 - `DetailPanel._on_save` — single-series edits
 - `DetailPanel._on_toggle_delete` — soft-delete flag flips
 - `BulkEditMetadataDialog._on_apply` — bulk metadata edits
+- CLI `import-acquisition` / `import-lif` — `_sync_legacy_xml_after_import`
+  (`cli.py`) syncs every non-failed series after the import session block.
+  The GUI LIF dialog spawns the CLI detached, so it inherits this.
+- `ImportWizard.accept` — `sync_many(...)` after the inline-import session
+- `pipeline/subprocess_steps.py` — after the worker updates `series.timepts`
+  from the staged file count, it re-syncs that series so the re-import count
+  lands in the XML too.
 
 When porting a new save path, route it through `sync_legacy_xml(name)` /
 `sync_many(names)` after `session.commit()` so legacy tools see the same
@@ -198,6 +263,36 @@ from the DB directly (the Tree1/Measure ports) or has been replaced by a
 Python implementation. Search the codebase for `sync_legacy_xml` to find
 the call sites that need to be removed when the time comes.
 
+## CLI ↔ GUI parity
+
+Design rule (stated by jmurr 2026-06-10): **every GUI menu/panel action
+should have a CLI equivalent.** Both interfaces route through the same
+`queries` / pipeline / `external_tools` modules, so a CLI command and its
+GUI counterpart share one code path.
+
+Parity launchers added in this pass (all reuse the GUI's underlying
+functions):
+
+| CLI | GUI counterpart | Shared core |
+|---|---|---|
+| `embryodb pipeline rerun <series…\|-d DATASET> [--step] [--set k=v] [--run/--no-run]` | Re-run pipeline… dialog | `pipeline/rerun.py::requeue_series` (also used by `gui/rerun_dialog.py`) |
+| `embryodb extract <series…\|-d DATASET> --step/--all [--list-steps]` | Run extract steps… | `external_tools.run_extract` |
+| `embryodb print-trees <series…\|-d DATASET> [--min/max-expr …]` | Print trees… | `external_tools.run_print_trees` |
+| `embryodb jobs [--running]` | Background jobs… | `jobs.list_jobs` |
+| `embryodb launch-acetree <series>` | Launch AceTree button | `external.launch_acetree` |
+| `embryodb pipeline recover <series…\|-d DATASET> [--action auto\|truncate\|stub] [--min-prefix N] [--run/--no-run]` | _(automatic in worker; CLI is the manual escape hatch)_ | `pipeline/sn_recovery.py::recover_series` |
+| `embryodb pipeline stub <series…\|-d DATASET>` | _(automatic in worker; CLI is the manual escape hatch)_ | `pipeline/stub_annotation.py::write_stub_for_series` |
+
+`cli.py::_resolve_series_arg(series, dataset)` is the shared "names or
+`--dataset`" resolver for rerun/extract/print-trees.
+
+**Still GUI-only (deferred backlog, not yet ported):** single/bulk
+**metadata edit** (detail-panel Save / Bulk edit metadata…), **Mark for
+deletion** (sets `deleted_at`; only the *purge* side, `gc-deleted`, has a
+CLI), and the two interactive file editors (**Edit AceTree config**, **Edit
+AuxInfo**) — these open an in-GUI text editor, so a CLI equivalent would
+just print the path. Add these when convenient to complete parity.
+
 ## Gotchas
 
 - **PySide6 doesn't launch on the lab cluster.** Missing
@@ -214,6 +309,37 @@ the call sites that need to be removed when the time comes.
 - **`/murrlab3/<user>/images/<series>` is canonical**, with an alias at
   `/murrlab/<user>/images/<series>`. Some legacy code uses the alias.
   The pipeline creates the symlink automatically.
+- **StarryNite detection collapse → recovery.** When a movie is dim /
+  photobleaches / drifts out of frame, MATLAB detection finds ~0–3 "nuclei"
+  per timepoint where there should be hundreds; the C tracer can't lineage
+  that and wedges (no "End time"), so `run_starrynite` FAILs. On failure
+  `step_run_starrynite` runs `pipeline/sn_recovery.py::analyze_series_collapse`
+  (counts `tif/<series>_matlabnuclei/matlabnuclei<N>` line counts; a timepoint
+  is "low" only if it is below 25% of the running peak **and** ≤10 nuclei — more
+  than 10 nuclei is always treated as traceable; collapse = detection peaked ≥20
+  then ≥4 consecutive low timepoints) and, if recognized, **recovers
+  automatically** in the worker via `sn_recovery.py::auto_recover` (no menu item
+  / user step — the earlier "Recover StarryNite…" GUI action was removed). When
+  a long healthy prefix exists it re-runs `run_starrynite` truncated to
+  `end_time=K` (K ≥ 30 timepoints, the drift/late-bleach case): the failed run
+  is reset to PENDING and the worker re-claims it, so `step_run_starrynite` must
+  **not** finalize that run. Otherwise it writes a **stub annotation**
+  (`pipeline/stub_annotation.py`) and the run stays FAILED with a note (so
+  downstream steps don't run on a fake lineage) so the raw images still open in
+  AceTree. **Loop guard:** truncation compares K against the *current*
+  `matlabParams` `end_time` (`_current_end_time`), not the on-disk file count —
+  a prior truncate leaves stale `matlabnuclei` files whose low tail re-reads as a
+  collapse; guarding on `end_time` bounds recovery to a single truncate. Manual
+  escape hatches remain on the CLI (`embryodb pipeline recover`/`stub`). The
+  stub is built from the **real MATLAB detection** when it survives (one
+  `t<NNN>-nuclei` per timepoint from `matlabnuclei`/`matlabdiams`, unlineaged —
+  verified pass-through `x y z`→`x,y,z.0`, diam, `Nuc<i>`), so you can see where
+  the detected nuclei are before retuning params; it falls back to a single
+  placeholder nucleus (the legacy artifact format) only when no detection output
+  exists. **High-priority follow-up:** the
+  truncated retry currently re-runs MATLAB detection on 1..K (wasteful); a
+  tracer-only re-run on the already-computed nuclei would be cheaper, and the
+  real fix is a tracer that degrades gracefully (planned v3 rewrite).
 - **Test fixture filenames are prefixed `_test`** (e.g.
   `20250527_JIM783_efl-3_test_L1`) so smoke tests can't accidentally
   clobber real `20250527_JIM783_efl-3` series.

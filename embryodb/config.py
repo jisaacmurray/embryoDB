@@ -54,6 +54,16 @@ class Settings(BaseSettings):
         description="JVM max-heap argument forwarded to AceTree (-mx<value>).",
     )
 
+    # AceTree-Py (napari-based Python rewrite) — alternative viewer launched
+    # from the browser right-click menu. Runs in its OWN venv because it pulls
+    # heavy deps (napari, numba, tifffile) the embryoDB GUI environment lacks.
+    # Launched as `<acetree_py_python> -m acetree_py gui <config>`; the same
+    # AceTree XML config the legacy jar consumes.
+    acetree_py_python: Path = Field(
+        default=Path("/murrlab/gpfs/fs0/l/murr/new_tools/acetree_py/.venv/bin/python"),
+        description="Python interpreter of the acetree_py venv (created via pip install -e '.[gui]').",
+    )
+
     # Pipeline subprocess tools
     tools3_dir: Path = Field(
         default=Path("/gpfs/fs0/l/murr/tools3"),
@@ -66,6 +76,17 @@ class Settings(BaseSettings):
     worker_pidfile_dir: Path = Field(
         default=Path("/tmp"),
         description="Directory for the per-machine worker pidfile.",
+    )
+
+    # Remote client mode. Set by the off-network launcher (scripts/embryodb-remote)
+    # when the GUI runs on a Mac/laptop talking to the lab DB over an SSH tunnel.
+    # In this mode the GUI must NOT spawn a local worker: heavy pipeline steps
+    # (StarryNite/extract/measure/staging) need the lab's compiled MATLAB/Java
+    # stack and shared storage, so they run on a worker resident on penticton,
+    # which claims the same PENDING rows this client enqueues.
+    remote: bool = Field(
+        default=False,
+        description="Off-network client mode; suppresses local worker spawn (EMBRYODB_REMOTE=1).",
     )
 
 

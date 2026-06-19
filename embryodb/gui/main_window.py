@@ -478,7 +478,41 @@ class MainWindow(QtWidgets.QMainWindow):
         act_trees = menu.addAction(f"Print trees…{n_suffix}")
         act_trees.triggered.connect(self._on_print_trees)
 
+        menu.addSeparator()
+
+        # AceTree-Py (napari rewrite) — single-series only; the legacy Java
+        # launcher stays on the detail panel. No extra toolbar buttons.
+        act_acetree_py = menu.addAction("Open in AceTree (Python)")
+        act_acetree_py.setEnabled(n == 1)
+        if n == 1:
+            act_acetree_py.triggered.connect(self._on_launch_acetree_py)
+
         menu.exec(self._table.viewport().mapToGlobal(pos))
+
+    def _on_launch_acetree_py(self) -> None:
+        names = self._selected_series_names()
+        if len(names) != 1:
+            return
+        from .. import external
+        from ..queries import series as q_series
+
+        with self._session_cm() as session:
+            row = q_series.get_by_name(session, names[0])
+            if row is None:
+                QtWidgets.QMessageBox.warning(
+                    self, "AceTree-Py", f"Series {names[0]!r} not found."
+                )
+                return
+            try:
+                proc = external.launch_acetree_py(row)
+            except external.LaunchError as exc:
+                QtWidgets.QMessageBox.warning(
+                    self, "AceTree-Py launch failed", str(exc)
+                )
+                return
+        self.statusBar().showMessage(
+            f"AceTree-Py launched for {names[0]} (pid {proc.pid}).", 5000
+        )
 
     def _on_select_same_acquisition(self) -> None:
         """Expand the current selection to include every series sharing an

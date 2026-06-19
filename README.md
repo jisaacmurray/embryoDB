@@ -11,6 +11,20 @@ for the broader roadmap (v1.5 through v4).
 
 ---
 
+## Documentation
+
+- **[docs/overview.md](docs/overview.md)** — quick map of the analysis tiers
+  (import → lineaging → AceTree curation → phenotyping) and the main GUI/CLI
+  option at each. Start here if you just want to know "what do I run?".
+- [docs/troubleshooting.md](docs/troubleshooting.md) — X11/XQuartz rendering
+  fixes, the AceTree-Py VNC path, DB connection issues, pipeline failures.
+- [docs/data_access.md](docs/data_access.md) — read surface for separate
+  consumer programs.
+- [docs/portability.md](docs/portability.md) — what a port to another lab's
+  environment would need.
+
+---
+
 ## Install
 
 End-to-end walkthrough for a fresh machine. Read top to bottom; nothing is
@@ -311,43 +325,30 @@ roles unless you want per-user access controls.
 
 ---
 
-## Mac (or off-network Linux) client via SSH tunnel
+## Mac (or off-network Linux) client — one command
 
-The native GUI runs on macOS without X11 forwarding. The lab Postgres is
-reached through an SSH tunnel.
-
-**One-time Mac setup:**
+The native GUI runs on macOS without X11 forwarding. The lab Postgres is reached
+through an SSH tunnel, and a single launcher opens it for you:
 
 ```bash
-brew install python@3.12 git
-git clone https://github.com/jisaacmurray/embryoDB.git ~/embryoDB
-pip install --user -e ~/embryoDB
-pip install --user pyside6 qtpy        # PySide6 wheel ships its own Qt; no system libs needed
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-
-# Optional — image data access for AceTree (skip if you're just browsing):
-#   brew install macfuse sshfs
-#   sshfs jmurr@server.lab:/murrlab3 ~/murrlab3 -o reconnect,defer_permissions
+embryodb-remote
 ```
 
-**Each session:**
+It opens (or reuses) a **nested bastion→penticton** tunnel to Postgres, reads
+the DB password from a chmod-600 file, and launches `embryodb-gui` locally
+(native speed). In this mode heavy pipeline jobs run on a penticton-resident
+worker, not the Mac. Image/AceTree access assumes lab paths resolve locally via
+your filesystem mount + root symlinks (`/murrlab3` etc.), so no path remapping is
+needed.
 
-```bash
-# Terminal 1 — open the SSH tunnel and leave it running:
-ssh -N -L 5432:dbhost.lab.local:5432 jmurr@gateway.lab.edu
+**Full setup (mount + root symlinks, the DB-URL file, `remote.conf`, the
+bastion/nested-forward details) lives in [`docs/remote_access.md`](docs/remote_access.md).**
 
-# Terminal 2 — point embryoDB at the tunnel and launch:
-export EMBRYODB_DB_URL='postgresql+psycopg://embryodb:PICK_A_PASSWORD@127.0.0.1:5432/embryodb'
-embryodb-gui
-```
+> The note that the firewall blocks `ssh -J` (ProxyJump) and the use of nested
+> local forwards is the key gotcha — see that doc.
 
-The GUI thinks it's talking to a local Postgres on port 5432; SSH forwards
-the bytes to the lab. UI rendering stays on the Mac, so latency only affects
-SQL round-trips (negligible).
-
-A future milestone (v2.5) adds a FastAPI tier so the Mac can connect
-over HTTPS without an SSH tunnel.
+A FastAPI/HTTPS tier (connect with no SSH tunnel) remains a deferred option; the
+tunnel + launcher covers the single-user Mac case with no lab-side server.
 
 ---
 
@@ -363,6 +364,7 @@ All settings come from env vars (prefix `EMBRYODB_`) or a `.env` file:
 | `EMBRYODB_USER` | `$USER` if set, else `anonymous` | Recorded in `imported_by` / `updated_by` columns |
 | `EMBRYODB_TOOLS3_DIR` | `/gpfs/fs0/l/murr/tools3` | Location of `matlab_SN_cluster.pl` + `acebatch3.jar` for the pipeline worker |
 | `EMBRYODB_WORKER_PIDFILE_DIR` | `/tmp` | Where the worker writes its per-host pidfile |
+| `EMBRYODB_REMOTE` | `0` | Off-network client mode (set by `scripts/embryodb-remote`); suppresses local worker spawn so heavy jobs run on penticton. See [`docs/remote_access.md`](docs/remote_access.md) |
 | `QT_API` | (auto) | Force a specific Qt binding: `pyqt5` / `pyqt6` / `pyside6` |
 
 For quick local dev without PostgreSQL:
@@ -382,6 +384,7 @@ SQLite is **only safe for one user at a time**. See Multi-user notes below.
 | `embryodb-gui` | Launch the GUI |
 | `embryodb-open` | First-time bootstrap (init + import-xml + import-lists + seed-protocols) + open GUI; idempotent |
 | `embryodb-worker` | Run the background pipeline worker (usually spawned by the import wizard) |
+| `embryodb-remote` | From an off-network Mac: open the SSH tunnel + launch the GUI in remote mode ([`docs/remote_access.md`](docs/remote_access.md)) |
 | `embryodb init-db` | Create the schema only |
 | `embryodb import-xml [dir]` | Bulk-import XMLs from source-dir (read-only) |
 | `embryodb export-xml [series\|all]` | Write back to export-dir |

@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+#
+# embryodb-remote — one-command launch of the embryoDB GUI from an off-network
+# Mac/laptop. Opens (or reuses) an SSH tunnel to the lab Postgres, points the
+# GUI at it, marks the process as a remote client, and launches embryodb-gui.
+#
+# Why a tunnel and not FastAPI: the GUI runs LOCALLY either way, so both give
+# native speed/rendering. The tunnel needs no lab-side server, just SSH — and
+# this script opens it invisibly so there is no manual terminal work.
+#
+# Assumptions (see docs/remote_access.md):
+#   * The lab shared filesystem is mounted locally and reachable at the SAME
+#     absolute paths the DB stores (root symlinks /murrlab /murrlab2 /murrlab3
+#     /gpfs → your mount). Then AceTree opens /murrlab3/... unchanged; no path
+#     remapping is needed.
+#   * The firewall blocks SSH ProxyJump (-J → "administratively prohibited"),
+#     so we reach penticton through the bastion using NESTED local forwards.
+#
+# Config: ~/.config/embryodb/remote.conf  (sourced bash; see the sample this
+# script writes on first run). The DB password lives ONLY in a chmod-600 file
+# and is never printed.
+
+set -euo pipefail
+
+CONF="${EMBRYODB_REMOTE_CONF:-$HOME/.config/embryodb/remote.conf}"
+
+die() { echo "embryodb-remote: $*" >&2; exit 1; }
+info() { echo "embryodb-remote: $*" >&2; }
+
+# ---------------------------------------------------------------------------
+# First-run scaffolding
+# ---------------------------------------------------------------------------
+if [[ ! -f "$CONF" ]]; then
+    mkdir -p "$(dirname "$CONF")"
+    cat >"$CONF" <<'SAMPLE'
+# embryodb-remote config — fill in for your lab, then re-run `embryodb-remote`.
+
+# Bastion (firewall) host you SSH into first. user@host.
+EMBRYODB_REMOTE_BASTION="user@gen-murra-006.med.upenn.edu"
+
+# Database host reached FROM the bastion (penticton). user@host.
+EMBRYODB_REMOTE_DBHOST="user@gen-murra-004.med.upenn.edu"
+
+# Postgres port (local + remote end of the forward).
+EMBRYODB_REMOTE_PGPORT=5432
+
+# File holding the full EMBRYODB_DB_URL (one line). Keep it chmod 600.
+# e.g. postgresql+psycopg://embryodb:PASSWORD@127.0.0.1:5432/embryodb
+EMBRYODB_REMOTE_DBURL_FILE="$HOME/.config/embryodb/db_url"
+
+# Space-separated paths that MUST resolve locally (your mount root symlinks)
+# so AceTree / file editors find images. Warned about if missing. Empty = skip.
+EMBRYODB_REMOTE_CHECK_PATHS="/murrlab3 /murrlab /gpfs"
+
+# Set to 1 to ensure a worker is running on penticton (so heavy jobs you
+# enqueue from here get serviced lab-side). Default 0 (assume one already runs).
+EMBRYODB_REMOTE_ENSURE_WORKER=0
+SAMPLE
+    info "wrote a sample config to $CONF"
+    info "edit it (hosts + DB-URL file), then run embryodb-remote again."
+    exit 1
+fi
+
+# shellcheck source=/dev/null
+source "$CONF"
+
+: "${EMBRYODB_REMOTE_BASTION:?set EMBRYODB_REMOTE_BASTION in $CONF}"
+: "${EMBRYODB_REMOTE_DBHOST:?set EMBRYODB_REMOTE_DBHOST in $CONF}"
+: "${EMBRYODB_REMOTE_PGPORT:=5432}"
+: "${EMBRYODB_REMOTE_DBURL_FILE:?set EMBRYODB_REMOTE_DBURL_FILE in $CONF}"
+: "${EMBRYODB_REMOTE_CHECK_PATHS:=}"
+: "${EMBRYODB_REMOTE_ENSURE_WORKER:=0}"
+
+PORT="$EMBRYODB_REMOTE_PGPORT"
+CTL="$HOME/.ssh/embryodb-remote-%C.sock"   # %C = hash(local host,user,bastion)
+
+# ---------------------------------------------------------------------------
+# Secret DB URL (never echoed)
+# ---------------------------------------------------------------------------
+[[ -f "$EMBRYODB_REMOTE_DBURL_FILE" ]] \
+    || die "DB-URL file not found: $EMBRYODB_REMOTE_DBURL_FILE (see $CONF)"
+perms=$(stat -f '%Lp' "$EMBRYODB_REMOTE_DBURL_FILE" 2>/dev/null \
+        || stat -c '%a' "$EMBRYODB_REMOTE_DBURL_FILE" 2>/dev/null || echo "")
+if [[ -n "$perms" && "$perms" != "600" ]]; then
+    info "warning: $EMBRYODB_REMOTE_DBURL_FILE is mode $perms; recommend 600 (chmod 600 it)."
+fi
+EMBRYODB_DB_URL="$(head -n1 "$EMBRYODB_REMOTE_DBURL_FILE")"
+[[ -n "$EMBRYODB_DB_URL" ]] || die "DB-URL file is empty: $EMBRYODB_REMOTE_DBURL_FILE"
+export EMBRYODB_DB_URL
+
+# ---------------------------------------------------------------------------
+# Tunnel: nested bastion → penticton, multiplexed (idempotent via ControlMaster)
+# ---------------------------------------------------------------------------
+master_alive() {
+    ssh -S "$CTL" -O check "$EMBRYODB_REMOTE_BASTION" >/dev/null 2>&1
+}
+
+if master_alive; then
+    info "reusing existing tunnel."
+else
+    info "opening tunnel ${EMBRYODB_REMOTE_BASTION} → ${EMBRYODB_REMOTE_DBHOST} (port $PORT)…"
+    # Outer ssh forwards local:PORT → bastion:localhost:PORT and stays alive
+    # because its remote command (inner ssh -N) keeps running; inner ssh
+    # forwards bastion:localhost:PORT → penticton:localhost:PORT.
+    ssh -f -M -S "$CTL" \
+        -o ControlPersist=yes \
+        -o ExitOnForwardFailure=yes \
+        -o ServerAliveInterval=30 \
+        -L "${PORT}:localhost:${PORT}" \
+        "$EMBRYODB_REMOTE_BASTION" \
+        "ssh -N -o ServerAliveInterval=30 -L ${PORT}:localhost:${PORT} ${EMBRYODB_REMOTE_DBHOST}" \
+        || die "failed to open SSH tunnel."
+    master_alive || die "tunnel did not come up (check $CONF hosts / your SSH keys)."
+fi
+
+# We intentionally leave the tunnel up after the GUI exits (ControlPersist) so
+# the next launch is instant. Tear it down manually with:
+#   ssh -S "$CTL" -O exit "$EMBRYODB_REMOTE_BASTION"
+
+# ---------------------------------------------------------------------------
+# Sanity: do the lab paths resolve locally? (AceTree needs them.)
+# ---------------------------------------------------------------------------
+for p in $EMBRYODB_REMOTE_CHECK_PATHS; do
+    [[ -e "$p" ]] || info "warning: $p does not resolve locally — AceTree/image access will fail until your mount + root symlinks are set up (see docs/remote_access.md)."
+done
+
+# ---------------------------------------------------------------------------
+# Optional: ensure a worker is alive on penticton for enqueued heavy jobs
+# ---------------------------------------------------------------------------
+if [[ "$EMBRYODB_REMOTE_ENSURE_WORKER" == "1" ]]; then
+    info "ensuring a worker on ${EMBRYODB_REMOTE_DBHOST}…"
+    ssh -S "$CTL" "$EMBRYODB_REMOTE_BASTION" \
+        "ssh ${EMBRYODB_REMOTE_DBHOST} 'embryodb-worker >/dev/null 2>&1 &'" \
+        || info "warning: could not start a penticton worker (heavy jobs may stay PENDING)."
+fi
+
+# ---------------------------------------------------------------------------
+# Launch the GUI locally, flagged as a remote client (no local worker spawn).
+# ---------------------------------------------------------------------------
+export EMBRYODB_REMOTE=1
+info "launching embryodb-gui (remote mode; heavy jobs run on penticton)…"
+exec embryodb-gui

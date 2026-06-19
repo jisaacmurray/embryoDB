@@ -97,6 +97,58 @@ If that combination still leaves you with black-fill bugs, please
 report the OS versions involved (macOS, XQuartz, Linux distro) so we
 can extend this doc.
 
+## AceTree-Py (napari) window is blank white / crashes XQuartz — use VNC
+
+Symptoms (specific to **AceTree-Py**, the napari rewrite — *not* the Java
+AceTree or `embryodb-gui`):
+- The window opens but is plain **white** (not black), never drawing the image.
+- Closing it crashes XQuartz (`The X11 connection broke`, SIGSEGV).
+- The terminal log shows `OpenGL version 2.1 or higher recommended, got 1.4`
+  followed by `Shader compilation error in GL_VERTEX_SHADER`.
+
+Cause: napari/vispy needs **OpenGL ≥ 2.1** shaders. Forwarded X11 (XQuartz)
+only negotiates indirect GLX **1.4**, so the canvas never renders. **None of
+the X11 fixes above help** — this isn't a 2D drawing bug, the GL context
+itself is too old. (The Java AceTree and `embryodb-gui` are fine over X11
+because they don't need modern OpenGL.)
+
+Fix: render inside a server-side VNC display, so OpenGL runs on the server
+(software Mesa / llvmpipe, GL 3.3) and only pixels travel to your Mac. The
+`acetree-py-vnc` launcher in the acetree_py repo does this end-to-end.
+
+**One-time, server (root):** `sudo apt install -y tigervnc-standalone-server`
+**One-time, per user:** `vncpasswd`   (sets `~/.vnc/passwd`)
+
+**Each session, on the server:**
+
+```bash
+acetree-py-vnc /path/to/<series>.xml
+```
+
+It starts a private VNC display, launches AceTree-Py into it, and prints the
+exact SSH-tunnel command + `vnc://localhost:<port>` line. On the Mac: open the
+tunnel, then Finder → Cmd-K → `vnc://localhost:<port>` (built-in viewer, no
+install) and enter your `vncpasswd` password.
+
+**Through a firewall/bastion:** if you reach the server via a jump host and
+`-J` fails with `administratively prohibited`, the bastion blocks ProxyJump
+forwarding. Use **nested local forwards** instead (each hop forwards only to
+its own localhost). Set these once (e.g. in `~/.bashrc` on the server) and the
+launcher prints the correct nested command for you every run:
+
+```bash
+export ACETREE_PY_SSH_JUMP=user@bastion.fqdn      # the firewall host
+export ACETREE_PY_HOSTNAME=server.fqdn            # this server's resolvable name
+```
+
+The printed nested form looks like:
+
+```bash
+ssh -L 5911:localhost:5911 -t user@bastion.fqdn "ssh -L 5911:localhost:5911 user@server.fqdn"
+```
+
+Quit the napari window (or Ctrl-C the launcher) when done to free the display.
+
 ## Database connection issues
 
 Symptoms:

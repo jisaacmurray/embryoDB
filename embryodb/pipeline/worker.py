@@ -107,7 +107,14 @@ def worker_is_running() -> bool:
 
 
 def spawn_worker() -> subprocess.Popen | None:
-    """Fork a detached worker process. Returns None if one is already alive."""
+    """Fork a detached worker process. Returns None if one is already alive.
+
+    In remote-client mode (settings.remote) this is a no-op: an off-network
+    Mac/laptop must not run the heavy pipeline locally. Work it enqueues is
+    serviced by a worker resident on penticton claiming the same PENDING rows.
+    """
+    if settings.remote:
+        return None
     if worker_is_running():
         return None
     return subprocess.Popen(

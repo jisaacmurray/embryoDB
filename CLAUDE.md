@@ -51,7 +51,8 @@ the code; this is a map.
 | **v2.7 — Acquisition settings + depth compensation** | done | Parser now extracts per-active-channel laser line + AOTF intensity + detector gain/dye/band, depth-compensation curves (projected per channel), and scalar scope settings (bit depth, pixel dwell, zoom, scan geometry, programmed timing, instrument serial). Stored as JSON on `MicroscopyMetadata` (`channels`, `depth_compensation`, `acquisition_settings`). Right-click → **Microscopy details…** opens a per-series dialog with the high-value table (channels + depth-comp curve). |
 | **v2.7.1 — Multi-host worker claim** | done | `_claim_next` in `pipeline/worker.py` atomically transitions PENDING→RUNNING via a guarded `UPDATE … WHERE id=? AND status='pending'` + `rowcount` check (portable across SQLite/Postgres; no `FOR UPDATE SKIP LOCKED` needed). Race losers re-evaluate and pick the next candidate. New `claimed_by` column on `PipelineStepRun` (observability; additive migration). Safe for two machines running workers against one DB. |
 | v2.8 — LineagePhenotyping bridge | **done** | Phase 1 (Python dataset freeze: CLI + GUI) + Phase 2 (GetACD stopgap, `external_tools.run_getacd`) + Phase 3 (R `build_inputs.R` port) all done; Phase 3 byte-validated against `die-1/` and `ceh-32_mutant/` Perl outputs. See "LineagePhenotyping bridge" section below. |
-| **v3 — Reimplement remaining Java/Perl tools** | pending | The bigger remaining chunk. See "Legacy tools currently called" below + the v3 ordering note. |
+| **v2.9 — One-command remote GUI** | done | `scripts/embryodb-remote` opens (or reuses) a nested bastion→penticton SSH tunnel to Postgres via `ControlMaster`, sources the secret `EMBRYODB_DB_URL` from a chmod-600 file, and launches `embryodb-gui` flagged `EMBRYODB_REMOTE=1`. In remote mode `spawn_worker()` is a no-op so heavy jobs run on a penticton-resident worker (the GUI just enqueues PENDING rows). Assumes lab paths resolve locally via mount + root symlinks (`/murrlab3` etc.), so AceTree needs no path remap. Full recipe: `docs/remote_access.md`. (FastAPI tier still deferred — tunnel suffices for single-user Mac.) |
+| **v3 — Reimplement remaining Java/Perl tools** | pending | The bigger remaining chunk. See "Legacy tools currently called" below + the v3 ordering note. **StarryNite track** is planned separately and **license-gated** — see `docs/starrynite_modernization.md` (adopt 2025 all-MATLAB upstream + retrain on the curated corpus; needs MATLAB + Image Processing + Statistics/ML, plus Compiler for the free-MCR cluster build). Reference checkout at `../StarryNite/`. |
 | v4 — acetree_py / archive lifecycle / image tiles | pending | |
 
 ## Quickstart
@@ -280,6 +281,7 @@ functions):
 | `embryodb print-trees <series…\|-d DATASET> [--min/max-expr …]` | Print trees… | `external_tools.run_print_trees` |
 | `embryodb jobs [--running]` | Background jobs… | `jobs.list_jobs` |
 | `embryodb launch-acetree <series>` | Launch AceTree button | `external.launch_acetree` |
+| `embryodb launch-acetree-py <series>` | Browser right-click → **Open in AceTree (Python)** | `external.launch_acetree_py` |
 | `embryodb pipeline recover <series…\|-d DATASET> [--action auto\|truncate\|stub] [--min-prefix N] [--run/--no-run]` | _(automatic in worker; CLI is the manual escape hatch)_ | `pipeline/sn_recovery.py::recover_series` |
 | `embryodb pipeline stub <series…\|-d DATASET>` | _(automatic in worker; CLI is the manual escape hatch)_ | `pipeline/stub_annotation.py::write_stub_for_series` |
 
@@ -300,7 +302,16 @@ just print the path. Add these when convenient to complete parity.
   the GUI binding-agnostic.
 - **Legacy AceTree is hardcoded to 2 channels** (`tif/` + `tifR/`).
   Multichannel acquisitions stage extras to `tifC<n>/` for future viewers
-  but legacy AceTree ignores them.
+  but legacy AceTree ignores them. The current jar (`AceTree_Santella.jar`)
+  *does* take 3 channels via `<image numChannels="3" channel1/2/3=...>` (no
+  `file=` attr), but channel→color is hard-coded GREEN/RED/BLUE — the 3rd
+  (DIC) lands as blue. **AceTree-Py** (the napari rewrite at
+  `../acetree_py`) reads the same config and is the path to grayscale/extra
+  channels; launch it from the browser right-click → **Open in AceTree
+  (Python)** (`external.launch_acetree_py`, CLI twin `launch-acetree-py`).
+  It runs in its OWN venv (`acetree_py/.venv`, `settings.acetree_py_python`,
+  env `EMBRYODB_ACETREE_PY_PYTHON`) because it pulls napari/numba; the
+  launcher raises a helpful `LaunchError` if that venv isn't built yet.
 - **Source-dir is the writer of record for the legacy Java GUI.**
   v2's `write_embryodb_xml` lands new acquisitions there so both systems
   see them. It explicitly refuses to overwrite existing files. Edits to

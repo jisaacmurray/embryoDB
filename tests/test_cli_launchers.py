@@ -255,6 +255,12 @@ def test_cli_launch_acetree_unknown_series(fresh_db):
     assert "no such series" in res.output
 
 
+def test_cli_launch_acetree_py_unknown_series(fresh_db):
+    res = runner.invoke(cli.app, ["launch-acetree-py", "nope_L1"])
+    assert res.exit_code == 1
+    assert "no such series" in res.output
+
+
 def test_cli_jobs_empty(fresh_db):
     res = runner.invoke(cli.app, ["jobs"])
     assert res.exit_code == 0

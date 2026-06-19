@@ -2296,6 +2296,29 @@ def launch_acetree_cmd(
     console.print(f"[green]launched[/green] AceTree for {series} (pid {proc.pid})")
 
 
+@app.command("launch-acetree-py")
+def launch_acetree_py_cmd(
+    series: Annotated[str, typer.Argument(help="Series name to open in AceTree-Py")],
+) -> None:
+    """Open a series in AceTree-Py, the napari rewrite (CLI twin of the
+    browser right-click "Open in AceTree (Python)" action). Reads the same
+    AceTree XML config as the legacy jar. Detached fire-and-forget.
+    """
+    from .external import LaunchError, launch_acetree_py
+
+    with database.session_scope() as session:
+        row = q_series.get_by_name(session, series)
+        if row is None:
+            console.print(f"[red]no such series:[/red] {series!r}")
+            raise typer.Exit(1)
+        try:
+            proc = launch_acetree_py(row)
+        except LaunchError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+    console.print(f"[green]launched[/green] AceTree-Py for {series} (pid {proc.pid})")
+
+
 # --- phenotyping (LineagePhenotyping bridge) --------------------------------
 
 

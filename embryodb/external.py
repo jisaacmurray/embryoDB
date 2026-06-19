@@ -61,3 +61,35 @@ def launch_acetree(row: Series, jar: Path | None = None) -> subprocess.Popen:
         stderr=subprocess.DEVNULL,
         start_new_session=True,  # don't kill child if GUI exits
     )
+
+
+def launch_acetree_py(row: Series, python: Path | None = None) -> subprocess.Popen:
+    """Spawn the napari-based AceTree-Py viewer against this series' config.
+
+    Same AceTree XML config the legacy jar consumes, opened in the Python
+    rewrite (`<acetree_py>/.venv/bin/python -m acetree_py gui <config>`).
+    Detached fire-and-forget, like `launch_acetree`.
+
+    Raises LaunchError if the config file or the acetree_py venv interpreter
+    are missing.
+    """
+    config_path = acetree_config_path(row)
+    if not config_path.exists():
+        raise LaunchError(f"AceTree config not found: {config_path}")
+    py = Path(python or settings.acetree_py_python)
+    if not py.exists():
+        raise LaunchError(
+            f"acetree_py interpreter not found: {py}\n"
+            "Create its venv first, e.g.:\n"
+            "  cd /murrlab/gpfs/fs0/l/murr/new_tools/acetree_py\n"
+            "  python3.12 -m venv .venv && . .venv/bin/activate\n"
+            "  pip install -e '.[gui]' PyQt5 imagecodecs"
+        )
+    cmd = [str(py), "-m", "acetree_py", "gui", str(config_path)]
+    return subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )

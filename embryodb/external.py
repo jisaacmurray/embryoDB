@@ -86,10 +86,17 @@ def launch_acetree_py(row: Series, python: Path | None = None) -> subprocess.Pop
             "  pip install -e '.[gui]' PyQt5 imagecodecs"
         )
     cmd = [str(py), "-m", "acetree_py", "gui", str(config_path)]
+    # acetree_py's venv ships PyQt5; the embryoDB GUI uses PySide6 and
+    # leaks QT_API=pyside6 in os.environ via qtpy. Force the child binding
+    # so qtpy in the acetree_py venv picks the binding that is installed.
+    import os
+    child_env = dict(os.environ)
+    child_env["QT_API"] = "pyqt5"
     return subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
+        env=child_env,
     )

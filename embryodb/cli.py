@@ -2274,6 +2274,57 @@ def jobs_cmd(
     console.print(table)
 
 
+@app.command("fix-permissions")
+def fix_permissions_cmd(
+    series: Annotated[
+        list[str] | None,
+        typer.Argument(help="Series names (omit when using --dataset)"),
+    ] = None,
+    dataset: Annotated[
+        str | None,
+        typer.Option("--dataset", "-d", help="Run on every series in this dataset"),
+    ] = None,
+    dats_only: Annotated[
+        bool,
+        typer.Option(
+            "--dats-only",
+            help="Only normalize each series' dats/ (curation + extract outputs); "
+            "skip the raw image tree.",
+        ),
+    ] = False,
+) -> None:
+    """Re-apply the lab file-permission policy (group `users`, 0664 files /
+    02775 setgid dirs) to a series' on-disk files (CLI twin of the GUI
+    "Fix permissions" button).
+
+    Run after curation edits or legacy tools that bypass embryoDB's safe-write
+    — especially AceTree edits made over sshfs — so the next lab member can
+    modify and re-save the series.
+    """
+    from . import permissions
+    from .fsutil import DEFAULT_GROUP
+
+    names = _resolve_series_arg(series, dataset)
+    total_d = total_f = 0
+    missing: list[str] = []
+    with database.session_scope() as session:
+        for nm in names:
+            rep = permissions.normalize_series(session, nm, dats_only=dats_only)
+            if rep.missing:
+                missing.append(nm)
+                continue
+            total_d += rep.n_dirs
+            total_f += rep.n_files
+    if missing:
+        console.print(f"[yellow]not found:[/yellow] {', '.join(missing)}")
+    scope = "dats/ only" if dats_only else "full series tree"
+    console.print(
+        f"[green]normalized[/green] {len(names) - len(missing)} series "
+        f"({scope}) — {total_f} files, {total_d} dirs → group {DEFAULT_GROUP}, "
+        f"0664/02775"
+    )
+
+
 @app.command("launch-acetree")
 def launch_acetree_cmd(
     series: Annotated[str, typer.Argument(help="Series name to open in AceTree")],

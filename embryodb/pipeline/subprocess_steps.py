@@ -303,6 +303,22 @@ def _finish_run(
             run.error_excerpt = excerpt
 
 
+def _normalize_dats_perms(series_name: str) -> None:
+    """After a legacy jar writes into `dats/`, bring those files back to the
+    project's group + mode policy (the jar writes with its own umask/group, so
+    the next lab member couldn't otherwise re-save). Never lets a perms fixup
+    break the worker — failures are swallowed (mode bits are recoverable via
+    `embryodb fix-permissions`).
+    """
+    try:
+        from .. import permissions
+
+        with session_scope() as s:
+            permissions.normalize_series(s, series_name, dats_only=True)
+    except Exception:
+        pass
+
+
 def _skip_run(run_id: int, reason: str) -> None:
     """Mark a run as SKIPPED (e.g. no reporter channel)."""
     with session_scope() as s:
@@ -492,6 +508,8 @@ def step_run_red_extract(
         returncode = _run_with_heartbeat(cmd, log_path, run_id)
 
     _finish_run(run_id, log_path, returncode)
+    if returncode == 0:
+        _normalize_dats_perms(series_name)
 
 
 def step_run_measure(
@@ -534,6 +552,8 @@ def step_run_measure(
         returncode = _run_with_heartbeat(cmd, log_path, run_id)
 
     _finish_run(run_id, log_path, returncode)
+    if returncode == 0:
+        _normalize_dats_perms(series_name)
 
 
 def step_stage_images(series_id: int, run_id: int) -> None:

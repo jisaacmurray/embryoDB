@@ -295,6 +295,61 @@ CLI), and the two interactive file editors (**Edit AceTree config**, **Edit
 AuxInfo**) — these open an in-GUI text editor, so a CLI equivalent would
 just print the path. Add these when convenient to complete parity.
 
+## File permission policy
+
+**Goal: curation of a series passes from one lab member to another, so any
+`users`-group member must be able to modify and re-save a series' files.** The
+policy that guarantees this:
+
+| What | Value | Why |
+|---|---|---|
+| Group | `users` (gid 100 — currently jmurr, jrumley, azach) | shared access for the whole lab |
+| Files | `0664` — **group-writable, not world-writable** | any `users` member can re-save; outsiders can't |
+| Dirs | `0775` | same, plus traversal |
+| umask | `0002` during writes | keeps the group bits from being stripped |
+
+This is implemented in `embryodb/fsutil.py` (`safe_write_bytes` /
+`safe_write_text` / `safe_copy` / `ensure_dir`, all via `_scoped_umask` +
+`chmod_if_possible` + `chgrp_if_possible`). **Every write the Python layer makes
+routes through it** — staged TIFs, AceTree XML, matlabParams, legacy XML,
+symlinks. Overridable per-deployment via `EMBRYODB_FILE_GROUP` /
+`EMBRYODB_FILE_MODE` / `EMBRYODB_DIR_MODE`. Group-write (not world-write) is the
+deliberate choice: it gives the handoff without making files writable by every
+account on the host.
+
+**The gap — writes that DON'T go through `safe_write`:**
+
+- **Java AceTree curation edits** (e.g. the `<series>-edit.zip` AceTree saves),
+  especially **over sshfs from a remote Mac**. These land as the *editor's
+  personal* user:group (e.g. `jmurr:jmurr`) and, per the Mac's umask over
+  sshfs, often `0666` (world-writable). They satisfy "another user can re-save"
+  only via the world-write bit — which is fragile: if anything later tightens
+  them to `0664` *without* also `chgrp users`, the personal group locks the
+  next curator out. (Confirmed on `20260528_ceh-27_JIM593_L4/dats/*.zip`,
+  2026-06-23.)
+- **Legacy Java/Perl extract tools** (`acebatch3.jar`, `GetACD.pl`, …) — they
+  write with whatever umask/group the spawning shell had.
+- **Any manual edit** over the mount or on the lab host.
+
+**Two structural reasons the group isn't auto-inherited:** the per-series
+`dats/` dirs have **no setgid bit** (so a new file takes the creator's primary
+group, not the dir's `users`), and sshfs writes carry the *remote* machine's
+umask. A setgid on the tree would fix the group-inheritance half; it wouldn't
+fix the world-writable mode from a permissive remote umask.
+
+**To normalize a series after external editing** (bring AceTree/handoff files
+back to policy so the next curator inherits clean perms):
+
+```bash
+chgrp -R users <annot_loc>             # e.g. /murrlab3/azach/images/<series>
+find <annot_loc> -type f -exec chmod 0664 {} +
+find <annot_loc> -type d -exec chmod 2775 {} +   # 2 = setgid, so future writes inherit `users`
+```
+
+There is **no `embryodb fix-permissions` CLI yet** — a natural addition that
+would wrap exactly this over `fsutil` for a series or dataset (parity with the
+GUI). Propose it when the external-edit handoff becomes routine.
+
 ## Gotchas
 
 - **PySide6 doesn't launch on the lab cluster.** Missing

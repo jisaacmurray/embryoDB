@@ -1,9 +1,18 @@
 """Filesystem helpers with the project's permission discipline baked in.
 
 Every file/directory the pipeline writes goes through this module. Default
-policy: mode 0664 for files, 0775 for directories, group `users` (gid 100).
-The legacy Perl/Java pipeline failed at the extract step on permissions,
-which blocked other lab members from accessing series; this is the fix.
+policy: mode 0664 for files, 02775 (setgid) for directories, group `users`
+(gid 100). The legacy Perl/Java pipeline failed at the extract step on
+permissions, which blocked other lab members from accessing series; this is the
+fix. Group-write (not world-write) is deliberate: any `users` member can re-save
+a series during a curation handoff, without exposing files to every account.
+
+The **setgid bit** on directories is load-bearing: it forces new files into the
+dir's group (`users`) regardless of which tool or user writes them — covering
+writers that bypass this module (legacy jars, AceTree edits over sshfs, manual
+edits). The *group* is then correct passively; only the *mode* still rides on
+the writer's umask. `normalize_tree()` is the post-hoc mop for those stragglers
+(see `embryodb.permissions` for the series-level / CLI entry point).
 
 Override `EMBRYODB_FILE_GROUP` / `EMBRYODB_FILE_MODE` / `EMBRYODB_DIR_MODE`
 in env if a deployment needs different defaults.
@@ -19,7 +28,7 @@ from pathlib import Path
 
 DEFAULT_GROUP = os.environ.get("EMBRYODB_FILE_GROUP", "users")
 DEFAULT_FILE_MODE = int(os.environ.get("EMBRYODB_FILE_MODE", "0o664"), 8)
-DEFAULT_DIR_MODE = int(os.environ.get("EMBRYODB_DIR_MODE", "0o775"), 8)
+DEFAULT_DIR_MODE = int(os.environ.get("EMBRYODB_DIR_MODE", "0o2775"), 8)
 
 
 def resolve_gid(group: str) -> int | None:
@@ -114,6 +123,46 @@ def safe_symlink(target: Path | str, link: Path | str, overwrite: bool = False) 
     return link_p
 
 
+def normalize_tree(root: Path | str) -> tuple[int, int]:
+    """Recursively re-apply the project's group + mode to an existing tree.
+
+    The mop for writers that bypass `safe_write*` (legacy Java/Perl jars,
+    AceTree curation edits over sshfs, manual edits): brings every file to
+    `DEFAULT_FILE_MODE` and every directory to `DEFAULT_DIR_MODE` (setgid), all
+    group `DEFAULT_GROUP`. Idempotent. Symlinks are skipped (never followed, so
+    link targets outside the tree are untouched). Returns
+    `(dirs_touched, files_touched)`.
+    """
+    root = Path(root)
+    n_dirs = n_files = 0
+    if not root.exists():
+        return (0, 0)
+    if root.is_dir() and not root.is_symlink():
+        chmod_if_possible(root, DEFAULT_DIR_MODE)
+        chgrp_if_possible(root)
+        n_dirs += 1
+    elif root.is_file() and not root.is_symlink():
+        chmod_if_possible(root, DEFAULT_FILE_MODE)
+        chgrp_if_possible(root)
+        return (0, 1)
+    for dirpath, dirnames, filenames in os.walk(root):
+        for d in dirnames:
+            p = Path(dirpath) / d
+            if p.is_symlink():
+                continue
+            chmod_if_possible(p, DEFAULT_DIR_MODE)
+            chgrp_if_possible(p)
+            n_dirs += 1
+        for f in filenames:
+            p = Path(dirpath) / f
+            if p.is_symlink():
+                continue
+            chmod_if_possible(p, DEFAULT_FILE_MODE)
+            chgrp_if_possible(p)
+            n_files += 1
+    return (n_dirs, n_files)
+
+
 @contextmanager
 def _scoped_umask(value: int = 0o002):
     """Force umask 0o002 for the duration of a write so group bits stick.
@@ -139,4 +188,5 @@ __all__ = [
     "safe_write_text",
     "safe_copy",
     "safe_symlink",
+    "normalize_tree",
 ]

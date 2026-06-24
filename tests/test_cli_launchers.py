@@ -200,8 +200,13 @@ def test_cli_rerun_rejects_unknown_step(fresh_db):
 def test_cli_extract_routes_to_run_extract(fresh_db, monkeypatch):
     captured = {}
 
+    class FakeProc:
+        pid = 4242
+
     class FakeResult:
         log_path = Path("/tmp/extract.log")
+        proc = FakeProc()
+        job_id = None
 
     def fake_run_extract(names, step_keys, **kw):
         captured["names"] = names
@@ -226,8 +231,13 @@ def test_cli_extract_list_steps(fresh_db):
 def test_cli_print_trees_routes(fresh_db, monkeypatch):
     captured = {}
 
+    class FakeProc:
+        pid = 4243
+
     class FakeResult:
         log_path = Path("/tmp/trees.log")
+        proc = FakeProc()
+        job_id = None
 
     def fake_run_print_trees(names, **kw):
         captured["names"] = names

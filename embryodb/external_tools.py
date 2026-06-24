@@ -19,6 +19,7 @@ either kind.
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -187,10 +188,19 @@ def shell_quote(s: str) -> str:
 
 @dataclass
 class LaunchResult:
-    """Returned by every launch function so callers can show status."""
-    proc: subprocess.Popen
+    """Returned by every launch function so callers can show status.
+
+    Two shapes:
+      * **local** — `proc` is the detached subprocess, `log_path` its live log,
+        `series_list` the temp name-list file. `job_id` is None.
+      * **queued** (remote mode) — `proc` and `series_list` are None; `job_id`
+        is the enqueued :class:`~embryodb.models.CommandJob` id and `log_path`
+        is where the penticton worker will write once it claims the job.
+    """
+    proc: subprocess.Popen | None
     log_path: Path
-    series_list: Path
+    series_list: Path | None
+    job_id: int | None = None
 
 
 def _step_invocation(step: ExtractStep, arg: str, base_dir: Path) -> str:
@@ -221,6 +231,141 @@ def _step_invocation(step: ExtractStep, arg: str, base_dir: Path) -> str:
     raise AssertionError(f"unknown step kind {step.kind!r}")
 
 
+# ---------------------------------------------------------------------------
+# Pure command builders — render the shell string only (no I/O, no spawn).
+#
+# Split out from the run_* launchers so the SAME shell is produced whether a
+# job runs locally (detached, here) or is claimed and run by a penticton worker
+# from a queued CommandJob. `list_file` is the path the batch steps read names
+# from; the caller (local launcher or worker) is responsible for writing it.
+# ---------------------------------------------------------------------------
+
+
+def build_extract_command(
+    series_names: list[str],
+    step_keys: list[str],
+    list_file: Path | str,
+    base_dir: Path,
+) -> str:
+    """Render the `&&`-chained extract shell for the chosen steps."""
+    chosen = [s for s in EXTRACT_STEPS if s.key in set(step_keys)]
+    parts: list[str] = []
+    for step in chosen:
+        # per_series steps have no list-file batch mode: invoke once per name.
+        # All other steps accept a list file directly.
+        if step.per_series:
+            invocations = [
+                _step_invocation(step, name, base_dir) for name in series_names
+            ]
+            parts.append(
+                f"echo '== {step.label} ==' && " + " && ".join(invocations)
+            )
+        else:
+            parts.append(
+                f"echo '== {step.label} ==' && "
+                + _step_invocation(step, str(list_file), base_dir)
+            )
+    # `&&` so a failed step halts the rest. Each step echoes a banner so
+    # the log is human-skimmable.
+    return " && ".join(parts)
+
+
+def build_print_trees_command(
+    series_names: list[str],
+    list_file: Path | str,
+    *,
+    min_expr: int | None = None,
+    max_expr: int | None = None,
+    color_scheme: str = "rainbow",
+    linewidth: int = 3,
+    base_dir: Path,
+) -> str:
+    """Render the `acexpress_CL2.jar Tree1` shell."""
+    args = [shell_quote(str(list_file))]
+    if min_expr is not None:
+        args.append(str(int(min_expr)))
+        if max_expr is not None:
+            args.append(str(int(max_expr)))
+            args.append(shell_quote(color_scheme))
+            args.append(str(int(linewidth)))
+    return (
+        f"echo '== PrintTrees ({len(series_names)} series) ==' && "
+        f"nice java -Xmx1000m -cp {shell_quote(str(base_dir / 'acexpress_CL2.jar'))} "
+        f"Tree1 {' '.join(args)}"
+    )
+
+
+def build_getacd_command(
+    series_names: list[str],
+    list_file: Path | str,
+    base_dir: Path,
+) -> str:
+    """Render the legacy `GetACD.pl` stopgap shell."""
+    return (
+        f"echo '== GetACD STOPGAP ({len(series_names)} series) ==' && "
+        "mkdir -p CDs AuxInfos && "
+        f"nice perl {shell_quote(str(base_dir / 'GetACD.pl'))} "
+        f"{shell_quote(str(list_file))}"
+    )
+
+
+# Command-job kinds → the params each builder reads from CommandJob.params.
+COMMAND_JOB_KINDS = ("extract", "print_trees", "getacd")
+
+
+def build_command_for_kind(
+    kind: str, params: dict, list_file: Path | str, base_dir: Path
+) -> str:
+    """Dispatch a queued CommandJob's (kind, params) to the matching builder.
+
+    Used by the worker when it claims a job; the local launchers call the
+    `build_*_command` builders directly.
+    """
+    names = list(params.get("series_names") or [])
+    if kind == "extract":
+        return build_extract_command(names, params["step_keys"], list_file, base_dir)
+    if kind == "print_trees":
+        return build_print_trees_command(
+            names,
+            list_file,
+            min_expr=params.get("min_expr"),
+            max_expr=params.get("max_expr"),
+            color_scheme=params.get("color_scheme", "rainbow"),
+            linewidth=params.get("linewidth", 3),
+            base_dir=base_dir,
+        )
+    if kind == "getacd":
+        return build_getacd_command(names, list_file, base_dir)
+    raise ValueError(f"unknown command-job kind {kind!r}")
+
+
+def command_job_log_path(job_id: int) -> Path:
+    """Deterministic shared log path for a queued CommandJob (worker writes it)."""
+    return Path(settings.command_log_dir) / f"command-{job_id}.log"
+
+
+def enqueue_command_job(kind: str, params: dict) -> LaunchResult:
+    """Insert a PENDING CommandJob for a penticton worker to claim and run.
+
+    Used by the run_* launchers in remote-client mode instead of spawning the
+    tool locally. Returns a LaunchResult with `proc=None`, `job_id` set, and
+    `log_path` pointing at where the worker will write — so the GUI/CLI can
+    surface "queued as job #N" and the Background-jobs panel can follow it.
+    """
+    from .database import session_scope
+    from .models import CommandJob
+
+    submitter = f"{settings.user}@{socket.gethostname()}"
+    with session_scope() as s:
+        job = CommandJob(kind=kind, params=params, submitted_by=submitter)
+        s.add(job)
+        s.flush()  # assigns job.id
+        job.log_path = str(command_job_log_path(job.id))
+        job_id = job.id
+        log_path = Path(job.log_path)
+    return LaunchResult(proc=None, log_path=log_path, series_list=None, job_id=job_id)
+
+
 def run_extract(
     series_names: list[str],
     step_keys: list[str],
@@ -247,31 +392,17 @@ def run_extract(
     if unknown:
         raise ValueError(f"run_extract: unknown step keys: {unknown}")
 
+    # Remote client: don't run the Java/Perl tools locally over sshfs — queue a
+    # CommandJob for the penticton-resident worker to claim and execute.
+    if settings.remote:
+        return enqueue_command_job(
+            "extract", {"series_names": list(series_names), "step_keys": list(step_keys)}
+        )
+
     base_dir = Path(tools3_dir or settings.tools3_dir)
     list_file = _write_series_list(series_names, tag="extract")
     log_path = list_file.with_suffix(".log")
-
-    # Run steps in canonical order (subset of EXTRACT_STEPS).
-    chosen = [s for s in EXTRACT_STEPS if s.key in set(step_keys)]
-    parts: list[str] = []
-    for step in chosen:
-        # per_series steps have no list-file batch mode: invoke once per name.
-        # All other steps accept a list file directly.
-        if step.per_series:
-            invocations: list[str] = []
-            for name in series_names:
-                invocations.append(_step_invocation(step, name, base_dir))
-            parts.append(
-                f"echo '== {step.label} ==' && " + " && ".join(invocations)
-            )
-        else:
-            parts.append(
-                f"echo '== {step.label} ==' && "
-                + _step_invocation(step, str(list_file), base_dir)
-            )
-    # `&&` so a failed step halts the rest. Each step echoes a banner so
-    # the log is human-skimmable.
-    shell = " && ".join(parts)
+    shell = build_extract_command(series_names, step_keys, list_file, base_dir)
     proc = _spawn_detached(shell, log_path)
     return LaunchResult(proc=proc, log_path=log_path, series_list=list_file)
 
@@ -297,22 +428,30 @@ def run_print_trees(
     """
     if not series_names:
         raise ValueError("run_print_trees: series_names is empty")
+
+    if settings.remote:
+        return enqueue_command_job(
+            "print_trees",
+            {
+                "series_names": list(series_names),
+                "min_expr": min_expr,
+                "max_expr": max_expr,
+                "color_scheme": color_scheme,
+                "linewidth": linewidth,
+            },
+        )
+
     base_dir = Path(tools3_dir or settings.tools3_dir)
     list_file = _write_series_list(series_names, tag="trees")
     log_path = list_file.with_suffix(".log")
-
-    args = [shell_quote(str(list_file))]
-    if min_expr is not None:
-        args.append(str(int(min_expr)))
-        if max_expr is not None:
-            args.append(str(int(max_expr)))
-            args.append(shell_quote(color_scheme))
-            args.append(str(int(linewidth)))
-
-    shell = (
-        f"echo '== PrintTrees ({len(series_names)} series) ==' && "
-        f"nice java -Xmx1000m -cp {shell_quote(str(base_dir / 'acexpress_CL2.jar'))} "
-        f"Tree1 {' '.join(args)}"
+    shell = build_print_trees_command(
+        series_names,
+        list_file,
+        min_expr=min_expr,
+        max_expr=max_expr,
+        color_scheme=color_scheme,
+        linewidth=linewidth,
+        base_dir=base_dir,
     )
     proc = _spawn_detached(shell, log_path)
     return LaunchResult(proc=proc, log_path=log_path, series_list=list_file)
@@ -346,15 +485,14 @@ def run_getacd(
     """
     if not series_names:
         raise ValueError("run_getacd: series_names is empty")
+
+    if settings.remote:
+        return enqueue_command_job("getacd", {"series_names": list(series_names)})
+
     base_dir = Path(tools3_dir or settings.tools3_dir)
     list_file = _write_series_list(series_names, tag="getacd")
     log_path = list_file.with_suffix(".log")
-    shell = (
-        f"echo '== GetACD STOPGAP ({len(series_names)} series) ==' && "
-        "mkdir -p CDs AuxInfos && "
-        f"nice perl {shell_quote(str(base_dir / 'GetACD.pl'))} "
-        f"{shell_quote(str(list_file))}"
-    )
+    shell = build_getacd_command(series_names, list_file, base_dir)
     proc = _spawn_detached(shell, log_path)
     return LaunchResult(proc=proc, log_path=log_path, series_list=list_file)
 
@@ -446,8 +584,15 @@ def run_lif_import(
 __all__ = [
     "EXTRACT_STEPS",
     "EXTRACT_STEPS_BY_KEY",
+    "COMMAND_JOB_KINDS",
     "ExtractStep",
     "LaunchResult",
+    "build_command_for_kind",
+    "build_extract_command",
+    "build_getacd_command",
+    "build_print_trees_command",
+    "command_job_log_path",
+    "enqueue_command_job",
     "run_extract",
     "run_getacd",
     "run_lif_import",

@@ -2143,6 +2143,27 @@ def open_cmd(
 # --- legacy analysis launchers (extract / trees) + jobs / acetree ----------
 
 
+def _report_launch(result, label: str, n_series: int) -> None:
+    """Print a launch/queue summary for a detached or queued analysis job.
+
+    Local (lab host): the tool was spawned detached. Remote client: it was
+    queued as a CommandJob for the penticton worker to claim — there's no local
+    process and the log appears only once the worker starts it.
+    """
+    if result.proc is None:
+        console.print(
+            f"[green]queued[/green] {label} on {n_series} series as "
+            f"job #{result.job_id} (runs on the penticton worker)\n"
+            f"  log (when it starts): [cyan]{result.log_path}[/cyan]\n"
+            f"  watch: [cyan]embryodb jobs[/cyan]"
+        )
+    else:
+        console.print(
+            f"[green]launched[/green] {label} on {n_series} series (detached)\n"
+            f"  log: [cyan]{result.log_path}[/cyan]"
+        )
+
+
 @app.command("extract")
 def extract_cmd(
     series: Annotated[
@@ -2196,10 +2217,7 @@ def extract_cmd(
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
-    console.print(
-        f"[green]launched[/green] extract ({', '.join(step_keys)}) on "
-        f"{len(names)} series (detached)\n  log: [cyan]{result.log_path}[/cyan]"
-    )
+    _report_launch(result, f"extract ({', '.join(step_keys)})", len(names))
 
 
 @app.command("print-trees")
@@ -2236,10 +2254,7 @@ def print_trees_cmd(
         color_scheme=color_scheme,
         linewidth=linewidth,
     )
-    console.print(
-        f"[green]launched[/green] PrintTrees on {len(names)} series (detached)\n"
-        f"  log: [cyan]{result.log_path}[/cyan]"
-    )
+    _report_launch(result, "PrintTrees", len(names))
 
 
 @app.command("jobs")
@@ -2469,10 +2484,7 @@ def phenotyping_getacd(
         console.print(f"[yellow]dataset {dataset!r} has no member series[/yellow]")
         raise typer.Exit(1)
     result = run_getacd(names)
-    console.print(
-        f"[green]launched[/green] GetACD stopgap on {len(names)} series "
-        f"(detached)\n  log: [cyan]{result.log_path}[/cyan]"
-    )
+    _report_launch(result, "GetACD stopgap", len(names))
 
 
 def open_gui() -> None:

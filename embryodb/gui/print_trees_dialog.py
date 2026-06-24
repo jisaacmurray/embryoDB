@@ -160,12 +160,21 @@ class PrintTreesDialog(QtWidgets.QDialog):
             )
             return
         self._launched_log = result.log_path
-        self._status.setText(
-            f"<b>Launched</b> (pid {result.proc.pid}). Detached — survives "
-            f"GUI close.<br><br>"
-            f"<b>Log:</b> <code>{result.log_path}</code><br>"
-            f"<b>PNGs:</b> <code>{_TREE_OUTPUT_DIR}/&lt;series&gt;.png</code>"
-        )
+        if result.proc is None:
+            # Remote mode: queued for the penticton worker.
+            self._status.setText(
+                f"<b>Queued</b> as job #{result.job_id} — will run on the "
+                f"penticton worker.<br>Track it in <b>Background jobs…</b>.<br><br>"
+                f"<b>Log (when it starts):</b> <code>{result.log_path}</code><br>"
+                f"<b>PNGs:</b> <code>{_TREE_OUTPUT_DIR}/&lt;series&gt;.png</code>"
+            )
+        else:
+            self._status.setText(
+                f"<b>Launched</b> (pid {result.proc.pid}). Detached — survives "
+                f"GUI close.<br><br>"
+                f"<b>Log:</b> <code>{result.log_path}</code><br>"
+                f"<b>PNGs:</b> <code>{_TREE_OUTPUT_DIR}/&lt;series&gt;.png</code>"
+            )
         self._ok_btn.setEnabled(False)
         self._view_log_btn.setEnabled(True)
 

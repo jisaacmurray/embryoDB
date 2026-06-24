@@ -178,12 +178,23 @@ class ExtractDialog(QtWidgets.QDialog):
         self._chosen_keys = keys
         self._ok_btn.setEnabled(False)
         self._view_log_btn.setEnabled(True)
-        # After a successful launch, "Cancel" no longer makes sense — the
-        # job is already running detached and closing this dialog doesn't
-        # stop it. Rename the button so the exit path reads as "I'm done
-        # watching", not "abort the thing I just started".
         self._cancel_btn.setText("Close")
-        # Start polling the log file for step-banner progress.
+
+        # Remote mode: the job was queued for the penticton worker, not spawned
+        # here. There's no local process to poll; point the user at the
+        # Background-jobs panel and the (eventual) shared log.
+        if result.proc is None:
+            self._status.setText(
+                f"<b>Queued</b> as job #{result.job_id} — will run on the "
+                f"penticton worker.<br>"
+                f"Track it in <b>Background jobs…</b>.<br>"
+                f"<b>Log (when it starts):</b> <code>{result.log_path}</code>"
+            )
+            return
+
+        # After a successful local launch, "Cancel" no longer makes sense — the
+        # job is already running detached and closing this dialog doesn't
+        # stop it. Start polling the log file for step-banner progress.
         self._poll_timer = QtCore.QTimer(self)
         self._poll_timer.setInterval(2000)
         self._poll_timer.timeout.connect(self._poll_log)
@@ -199,6 +210,8 @@ class ExtractDialog(QtWidgets.QDialog):
         """
         if self._launch_result is None or self._launched_log is None:
             return
+        if self._launch_result.proc is None:
+            return  # queued (remote) — no local process to poll
         try:
             content = self._launched_log.read_text(errors="replace")
         except OSError:

@@ -46,12 +46,17 @@ from .. import database
 from ..config import settings
 from ..models import (
     Acquisition,
+    CommandJob,
     PipelineStepRun,
     Protocol,
     RunStatus,
     Series,
 )
 from . import subprocess_steps
+
+# Seconds between DB heartbeat writes while a queued command job runs. Well
+# under STALE_THRESHOLD so a healthy job never looks crashed.
+COMMAND_HEARTBEAT = 30
 
 # Steps handled by this worker (in execution order within a series).
 # stage_images is here so the heavy I/O step can be scheduled (delayed) via
@@ -306,6 +311,160 @@ def _get_channel_map(session, series: Series) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Command jobs (batch extract / print-trees / getacd queued by remote clients)
+# ---------------------------------------------------------------------------
+
+
+def _reset_stale_commands(session) -> int:
+    """Requeue RUNNING CommandJobs whose heartbeat has gone stale (crashed worker)."""
+    cutoff = datetime.now(tz=timezone.utc) - STALE_THRESHOLD
+    stale = (
+        session.query(CommandJob)
+        .filter(
+            CommandJob.status == RunStatus.RUNNING,
+            CommandJob.heartbeat_at < cutoff,
+        )
+        .all()
+    )
+    for job in stale:
+        job.status = RunStatus.PENDING
+        job.started_at = None
+        job.heartbeat_at = None
+        job.claimed_by = None
+        job.error_excerpt = "reset: stale heartbeat (worker crashed?)"
+    if stale:
+        session.flush()
+    return len(stale)
+
+
+def _claim_next_command(session) -> tuple[int, str, dict, str | None] | None:
+    """Atomically claim the oldest runnable CommandJob for this worker.
+
+    Same guarded-UPDATE pattern as `_claim_next` — flips PENDING→RUNNING only
+    while still PENDING, so exactly one worker wins. No prerequisite chain (these
+    are independent batch jobs); ordering is by submission (id ASC). Returns
+    (job_id, kind, params, log_path) or None.
+    """
+    from sqlalchemy import or_
+
+    now = datetime.now(tz=timezone.utc)
+    while True:
+        row = (
+            session.query(CommandJob)
+            .filter(
+                CommandJob.status == RunStatus.PENDING,
+                or_(CommandJob.not_before.is_(None), CommandJob.not_before <= now),
+            )
+            .order_by(CommandJob.id.asc())
+            .first()
+        )
+        if row is None:
+            return None
+        job_id, kind, params, log_path = (
+            row.id,
+            row.kind,
+            dict(row.params or {}),
+            row.log_path,
+        )
+        result = session.execute(
+            update(CommandJob)
+            .where(
+                CommandJob.id == job_id,
+                CommandJob.status == RunStatus.PENDING,
+            )
+            .values(
+                status=RunStatus.RUNNING,
+                started_at=now,
+                heartbeat_at=now,
+                claimed_by=socket.gethostname(),
+            )
+        )
+        if result.rowcount == 1:
+            return job_id, kind, params, log_path
+        session.expire(row)
+        # lost the race — loop; the SQL filter excludes the now-RUNNING row.
+
+
+def _command_tail(path: Path, n: int = 30) -> str | None:
+    try:
+        return "\n".join(path.read_text(errors="replace").splitlines()[-n:])
+    except OSError:
+        return None
+
+
+def _finish_command(
+    job_id: int, log_path: Path, *, returncode: int, error: str | None = None
+) -> None:
+    with database.session_scope() as s:
+        job = s.get(CommandJob, job_id)
+        if job is None:
+            return
+        job.log_path = str(log_path)
+        job.returncode = returncode
+        job.completed_at = datetime.now(tz=timezone.utc)
+        job.status = RunStatus.COMPLETE if returncode == 0 else RunStatus.FAILED
+        if error:
+            job.error_excerpt = error[:4000]
+
+
+def _execute_command_job(
+    job_id: int, kind: str, params: dict, log_path: Path
+) -> None:
+    """Materialize + run a claimed CommandJob, heartbeating the row until exit.
+
+    Renders the same shell the local launcher would (via the shared builders in
+    external_tools), writes the series-list + log into the shared
+    `command_log_dir`, and runs from `tools3_dir` so the jars/scripts resolve.
+    """
+    from .. import external_tools as ext
+    from .. import fsutil
+
+    base_dir = Path(settings.tools3_dir)
+    if not log_path or str(log_path) in ("", "."):
+        log_path = ext.command_job_log_path(job_id)
+    log_path = Path(log_path)
+    fsutil.ensure_dir(log_path.parent)
+
+    series_names = list(params.get("series_names") or [])
+    list_file = log_path.with_suffix(".list")
+    try:
+        fsutil.safe_write_text(list_file, "\n".join(series_names) + "\n")
+        shell = ext.build_command_for_kind(kind, params, list_file, base_dir)
+    except Exception as exc:  # bad params / unknown kind — fail the row cleanly
+        _finish_command(job_id, log_path, returncode=2, error=f"build failed: {exc}")
+        return
+
+    q = ext.shell_quote(str(log_path))
+    full = f"({shell}) >> {q} 2>&1; echo \"{ext._EXIT_TRAILER}=$?\" >> {q}"
+    try:
+        log_path.touch(exist_ok=True)
+    except OSError:
+        pass
+    proc = subprocess.Popen(
+        ["bash", "-c", full],
+        cwd=str(base_dir),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    while proc.poll() is None:
+        time.sleep(COMMAND_HEARTBEAT)
+        try:
+            with database.session_scope() as s:
+                job = s.get(CommandJob, job_id)
+                if job is not None:
+                    job.heartbeat_at = datetime.now(tz=timezone.utc)
+        except Exception:
+            pass  # heartbeat failures are non-fatal
+
+    rc = proc.returncode
+    fsutil.chmod_if_possible(log_path, 0o664)
+    error = None if rc == 0 else _command_tail(log_path)
+    _finish_command(job_id, log_path, returncode=rc, error=error)
+
+
+# ---------------------------------------------------------------------------
 # Main worker loop
 # ---------------------------------------------------------------------------
 
@@ -332,16 +491,24 @@ def run_worker() -> None:
         series_id = None
         series_name = None
         run_id = None
+        command: tuple[int, str, dict, str | None] | None = None
 
         with database.session_scope() as s:
             _reset_stale_running(s)
+            _reset_stale_commands(s)
             # Atomic claim: flips PENDING→RUNNING and commits on block exit so
-            # the GUI (and other workers) see the row as RUNNING.
+            # the GUI (and other workers) see the row as RUNNING. Pipeline
+            # steps take priority; only when none are runnable do we claim a
+            # batch command job (extract / print-trees / getacd).
             item = _claim_next(s)
             if item is None:
-                idle_count += 1
-                if idle_count >= MAX_IDLE_LOOPS:
-                    break
+                command = _claim_next_command(s)
+                if command is None:
+                    idle_count += 1
+                    if idle_count >= MAX_IDLE_LOOPS:
+                        break
+                else:
+                    idle_count = 0
             else:
                 idle_count = 0
                 series_obj, step_name, run_obj = item
@@ -352,8 +519,14 @@ def run_worker() -> None:
                 series_name = series_obj.series_name
                 run_id = run_obj.id
 
-        if series_id is None:
+        if series_id is None and command is None:
             time.sleep(IDLE_SLEEP)
+            continue
+
+        if command is not None:
+            job_id, kind, params, log_path = command
+            # _execute_command_job recomputes the path if this is empty.
+            _execute_command_job(job_id, kind, params, Path(log_path or "."))
             continue
 
         # Run the subprocess step (manages its own DB sessions for heartbeats).

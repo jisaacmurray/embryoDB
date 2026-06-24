@@ -463,6 +463,55 @@ class PipelineStepRun(Base):
         return f"<Run {self.step} series={self.series_id} status={self.status}>"
 
 
+class CommandJob(Base):
+    """A queued, host-portable batch analysis command.
+
+    Unlike :class:`PipelineStepRun` — which audits the per-series *import*
+    pipeline and is gated on a series' step prerequisites — a CommandJob is a
+    fire-and-forget batch operation over a *list* of series with no dependency
+    chain (the `extract` / `print_trees` / `getacd` launchers in
+    ``external_tools``). On the lab host those run locally and instantly. In
+    remote-client mode (``settings.remote``) the launcher instead enqueues a
+    PENDING CommandJob that a penticton-resident worker claims and executes, so
+    heavy Java/Perl tools don't run on an off-network Mac over sshfs.
+
+    ``params`` carries everything the matching command-builder needs
+    (``series_names`` plus per-kind options). ``status`` reuses
+    :class:`RunStatus`; ``claimed_by`` mirrors the PipelineStepRun atomic-claim
+    convention (the guarded PENDING→RUNNING UPDATE in ``pipeline.worker`` is the
+    real lock — this column is observability only). ``log_path`` points into the
+    shared ``settings.command_log_dir`` so the enqueuing client can read the log
+    the worker writes.
+    """
+
+    __tablename__ = "command_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    params: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    status: Mapped[RunStatus] = mapped_column(
+        SAEnum(RunStatus, name="command_job_status_enum", native_enum=False, length=16),
+        default=RunStatus.PENDING,
+        nullable=False,
+    )
+    submitted_by: Mapped[str | None] = mapped_column(String(128))
+    claimed_by: Mapped[str | None] = mapped_column(String(64))
+    not_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    log_path: Mapped[str | None] = mapped_column(Text)
+    returncode: Mapped[int | None] = mapped_column(Integer)
+    error_excerpt: Mapped[str | None] = mapped_column(Text)
+    output_summary: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+    def __repr__(self) -> str:
+        return f"<CommandJob {self.kind} status={self.status} id={self.id}>"
+
+
 __all__ = [
     "Base",
     "Series",
@@ -474,6 +523,7 @@ __all__ = [
     "Protocol",
     "MicroscopyMetadata",
     "PipelineStepRun",
+    "CommandJob",
     "VolumeTimestamp",
     "dataset_series_table",
 ]

@@ -185,6 +185,13 @@ _PIPELINE_STATUS_LABELS = {
     "skipped": "skipped",
 }
 
+# CommandJob.kind → human label for the panel.
+_COMMAND_KIND_LABELS = {
+    "extract": "Extract",
+    "print_trees": "Print trees",
+    "getacd": "GetACD",
+}
+
 
 @dataclass(frozen=True)
 class JobRow:
@@ -270,16 +277,69 @@ def discover_pipeline_jobs(
     return rows
 
 
+def _command_row(job) -> JobRow:
+    status = str(getattr(job.status, "value", job.status))
+    last = job.heartbeat_at or job.completed_at or job.started_at or job.created_at
+    names = list((job.params or {}).get("series_names") or [])
+    n = len(names)
+    label = _COMMAND_KIND_LABELS.get(job.kind, job.kind.replace("_", " ").title())
+    descr = names[0] if n == 1 else f"{n} series"
+    return JobRow(
+        source="command",
+        kind=label,
+        name=f"#{job.id} · {descr}",
+        status_label=_PIPELINE_STATUS_LABELS.get(status, status),
+        running=status == "running",
+        started_at=job.started_at or job.created_at,
+        last_activity=last,
+        log_path=Path(job.log_path) if job.log_path else None,
+    )
+
+
+def discover_command_jobs(
+    session_cm: Callable,
+    *,
+    since: datetime | None = None,
+) -> list[JobRow]:
+    """Read queued batch CommandJobs (extract / print-trees / getacd) as job rows.
+
+    Active jobs (RUNNING/PENDING) are always returned; terminal jobs only when
+    they completed at or after `since`. ``since == datetime.max`` (the "Running
+    only" window) returns active jobs alone. DB failures degrade to an empty
+    list so the panel still shows the other sources.
+    """
+    from sqlalchemy import or_, select
+
+    from .models import CommandJob, RunStatus
+
+    active = (RunStatus.RUNNING, RunStatus.PENDING)
+    rows: list[JobRow] = []
+    try:
+        with session_cm() as s:
+            q = select(CommandJob)
+            if since is not None:
+                cond = CommandJob.status.in_(active)
+                if since != datetime.max:
+                    cond = or_(cond, CommandJob.completed_at >= since)
+                q = q.where(cond)
+            for (job,) in s.execute(q).all():
+                rows.append(_command_row(job))
+    except Exception:
+        return rows
+    return rows
+
+
 def list_jobs(
     session_cm: Callable | None = None,
     *,
     since: datetime | None = None,
 ) -> list[JobRow]:
     """All background jobs, newest-first: detached log files + (if a session
-    factory is given) DB-backed pipeline steps."""
+    factory is given) DB-backed pipeline steps and queued command jobs."""
     rows = [JobRow.from_detached(j) for j in discover_jobs(since=since)]
     if session_cm is not None:
         rows.extend(discover_pipeline_jobs(session_cm, since=since))
+        rows.extend(discover_command_jobs(session_cm, since=since))
     rows.sort(key=lambda r: _as_aware(r.started_at), reverse=True)
     return rows
 
@@ -300,5 +360,6 @@ __all__ = [
     "JobRow",
     "discover_jobs",
     "discover_pipeline_jobs",
+    "discover_command_jobs",
     "list_jobs",
 ]

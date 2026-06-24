@@ -10,6 +10,16 @@ def _default_user() -> str:
     return os.environ.get("USER") or os.environ.get("LOGNAME") or "anonymous"
 
 
+def _default_command_log_dir() -> Path:
+    """Per-user dir under the canonical /murrlab3 root for queued command-job logs.
+
+    Must resolve to the same absolute path on the lab host AND a remote client
+    (the Mac maps /murrlab3 via a root symlink), so a client that enqueues a job
+    can later read the log a penticton worker wrote at this exact path.
+    """
+    return Path("/murrlab3") / _default_user() / "embryodb-jobs"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="EMBRYODB_",
@@ -76,6 +86,15 @@ class Settings(BaseSettings):
     worker_pidfile_dir: Path = Field(
         default=Path("/tmp"),
         description="Directory for the per-machine worker pidfile.",
+    )
+    command_log_dir: Path = Field(
+        default_factory=_default_command_log_dir,
+        description=(
+            "Shared, host-agnostic directory for queued command-job logs. Must "
+            "resolve to the same absolute path on the lab host and any remote "
+            "client so a Mac that enqueued a job can read the log a penticton "
+            "worker writes (EMBRYODB_COMMAND_LOG_DIR)."
+        ),
     )
 
     # Remote client mode. Set by the off-network launcher (scripts/embryodb-remote)

@@ -10,6 +10,7 @@ running the same job, so slots only add concurrency, never double-execution.
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 
@@ -54,6 +55,32 @@ def test_live_slot_is_not_stolen(slot_dir):
     assert w._try_claim_slot(0) is False
     # The next free slot is 1, not 0.
     assert w.acquire_free_slot() == 1
+
+
+def test_inflight_empty_slot_is_not_stolen(slot_dir):
+    # Reproduces the TOCTOU: worker A created the pidfile via O_EXCL but hasn't
+    # written its pid yet (empty file, fresh mtime). Worker B must treat it as
+    # occupied, NOT reclaim it — otherwise both "own" the slot and parallelism
+    # exceeds max_slots.
+    pf = w._pidfile_for_slot(0)
+    pf.write_text("")  # in-flight: created, pid not yet written
+    assert w._slot_holder(pf) == "live"
+    assert w._try_claim_slot(0) is False
+    # The next free slot is 1, not 0.
+    assert w.acquire_free_slot() == 1
+    assert w.running_worker_count() == 2  # the in-flight slot 0 counts as held
+
+
+def test_orphaned_empty_slot_is_reclaimed(slot_dir, monkeypatch):
+    # An empty pidfile left by a creator that died mid-claim is reclaimable once
+    # it has lingered past the grace window.
+    monkeypatch.setattr(w, "_SLOT_INFLIGHT_GRACE", 0.0)
+    pf = w._pidfile_for_slot(0)
+    pf.write_text("")
+    time.sleep(0.01)  # push mtime past the (now zero) grace window
+    assert w._slot_holder(pf) == "reclaimable"
+    assert w.acquire_free_slot() == 0
+    assert w._slot_pid(pf) == os.getpid()
 
 
 def test_release_slot_frees_it(slot_dir):

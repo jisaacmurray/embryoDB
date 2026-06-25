@@ -108,6 +108,14 @@ def _pid_is_alive(pid: int) -> bool:
         return False
 
 
+# An O_EXCL-created pidfile is briefly EMPTY between the create and the pid
+# write. A second racer that reads it in that window must treat it as occupied,
+# not reclaim it — otherwise both workers end up "owning" the slot. We only
+# reclaim an empty file once it has lingered past this grace window (its creator
+# must have crashed between create and write).
+_SLOT_INFLIGHT_GRACE = 10.0  # seconds
+
+
 def _slot_pid(pf: Path) -> int | None:
     try:
         return int(pf.read_text().strip())
@@ -115,28 +123,57 @@ def _slot_pid(pf: Path) -> int | None:
         return None
 
 
+def _slot_holder(pf: Path) -> str:
+    """Classify a slot pidfile: 'live' (occupied), 'reclaimable' (dead/orphaned),
+    or 'missing' (no file). An empty file is a racing creator within the grace
+    window (treated 'live'); it only becomes 'reclaimable' once it has stayed
+    empty long enough that its creator must have died mid-claim.
+    """
+    try:
+        txt = pf.read_text().strip()
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "live"  # transient read error — be conservative, don't steal
+    if txt:
+        try:
+            pid = int(txt)
+        except ValueError:
+            return "reclaimable"  # non-empty but corrupt — safe to drop
+        return "live" if _pid_is_alive(pid) else "reclaimable"
+    # Empty: an in-flight creator unless it has lingered past the grace window.
+    try:
+        age = time.time() - pf.stat().st_mtime
+    except OSError:
+        return "live"
+    return "reclaimable" if age > _SLOT_INFLIGHT_GRACE else "live"
+
+
 def _try_claim_slot(slot: int) -> bool:
     """Atomically claim one slot. Returns True if this process now owns it.
 
-    O_CREAT|O_EXCL is the atomic primitive: only one racer's create succeeds.
-    If the file already exists we reclaim it only when its pid is dead/corrupt
-    (one retry), so a crashed worker's slot is reused without a separate sweep.
+    O_CREAT|O_EXCL is the atomic primitive: only one racer's create succeeds,
+    and the winner writes its pid immediately (os.write, no buffering) to shrink
+    the empty-file window. If the file already exists we reclaim it only when it
+    is dead/corrupt/orphaned (one retry) — never while a live or in-flight
+    creator holds it (see _slot_holder), so two workers can't both win a slot.
     """
     pf = _pidfile_for_slot(slot)
     for _attempt in range(2):
         try:
             fd = os.open(pf, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         except FileExistsError:
-            pid = _slot_pid(pf)
-            if pid is not None and _pid_is_alive(pid):
-                return False  # held by a live worker
+            if _slot_holder(pf) == "live":
+                return False  # held by a live (or in-flight) worker
             try:
-                pf.unlink()  # stale — drop it and retry the exclusive create
+                pf.unlink()  # reclaimable — drop it and retry the exclusive create
             except OSError:
                 return False
             continue
-        with os.fdopen(fd, "w") as f:
-            f.write(str(os.getpid()))
+        try:
+            os.write(fd, str(os.getpid()).encode())
+        finally:
+            os.close(fd)
         return True
     return False
 
@@ -156,12 +193,10 @@ def running_worker_count(max_slots: int | None = None) -> int:
     count = 0
     for slot in range(max(1, n)):
         pf = _pidfile_for_slot(slot)
-        if not pf.exists():
-            continue
-        pid = _slot_pid(pf)
-        if pid is not None and _pid_is_alive(pid):
+        state = _slot_holder(pf)
+        if state == "live":
             count += 1
-        else:
+        elif state == "reclaimable":
             try:
                 pf.unlink(missing_ok=True)
             except OSError:

@@ -52,6 +52,13 @@ _CRASH_SIGNATURES = (
     "double free or corruption",
     "Segmentation fault",
     "terminate called",
+    # MCR/C++ runtime aborts that deadlock instead of exiting: the process
+    # prints one of these then wedges its threads in futex_wait, so poll()
+    # never returns. Caught the JIM799 6-day hang (2026-06-18) that the
+    # CPU/log-idle heuristic missed (periodic java helpers reset its timer).
+    "pure virtual method called",
+    "Assertion `",
+    "what():  std::",
 )
 
 
@@ -189,12 +196,20 @@ def _run_with_heartbeat(
     *,
     cwd: str | None = None,
     env: dict | None = None,
+    max_seconds: int | None = None,
 ) -> int:
     """Spawn cmd, stream output to log_path, heartbeat the DB row every
     HEARTBEAT_INTERVAL seconds, and watchdog for a crashed-but-wedged process.
 
     Returns the process returncode, or a negative sentinel if the watchdog
     had to kill a wedged process (so the caller marks the step FAILED).
+
+    `max_seconds`, when set, is a HARD wall-clock cap: the process is killed
+    once it has run that long regardless of CPU/log activity. Unlike the
+    CPU/log-idle heuristic below — which periodic MCR/java child processes can
+    defeat by intermittently burning CPU — this ceiling is deterministic and
+    cannot be fooled by a busy-but-stuck job. None = no cap (the Java steps,
+    which are bounded in practice).
     """
     ensure_dir(log_path.parent)
     with open(log_path, "w", encoding="utf-8", errors="replace") as log_fp:
@@ -213,6 +228,7 @@ def _run_with_heartbeat(
     except (ProcessLookupError, OSError):
         pgid = pid
 
+    started = time.monotonic()
     last_cpu = _proc_group_cpu_ticks(pgid)
     last_size = _safe_size(log_path)
     idle_seconds = 0
@@ -248,6 +264,15 @@ def _run_with_heartbeat(
             wedged_reason = (
                 f"no CPU activity or log output for {idle_seconds}s "
                 "(crashed but did not exit?)"
+            )
+            break
+
+        # (3) Hard wall-clock cap — deterministic backstop to (2).
+        if max_seconds is not None and (time.monotonic() - started) >= max_seconds:
+            elapsed = int(time.monotonic() - started)
+            wedged_reason = (
+                f"exceeded hard wall-clock cap ({elapsed}s >= {max_seconds}s); "
+                "killing (stuck or pathologically slow run?)"
             )
             break
 
@@ -392,7 +417,9 @@ def step_run_starrynite(
     env["MCR_CACHE_ROOT"] = mcr_cache
     try:
         returncode = _run_with_heartbeat(
-            cmd, log_path, run_id, cwd=str(settings.tools3_dir), env=env
+            cmd, log_path, run_id,
+            cwd=str(settings.tools3_dir), env=env,
+            max_seconds=settings.starrynite_max_seconds,
         )
     finally:
         shutil.rmtree(mcr_cache, ignore_errors=True)

@@ -87,6 +87,25 @@ class Settings(BaseSettings):
         default=Path("/tmp"),
         description="Directory for the per-machine worker pidfile.",
     )
+    worker_max_slots: int = Field(
+        default=3,
+        description=(
+            "Max concurrent worker processes per host. The cron relauncher and "
+            "spawn_worker() each claim the first free slot (0..N-1) via a "
+            "per-slot pidfile; the DB atomic claim keeps them from running the "
+            "same job. >1 lets independent jobs run in parallel and stops one "
+            "wedged job from freezing the whole queue (EMBRYODB_WORKER_MAX_SLOTS)."
+        ),
+    )
+    starrynite_max_seconds: int = Field(
+        default=21_600,  # 6 hours
+        description=(
+            "Hard wall-clock cap for a single StarryNite run. A run exceeding "
+            "this is killed and marked FAILED — a deterministic backstop to the "
+            "heuristic CPU/log-idle watchdog, which periodic MCR/java child "
+            "processes can defeat (EMBRYODB_STARRYNITE_MAX_SECONDS)."
+        ),
+    )
     command_log_dir: Path = Field(
         default_factory=_default_command_log_dir,
         description=(

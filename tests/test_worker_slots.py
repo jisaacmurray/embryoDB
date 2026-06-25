@@ -1,0 +1,92 @@
+"""Tests for bounded worker parallelism (per-host slot pidfiles).
+
+The single-instance pidfile guard was replaced by N atomic slots so up to
+settings.worker_max_slots workers coexist on one host. The point is resilience:
+one wedged job (the JIM799 6-day MCR hang) ties up only its own slot instead of
+freezing the whole queue. The DB atomic claim still prevents two slots from
+running the same job, so slots only add concurrency, never double-execution.
+"""
+
+from __future__ import annotations
+
+import os
+
+import pytest
+
+from embryodb.pipeline import worker as w
+
+
+@pytest.fixture
+def slot_dir(tmp_path, monkeypatch):
+    # Point slot pidfiles at a private tmp dir and cap slots at 3.
+    monkeypatch.setattr(w.settings, "worker_pidfile_dir", tmp_path)
+    monkeypatch.setattr(w.settings, "worker_max_slots", 3)
+    yield tmp_path
+
+
+def test_acquire_takes_lowest_free_slot_then_reports_full(slot_dir):
+    # Claim all three slots; each returns the next-lowest index.
+    assert w.acquire_free_slot() == 0
+    assert w.acquire_free_slot() == 1
+    assert w.acquire_free_slot() == 2
+    # All taken (this live process owns all three) → no slot, queue "full".
+    assert w.acquire_free_slot() is None
+    assert w.has_free_slot() is False
+    assert w.running_worker_count() == 3
+
+
+def test_stale_slot_is_reclaimed(slot_dir):
+    # A slot whose pid is dead must be reusable without a manual sweep.
+    dead_pid = _a_dead_pid()
+    pf = w._pidfile_for_slot(0)
+    pf.write_text(str(dead_pid), encoding="utf-8")
+
+    # running_worker_count cleans the corpse; acquire reclaims slot 0.
+    assert w.running_worker_count() == 0
+    assert w.acquire_free_slot() == 0
+    assert w._slot_pid(pf) == os.getpid()
+
+
+def test_live_slot_is_not_stolen(slot_dir):
+    # A slot held by THIS (live) process is never handed out again.
+    pf = w._pidfile_for_slot(0)
+    pf.write_text(str(os.getpid()), encoding="utf-8")
+    assert w._try_claim_slot(0) is False
+    # The next free slot is 1, not 0.
+    assert w.acquire_free_slot() == 1
+
+
+def test_release_slot_frees_it(slot_dir):
+    slot = w.acquire_free_slot()
+    w._claimed_slot = slot
+    assert w.running_worker_count() == 1
+    w._release_slot()
+    assert w._claimed_slot is None
+    assert w.running_worker_count() == 0
+    assert w.has_free_slot() is True
+
+
+def test_spawn_worker_noop_when_remote(slot_dir, monkeypatch):
+    monkeypatch.setattr(w.settings, "remote", True)
+    assert w.spawn_worker() is None
+
+
+def test_spawn_worker_noop_when_slots_full(slot_dir, monkeypatch):
+    monkeypatch.setattr(w.settings, "remote", False)
+    # Fill all slots with live (this-process) pids.
+    for i in range(3):
+        w._pidfile_for_slot(i).write_text(str(os.getpid()), encoding="utf-8")
+
+    def _boom(*a, **k):
+        raise AssertionError("must not fork when all slots are busy")
+
+    monkeypatch.setattr(w.subprocess, "Popen", _boom)
+    assert w.spawn_worker() is None
+
+
+def _a_dead_pid() -> int:
+    """Return a pid that is not currently alive."""
+    for candidate in range(2**15, 2**15 - 5000, -1):
+        if not w._pid_is_alive(candidate):
+            return candidate
+    raise RuntimeError("could not find a dead pid for the test")

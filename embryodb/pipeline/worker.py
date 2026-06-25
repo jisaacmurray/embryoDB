@@ -12,10 +12,15 @@ Properties
   heartbeat_at. On next startup, _reset_stale_running() requeues those rows
   as PENDING so they are retried from scratch (steps are idempotent — outputs
   are overwritten).
-- One per machine: a pidfile at <worker_pidfile_dir>/embryodb-worker-<host>.pid
-  prevents duplicate instances. spawn_worker() checks before forking.
+- Bounded parallelism: up to settings.worker_max_slots workers run per host,
+  each holding one slot pidfile <worker_pidfile_dir>/embryodb-worker-<host>-<slot>.pid
+  (slot in 0..N-1). A worker claims the first free slot atomically at startup
+  (O_CREAT|O_EXCL); spawn_worker() only forks while a slot is free. The DB
+  atomic claim (_claim_next / _claim_next_command) keeps two slots from running
+  the same job, so independent jobs run concurrently and one wedged job ties up
+  only its own slot rather than freezing the whole queue.
 - Self-terminating: after MAX_IDLE_LOOPS consecutive idle polls the worker
-  exits. The GUI re-spawns it when new work arrives.
+  exits, releasing its slot. The GUI re-spawns it when new work arrives.
 
 Usage
 -----
@@ -81,46 +86,123 @@ MAX_IDLE_LOOPS = 30  # ~5 minutes
 # ---------------------------------------------------------------------------
 
 
-def _pidfile() -> Path:
-    return settings.worker_pidfile_dir / f"embryodb-worker-{socket.gethostname()}.pid"
+# Set by run_worker() once it claims a slot, so the exit handlers release the
+# right pidfile.
+_claimed_slot: int | None = None
 
 
-def _write_pidfile() -> None:
-    _pidfile().write_text(str(os.getpid()), encoding="utf-8")
+def _max_slots() -> int:
+    return max(1, settings.worker_max_slots)
 
 
-def _remove_pidfile() -> None:
+def _pidfile_for_slot(slot: int) -> Path:
+    host = socket.gethostname()
+    return settings.worker_pidfile_dir / f"embryodb-worker-{host}-{slot}.pid"
+
+
+def _pid_is_alive(pid: int) -> bool:
     try:
-        _pidfile().unlink(missing_ok=True)
+        os.kill(pid, 0)  # signal 0: existence check, sends nothing
+        return True
     except OSError:
-        pass
+        return False
+
+
+def _slot_pid(pf: Path) -> int | None:
+    try:
+        return int(pf.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _try_claim_slot(slot: int) -> bool:
+    """Atomically claim one slot. Returns True if this process now owns it.
+
+    O_CREAT|O_EXCL is the atomic primitive: only one racer's create succeeds.
+    If the file already exists we reclaim it only when its pid is dead/corrupt
+    (one retry), so a crashed worker's slot is reused without a separate sweep.
+    """
+    pf = _pidfile_for_slot(slot)
+    for _attempt in range(2):
+        try:
+            fd = os.open(pf, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            pid = _slot_pid(pf)
+            if pid is not None and _pid_is_alive(pid):
+                return False  # held by a live worker
+            try:
+                pf.unlink()  # stale — drop it and retry the exclusive create
+            except OSError:
+                return False
+            continue
+        with os.fdopen(fd, "w") as f:
+            f.write(str(os.getpid()))
+        return True
+    return False
+
+
+def acquire_free_slot(max_slots: int | None = None) -> int | None:
+    """Claim the lowest free slot index, or None if all are taken."""
+    n = max_slots if max_slots is not None else _max_slots()
+    for slot in range(max(1, n)):
+        if _try_claim_slot(slot):
+            return slot
+    return None
+
+
+def running_worker_count(max_slots: int | None = None) -> int:
+    """Count live worker slots on this host, cleaning up any stale pidfiles."""
+    n = max_slots if max_slots is not None else _max_slots()
+    count = 0
+    for slot in range(max(1, n)):
+        pf = _pidfile_for_slot(slot)
+        if not pf.exists():
+            continue
+        pid = _slot_pid(pf)
+        if pid is not None and _pid_is_alive(pid):
+            count += 1
+        else:
+            try:
+                pf.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return count
+
+
+def has_free_slot(max_slots: int | None = None) -> bool:
+    n = max_slots if max_slots is not None else _max_slots()
+    return running_worker_count(n) < max(1, n)
 
 
 def worker_is_running() -> bool:
-    """Return True if a live worker process exists for this host."""
-    pf = _pidfile()
-    if not pf.exists():
-        return False
+    """True if at least one live worker exists for this host."""
+    return running_worker_count() > 0
+
+
+def _release_slot() -> None:
+    global _claimed_slot
+    if _claimed_slot is None:
+        return
     try:
-        pid = int(pf.read_text().strip())
-        os.kill(pid, 0)  # signal 0: check existence without sending anything
-        return True
-    except (OSError, ValueError):
-        # Process doesn't exist or pidfile is corrupt — clean up.
-        _remove_pidfile()
-        return False
+        _pidfile_for_slot(_claimed_slot).unlink(missing_ok=True)
+    except OSError:
+        pass
+    _claimed_slot = None
 
 
 def spawn_worker() -> subprocess.Popen | None:
-    """Fork a detached worker process. Returns None if one is already alive.
+    """Fork a detached worker process. Returns None if no slot is free.
 
     In remote-client mode (settings.remote) this is a no-op: an off-network
     Mac/laptop must not run the heavy pipeline locally. Work it enqueues is
     serviced by a worker resident on penticton claiming the same PENDING rows.
+
+    The free-slot check here is an optimization to avoid forking a doomed
+    child; the authoritative atomic claim happens in the child's run_worker().
     """
     if settings.remote:
         return None
-    if worker_is_running():
+    if not has_free_slot():
         return None
     return subprocess.Popen(
         [sys.executable, "-m", "embryodb.pipeline.worker"],
@@ -470,12 +552,20 @@ def _execute_command_job(
 
 
 def run_worker() -> None:
-    """Main blocking loop. Returns when the queue is empty (MAX_IDLE_LOOPS)."""
-    _write_pidfile()
-    atexit.register(_remove_pidfile)
+    """Main blocking loop. Returns when the queue is empty (MAX_IDLE_LOOPS).
+
+    Claims a free worker slot first; returns immediately if all slots on this
+    host are busy (lets up to settings.worker_max_slots workers coexist).
+    """
+    global _claimed_slot
+    slot = acquire_free_slot()
+    if slot is None:
+        return  # all slots busy — nothing to do
+    _claimed_slot = slot
+    atexit.register(_release_slot)
 
     def _handle_sigterm(*_):
-        _remove_pidfile()
+        _release_slot()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
@@ -552,8 +642,11 @@ def run_worker() -> None:
 
 
 def main() -> None:
-    if worker_is_running():
-        print("embryodb-worker: already running, exiting.", flush=True)
+    if not has_free_slot():
+        print(
+            f"embryodb-worker: all {_max_slots()} worker slot(s) busy, exiting.",
+            flush=True,
+        )
         return
     run_worker()
 

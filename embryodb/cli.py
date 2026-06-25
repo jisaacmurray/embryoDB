@@ -1703,9 +1703,9 @@ def pipeline_worker_cmd() -> None:
     rows in series order and executes them sequentially. It is crash-safe: rows
     left RUNNING with a stale heartbeat are requeued on startup.
     """
-    from .pipeline.worker import run_worker, worker_is_running
-    if worker_is_running():
-        console.print("[yellow]worker already running for this host — nothing to do[/yellow]")
+    from .pipeline.worker import run_worker, has_free_slot
+    if not has_free_slot():
+        console.print("[yellow]all worker slots busy for this host — nothing to do[/yellow]")
         return
     console.print("[green]worker starting…[/green]")
     run_worker()
@@ -2111,7 +2111,7 @@ def open_cmd(
     if not no_worker:
         from sqlalchemy import func, select
         from .models import PipelineStepRun, RunStatus
-        from .pipeline.worker import spawn_worker, worker_is_running, WORKER_STEPS
+        from .pipeline.worker import spawn_worker, WORKER_STEPS
 
         with database.session_scope() as s:
             n_pending = s.scalar(
@@ -2124,11 +2124,10 @@ def open_cmd(
             )
         console.print(f"[bold]5/5[/bold] worker: {n_pending} pending pipeline step(s)")
         if n_pending:
-            if worker_is_running():
-                console.print("    worker already running")
-            else:
-                spawn_worker()
+            if spawn_worker() is not None:
                 console.print("    [green]worker spawned[/green]")
+            else:
+                console.print("    worker slots full (or remote) — already servicing")
         else:
             console.print("    nothing pending — skipping")
     else:

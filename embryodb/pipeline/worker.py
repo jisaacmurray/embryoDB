@@ -249,6 +249,66 @@ def spawn_worker() -> subprocess.Popen | None:
 
 
 # ---------------------------------------------------------------------------
+# Memory-pressure guard
+# ---------------------------------------------------------------------------
+
+
+def _read_meminfo_kb() -> dict[str, int]:
+    """Parse /proc/meminfo into a {field: kB} dict. Empty on non-Linux/error."""
+    out: dict[str, int] = {}
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                key, _, rest = line.partition(":")
+                parts = rest.split()
+                if parts and parts[0].isdigit():
+                    out[key] = int(parts[0])
+    except OSError:
+        pass
+    return out
+
+
+def _memory_pressure_reason() -> str | None:
+    """Return a human-readable reason to back off, or None when memory is fine.
+
+    Two independent signals, either of which aborts the worker:
+      * SReclaimable above worker_slab_guard_gib — the stranded NFS
+        inode/dentry cache that OOM-killed penticton on 2026-06-26. This slab
+        is labeled reclaimable but the NFS client may not release it on demand,
+        and MemAvailable counts it as free, so it is the *only* early signal.
+      * MemFree below worker_memfree_floor_mib — truly-free RAM near zero, so
+        the next non-trivial allocation may trip the OOM killer.
+
+    A guard set to 0 is disabled. Missing /proc/meminfo (non-Linux) -> None.
+    """
+    info = _read_meminfo_kb()
+    if not info:
+        return None
+
+    slab_guard_kb = settings.worker_slab_guard_gib * 1024 * 1024
+    if slab_guard_kb > 0:
+        sreclaim = info.get("SReclaimable", 0)
+        if sreclaim > slab_guard_kb:
+            return (
+                f"SReclaimable {sreclaim / 1024 / 1024:.1f} GiB exceeds guard "
+                f"{settings.worker_slab_guard_gib:.1f} GiB (stranded NFS inode "
+                "cache?) — refusing work to avoid OOM"
+            )
+
+    memfree_floor_kb = settings.worker_memfree_floor_mib * 1024
+    if memfree_floor_kb > 0:
+        memfree = info.get("MemFree", None)
+        if memfree is not None and memfree < memfree_floor_kb:
+            return (
+                f"MemFree {memfree / 1024:.0f} MiB below floor "
+                f"{settings.worker_memfree_floor_mib:.0f} MiB — refusing work "
+                "to avoid OOM"
+            )
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Queue helpers
 # ---------------------------------------------------------------------------
 
@@ -276,6 +336,63 @@ def _reset_stale_running(session) -> int:
     if stale:
         session.flush()
     return len(stale)
+
+
+def _failed_prerequisite(session, series_id: int, step: str) -> str | None:
+    """Return the name of a FAILED worker step preceding `step`, else None.
+
+    Only worker steps are considered: a FAILED upstream worker step means the
+    inputs this step needs were never produced, so it can never run.
+    """
+    for ws in WORKER_STEPS:
+        if ws == step:
+            break
+        row = (
+            session.query(PipelineStepRun)
+            .filter_by(series_id=series_id, step=ws)
+            .one_or_none()
+        )
+        if row is not None and row.status == RunStatus.FAILED:
+            return ws
+    return None
+
+
+def _fail_orphaned_steps(session) -> int:
+    """Clear PENDING worker steps stranded behind a FAILED prerequisite.
+
+    Policy (jmurr, 2026-06-26): a failed step must not leave its downstream
+    steps queued forever. A worker step whose upstream worker step FAILED can
+    never become runnable — its inputs (the lineage / extracted signal) were
+    never produced — so it would sit PENDING indefinitely, making the queue
+    look full and hiding the real per-series status. Mark such rows FAILED so
+    they move out of the queue and the series' pipeline status reflects the
+    failure. FAILED (not SKIPPED) is deliberate: SKIPPED counts as a satisfied
+    prerequisite and would wrongly unblock the step after it. A single pass
+    clears the whole tail, since every dependent row sees the same FAILED
+    upstream. Returns the number of rows cleared.
+    """
+    pend = (
+        session.query(PipelineStepRun)
+        .filter(
+            PipelineStepRun.step.in_(WORKER_STEPS),
+            PipelineStepRun.status == RunStatus.PENDING,
+        )
+        .all()
+    )
+    cleared = 0
+    now = datetime.now(tz=timezone.utc)
+    for run in pend:
+        failed = _failed_prerequisite(session, run.series_id, run.step)
+        if failed is not None:
+            run.status = RunStatus.FAILED
+            run.started_at = None
+            run.completed_at = now
+            run.heartbeat_at = None
+            run.error_excerpt = f"not run: prerequisite {failed} failed"
+            cleared += 1
+    if cleared:
+        session.flush()
+    return cleared
 
 
 def _prerequisite_ok(session, series_id: int, step: str) -> bool:
@@ -593,6 +710,10 @@ def run_worker() -> None:
     host are busy (lets up to settings.worker_max_slots workers coexist).
     """
     global _claimed_slot
+    pressure = _memory_pressure_reason()
+    if pressure is not None:
+        print(f"embryodb-worker: {pressure}; exiting before claiming a slot.", flush=True)
+        return
     slot = acquire_free_slot()
     if slot is None:
         return  # all slots busy — nothing to do
@@ -608,6 +729,14 @@ def run_worker() -> None:
     idle_count = 0
 
     while True:
+        # Re-check between jobs: a long run (or another process) may have driven
+        # the box into slab/memory pressure since startup. Bail rather than
+        # claim the next job and risk becoming the OOM victim.
+        pressure = _memory_pressure_reason()
+        if pressure is not None:
+            print(f"embryodb-worker: {pressure}; releasing slot and exiting.", flush=True)
+            break
+
         series_obj = None
         step_name = None
         run_obj = None
@@ -621,6 +750,9 @@ def run_worker() -> None:
         with database.session_scope() as s:
             _reset_stale_running(s)
             _reset_stale_commands(s)
+            # Clear steps stranded behind a FAILED upstream so the queue
+            # reflects reality instead of holding un-runnable PENDING rows.
+            _fail_orphaned_steps(s)
             # Atomic claim: flips PENDING→RUNNING and commits on block exit so
             # the GUI (and other workers) see the row as RUNNING. Pipeline
             # steps take priority; only when none are runnable do we claim a

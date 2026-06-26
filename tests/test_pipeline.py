@@ -657,6 +657,77 @@ def test_run_measure_skipped_when_no_reporter(db_session, tmp_path):
     assert refreshed.status == RunStatus.SKIPPED
 
 
+# ---------------------------------------------------------------------------
+# Orphaned-step cleanup: a FAILED step must not strand downstream PENDING rows
+# ---------------------------------------------------------------------------
+
+
+def _add_run(session, series_id, step, status):
+    run = PipelineStepRun(series_id=series_id, step=step, status=status)
+    session.add(run)
+    session.flush()
+    return run
+
+
+def test_fail_orphaned_steps_clears_downstream_of_failed(db_session):
+    """A FAILED run_starrynite should cause its PENDING run_red_extract and
+    run_measure to be marked FAILED (not left PENDING forever), in one pass."""
+    from embryodb.pipeline.worker import _fail_orphaned_steps
+
+    series = Series(series_name="orphan_L1", status=Status.NEW)
+    db_session.add(series)
+    db_session.flush()
+    _add_run(db_session, series.id, "stage_images", RunStatus.COMPLETE)
+    _add_run(db_session, series.id, "run_starrynite", RunStatus.FAILED)
+    re = _add_run(db_session, series.id, "run_red_extract", RunStatus.PENDING)
+    me = _add_run(db_session, series.id, "run_measure", RunStatus.PENDING)
+
+    cleared = _fail_orphaned_steps(db_session)
+    assert cleared == 2
+
+    db_session.expire_all()
+    assert db_session.get(PipelineStepRun, re.id).status == RunStatus.FAILED
+    assert db_session.get(PipelineStepRun, me.id).status == RunStatus.FAILED
+    assert "run_starrynite failed" in (
+        db_session.get(PipelineStepRun, re.id).error_excerpt or ""
+    )
+
+
+def test_fail_orphaned_steps_leaves_runnable_pending(db_session):
+    """Downstream steps whose prerequisites are all terminal-OK stay PENDING —
+    only those behind a FAILED upstream are cleared."""
+    from embryodb.pipeline.worker import _fail_orphaned_steps
+
+    series = Series(series_name="healthy_L1", status=Status.NEW)
+    db_session.add(series)
+    db_session.flush()
+    _add_run(db_session, series.id, "stage_images", RunStatus.COMPLETE)
+    _add_run(db_session, series.id, "run_starrynite", RunStatus.COMPLETE)
+    re = _add_run(db_session, series.id, "run_red_extract", RunStatus.PENDING)
+
+    assert _fail_orphaned_steps(db_session) == 0
+    db_session.expire_all()
+    assert db_session.get(PipelineStepRun, re.id).status == RunStatus.PENDING
+
+
+def test_fail_orphaned_steps_ignores_pending_upstream(db_session):
+    """A still-PENDING (not yet failed) upstream must not trigger a cascade —
+    the downstream is simply not yet runnable, not orphaned."""
+    from embryodb.pipeline.worker import _fail_orphaned_steps
+
+    series = Series(series_name="inflight_L1", status=Status.NEW)
+    db_session.add(series)
+    db_session.flush()
+    _add_run(db_session, series.id, "stage_images", RunStatus.COMPLETE)
+    sn = _add_run(db_session, series.id, "run_starrynite", RunStatus.PENDING)
+    re = _add_run(db_session, series.id, "run_red_extract", RunStatus.PENDING)
+
+    assert _fail_orphaned_steps(db_session) == 0
+    db_session.expire_all()
+    assert db_session.get(PipelineStepRun, sn.id).status == RunStatus.PENDING
+    assert db_session.get(PipelineStepRun, re.id).status == RunStatus.PENDING
+
+
 def test_step_run_starrynite_complete_on_success(db_session, tmp_path, monkeypatch):
     """run_starrynite marks the run COMPLETE when the subprocess exits 0."""
     import subprocess as _sp

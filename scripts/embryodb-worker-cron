@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+#
+# embryodb-worker-cron — cron entry point for the embryoDB pipeline worker.
+#
+# Wraps `embryodb-worker` so the */2 cron tick is safe and self-limiting:
+#
+#   1. Sources /etc/embryodb/worker.env (DB URL + LD_LIBRARY_PATH for the legacy
+#      StarryNite tracer's libtiff.so.3 — see that file's comment).
+#   2. Tries to grab a per-slot flock (slots 0..N-1, N = EMBRYODB_WORKER_MAX_SLOTS,
+#      default 3) with `flock -n`. The first free lock is held for the worker's
+#      whole lifetime; if every slot lock is taken the tick exits 0 without
+#      spawning anything.
+#
+# Why flock when the worker already has O_EXCL slot pidfiles: it caps concurrency
+# at the SHELL layer, BEFORE launching a Python interpreter that imports the
+# package from the NFS mount. Under the 2026-06-26 OOM, ticks were stacking up
+# faster than doomed workers could exit; this fails them fast and cheap. Using N
+# per-slot locks (not one global lock) preserves the worker_max_slots parallelism
+# that keeps a single wedged StarryNite job from freezing the whole queue.
+#
+# Output (the worker's stdout/stderr) is appended to /var/log/embryodb-worker.log
+# by the cron line itself.
+
+set -euo pipefail
+
+ENV_FILE="${EMBRYODB_WORKER_ENV:-/etc/embryodb/worker.env}"
+if [[ -r "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+fi
+
+WORKER_BIN="${EMBRYODB_WORKER_BIN:-/home/jmurr/anaconda3/bin/embryodb-worker}"
+LOCK_DIR="${EMBRYODB_WORKER_PIDFILE_DIR:-/tmp}"
+MAX_SLOTS="${EMBRYODB_WORKER_MAX_SLOTS:-3}"
+
+# `flock -n -E <code>` exits with <code> when the lock is BUSY, and otherwise
+# propagates the worker's own exit status. We use that to tell "slot taken, try
+# the next one" apart from "worker ran and exited (done, whatever its rc)".
+CONFLICT_RC=75
+
+# Try each slot lock in turn; run the worker under the first free one.
+for ((slot = 0; slot < MAX_SLOTS; slot++)); do
+    lock="${LOCK_DIR}/embryodb-worker-cron-${slot}.lock"
+    set +e
+    flock -n -E "$CONFLICT_RC" "$lock" -c "exec '$WORKER_BIN'"
+    rc=$?
+    set -e
+    if [[ "$rc" -ne "$CONFLICT_RC" ]]; then
+        # Acquired this slot and ran the worker; rc is the worker's exit code.
+        exit "$rc"
+    fi
+    # Slot busy — try the next one.
+done
+
+# All slot locks busy — nothing to do this tick.
+exit 0

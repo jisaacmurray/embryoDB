@@ -5,6 +5,23 @@ lineage metadata DB) plus its `Stellaris_tif_pipeline*.pl` import pipeline.
 This document is for AI assistants picking up the project. Live state is
 the code; this is a map.
 
+> **⚠️ NEVER recursively walk `/murrlab`, `/murrlab2`, `/murrlab3` (agents
+> AND code).** These NFS mounts hold embryoDB's image tree: **every** embryo
+> directory contains *tens of thousands* of TIFF files, and there are
+> *thousands* of embryos. A recursive enumeration over a mount root — `find`,
+> `ls -R`, `du`, `glob('**')`, `rglob`, `os.walk`, `pathlib` recursion, a
+> Snakemake input-glob, or even `cd`-ing into such a tree so a tool indexes it —
+> caches one NFS inode + dentry per entry. Over the full tree that is tens of
+> millions of kernel slab objects which the NFS client will **not** release on
+> demand, and it OOM-killed `penticton` on 2026-06-26 (zero swap → hard kill,
+> required a reboot). Rules: (1) **discover files via the Postgres DB, never the
+> filesystem.** (2) If you must walk, root it at the **narrowest** known subtree
+> (a single series' `tif/`), never a `/murrlab*` mount point or a user's
+> `images/` dir, and process/stat in bounded batches. (3) Launch `claude` /
+> `embryodb` from a small **local** dir and pass NFS paths as arguments — never
+> start a tool *inside* a million-file NFS tree. (4) When reviewing a diff,
+> reject any new unbounded recursive traversal rooted on these mounts.
+>
 > **Commit cadence (agents, please read).** Commit at regular intervals —
 > after each self-contained, test-green unit of work (a fix, a feature, a
 > doc pass), not in one giant batch at the end of a session. Concretely:

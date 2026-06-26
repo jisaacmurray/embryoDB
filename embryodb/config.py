@@ -97,6 +97,25 @@ class Settings(BaseSettings):
             "wedged job from freezing the whole queue (EMBRYODB_WORKER_MAX_SLOTS)."
         ),
     )
+    worker_slab_guard_gib: float = Field(
+        default=30.0,
+        description=(
+            "Refuse to start (or continue) a worker when /proc/meminfo "
+            "SReclaimable exceeds this many GiB. Tens of GiB of reclaimable "
+            "slab is the stranded-NFS-inode-cache signature that OOM-killed "
+            "penticton on 2026-06-26; the worker bails rather than become the "
+            "next OOM victim. 0 disables the guard (EMBRYODB_WORKER_SLAB_GUARD_GIB)."
+        ),
+    )
+    worker_memfree_floor_mib: float = Field(
+        default=512.0,
+        description=(
+            "Refuse to start (or continue) a worker when /proc/meminfo MemFree "
+            "drops below this many MiB. Truly-free memory near zero means the "
+            "next allocation may OOM. Pairs with worker_slab_guard_gib; either "
+            "tripping aborts the worker. 0 disables (EMBRYODB_WORKER_MEMFREE_FLOOR_MIB)."
+        ),
+    )
     starrynite_max_seconds: int = Field(
         default=21_600,  # 6 hours
         description=(

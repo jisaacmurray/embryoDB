@@ -117,3 +117,57 @@ def _a_dead_pid() -> int:
         if not w._pid_is_alive(candidate):
             return candidate
     raise RuntimeError("could not find a dead pid for the test")
+
+
+# ---------------------------------------------------------------------------
+# Memory-pressure guard (added after the 2026-06-26 penticton OOM)
+# ---------------------------------------------------------------------------
+
+
+def test_memory_guard_ok_when_healthy(monkeypatch):
+    monkeypatch.setattr(w.settings, "worker_slab_guard_gib", 30.0)
+    monkeypatch.setattr(w.settings, "worker_memfree_floor_mib", 512.0)
+    monkeypatch.setattr(
+        w, "_read_meminfo_kb",
+        lambda: {"MemFree": 8 * 1024 * 1024, "SReclaimable": 2 * 1024 * 1024},
+    )
+    assert w._memory_pressure_reason() is None
+
+
+def test_memory_guard_trips_on_huge_slab(monkeypatch):
+    monkeypatch.setattr(w.settings, "worker_slab_guard_gib", 30.0)
+    monkeypatch.setattr(w.settings, "worker_memfree_floor_mib", 512.0)
+    # 64 GiB SReclaimable — the stranded-NFS-inode signature from the incident.
+    monkeypatch.setattr(
+        w, "_read_meminfo_kb",
+        lambda: {"MemFree": 8 * 1024 * 1024, "SReclaimable": 64 * 1024 * 1024},
+    )
+    reason = w._memory_pressure_reason()
+    assert reason is not None and "SReclaimable" in reason
+
+
+def test_memory_guard_trips_on_low_memfree(monkeypatch):
+    monkeypatch.setattr(w.settings, "worker_slab_guard_gib", 30.0)
+    monkeypatch.setattr(w.settings, "worker_memfree_floor_mib", 512.0)
+    # 325 MiB free — what `free -h` showed during the incident.
+    monkeypatch.setattr(
+        w, "_read_meminfo_kb",
+        lambda: {"MemFree": 325 * 1024, "SReclaimable": 1 * 1024 * 1024},
+    )
+    reason = w._memory_pressure_reason()
+    assert reason is not None and "MemFree" in reason
+
+
+def test_memory_guard_disabled_with_zero_thresholds(monkeypatch):
+    monkeypatch.setattr(w.settings, "worker_slab_guard_gib", 0.0)
+    monkeypatch.setattr(w.settings, "worker_memfree_floor_mib", 0.0)
+    monkeypatch.setattr(
+        w, "_read_meminfo_kb",
+        lambda: {"MemFree": 1, "SReclaimable": 999 * 1024 * 1024},
+    )
+    assert w._memory_pressure_reason() is None
+
+
+def test_memory_guard_none_when_meminfo_unavailable(monkeypatch):
+    monkeypatch.setattr(w, "_read_meminfo_kb", lambda: {})
+    assert w._memory_pressure_reason() is None

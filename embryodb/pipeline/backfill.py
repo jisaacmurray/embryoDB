@@ -81,6 +81,71 @@ def _step_status_for(image_loc: Path, step: str) -> RunStatus:
     return RunStatus.PENDING
 
 
+# Marker recorded on a synthetic stage_images row for series that predate the
+# new staging pipeline (the old XML EmbryoDB, retired ~2026-05). Their images
+# are already on disk but were never run through step_stage_images, so they
+# carry no stage_images PipelineStepRun at all.
+_LEGACY_STAGING_NOTE = (
+    "legacy import: series predates the new staging pipeline (~2026-05); "
+    "images came from the old XML EmbryoDB, so there is no staging record. "
+    "Marked SKIPPED so downstream worker steps are not blocked by a missing "
+    "prerequisite."
+)
+
+
+def backfill_legacy_staging(
+    session: Session,
+    series_names: list[str] | None = None,
+) -> list[str]:
+    """Record a SKIPPED ``stage_images`` row for legacy series that have none.
+
+    Series imported from the old XML EmbryoDB (before the new staging pipeline)
+    have their images on disk but were never run through ``step_stage_images``,
+    so they carry no ``stage_images`` PipelineStepRun. A *missing* worker-step
+    row blocks :func:`worker._prerequisite_ok`, so an enqueued ``run_starrynite``
+    on such a series can never be claimed — and the bare absence is easily
+    mistaken for a malformed enqueue. This writes an explicit terminal marker
+    (SKIPPED + ``output_summary['legacy'] = True``) so the staging step reads as
+    "intentionally not run for a legacy import" rather than "pending/failed",
+    and downstream steps become claimable.
+
+    Purely DB-side: it does **not** touch the filesystem (no NFS walk). A series
+    is treated as legacy iff it has no ``stage_images`` row; soft-deleted series
+    are skipped. Idempotent — a series already carrying any ``stage_images`` row
+    is left untouched. Returns the names of the series newly marked.
+    """
+    q = select(Series).where(Series.deleted_at.is_(None))
+    if series_names is not None:
+        q = q.where(Series.series_name.in_(series_names))
+
+    marked: list[str] = []
+    now = datetime.now(tz=timezone.utc)
+    for series in session.execute(q).scalars():
+        existing = session.execute(
+            select(PipelineStepRun).where(
+                PipelineStepRun.series_id == series.id,
+                PipelineStepRun.step == "stage_images",
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            continue
+        session.add(
+            PipelineStepRun(
+                series_id=series.id,
+                step="stage_images",
+                status=RunStatus.SKIPPED,
+                completed_at=now,
+                error_excerpt=_LEGACY_STAGING_NOTE,
+                output_summary={"legacy": True, "marked_by": "backfill_legacy_staging"},
+            )
+        )
+        marked.append(series.series_name)
+
+    if marked:
+        session.flush()
+    return marked
+
+
 @dataclass
 class BackfillReport:
     acquisitions_created: list[str] = field(default_factory=list)

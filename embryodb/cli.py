@@ -1695,6 +1695,49 @@ def pipeline_import_lif_cmd(
             console.print("[green]worker started[/green] for StarryNite/extract/measure")
 
 
+@pipeline_app.command("mark-legacy")
+def pipeline_mark_legacy_cmd(
+    series: Annotated[
+        list[str] | None,
+        typer.Argument(help="Series names to mark (omit, or pass --all, for every legacy series)"),
+    ] = None,
+    all_series: Annotated[
+        bool,
+        typer.Option("--all", help="Mark every legacy series in the DB."),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Report how many would be marked without writing."),
+    ] = False,
+) -> None:
+    """Record a SKIPPED ``stage_images`` row for legacy series that have none.
+
+    Series imported from the old XML EmbryoDB (pre ~2026-05) have images on
+    disk but never went through the new staging step, so they carry no
+    ``stage_images`` row — which blocks any enqueued ``run_starrynite`` and is
+    easy to mistake for a broken enqueue. This backfills an explicit
+    "legacy, not staged" marker so the queue logic and the GUI read it
+    correctly. DB-only; no filesystem scan.
+    """
+    from .pipeline.backfill import backfill_legacy_staging
+
+    if not series and not all_series:
+        console.print("[red]pass series names or --all[/red]")
+        raise typer.Exit(1)
+    names = list(series) if series else None
+
+    with database.session_scope() as session:
+        if dry_run:
+            session.begin_nested()
+            marked = backfill_legacy_staging(session, series_names=names)
+            session.rollback()
+            console.print(f"[cyan]dry-run:[/cyan] would mark {len(marked)} legacy series")
+            return
+        marked = backfill_legacy_staging(session, series_names=names)
+
+    console.print(f"[green]marked[/green] {len(marked)} legacy series (stage_images → SKIPPED)")
+
+
 @pipeline_app.command("worker")
 def pipeline_worker_cmd() -> None:
     """Start the per-machine background worker (exits when queue is empty).

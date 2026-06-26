@@ -728,6 +728,78 @@ def test_fail_orphaned_steps_ignores_pending_upstream(db_session):
     assert db_session.get(PipelineStepRun, re.id).status == RunStatus.PENDING
 
 
+# ---------------------------------------------------------------------------
+# Legacy staging backfill: pre-pipeline series get an explicit SKIPPED marker
+# ---------------------------------------------------------------------------
+
+
+def test_backfill_legacy_staging_marks_series_without_stage_images(db_session):
+    """A legacy series (no stage_images row) gets a SKIPPED stage_images row
+    flagged legacy, which then satisfies the run_starrynite prerequisite."""
+    from sqlalchemy import select
+    from embryodb.pipeline.backfill import backfill_legacy_staging
+    from embryodb.pipeline.worker import _prerequisite_ok
+
+    series = Series(series_name="legacy_L1", status=Status.NEW)
+    db_session.add(series)
+    db_session.flush()
+    # Legacy: only an enqueued run_starrynite, no stage_images row at all.
+    _add_run(db_session, series.id, "run_starrynite", RunStatus.PENDING)
+    assert not _prerequisite_ok(db_session, series.id, "run_starrynite")
+
+    marked = backfill_legacy_staging(db_session)
+    assert marked == ["legacy_L1"]
+
+    db_session.expire_all()
+    row = db_session.execute(
+        select(PipelineStepRun).where(
+            PipelineStepRun.series_id == series.id,
+            PipelineStepRun.step == "stage_images",
+        )
+    ).scalar_one()
+    assert row.status == RunStatus.SKIPPED
+    assert row.output_summary.get("legacy") is True
+    # run_starrynite is now claimable.
+    assert _prerequisite_ok(db_session, series.id, "run_starrynite")
+
+
+def test_backfill_legacy_staging_is_idempotent_and_skips_existing(db_session):
+    """A series that already has any stage_images row is left untouched."""
+    from sqlalchemy import select
+    from embryodb.pipeline.backfill import backfill_legacy_staging
+
+    series = Series(series_name="staged_L1", status=Status.NEW)
+    db_session.add(series)
+    db_session.flush()
+    _add_run(db_session, series.id, "stage_images", RunStatus.COMPLETE)
+
+    assert backfill_legacy_staging(db_session) == []
+    db_session.expire_all()
+    row = db_session.execute(
+        select(PipelineStepRun).where(
+            PipelineStepRun.series_id == series.id,
+            PipelineStepRun.step == "stage_images",
+        )
+    ).scalar_one()
+    assert row.status == RunStatus.COMPLETE  # unchanged
+
+
+def test_backfill_legacy_staging_skips_deleted(db_session):
+    """Soft-deleted series are not marked."""
+    from datetime import datetime, timezone
+    from embryodb.pipeline.backfill import backfill_legacy_staging
+
+    series = Series(
+        series_name="gone_L1",
+        status=Status.NEW,
+        deleted_at=datetime.now(tz=timezone.utc),
+    )
+    db_session.add(series)
+    db_session.flush()
+
+    assert backfill_legacy_staging(db_session) == []
+
+
 def test_step_run_starrynite_complete_on_success(db_session, tmp_path, monkeypatch):
     """run_starrynite marks the run COMPLETE when the subprocess exits 0."""
     import subprocess as _sp

@@ -286,6 +286,18 @@ def import_lif(
     if channel_role_override:
         channel_map.update(channel_role_override)
 
+    # histone and reporter each stage into a single fixed dir (tif/ resp.
+    # tifR/), so at most one channel may hold each — two would overwrite/
+    # interleave on disk. Reject before any extraction runs.
+    for role in ("histone", "reporter"):
+        dup = sorted(ch for ch, r in channel_map.items() if r == role)
+        if len(dup) > 1:
+            raise ValueError(
+                f"channel role {role!r} assigned to multiple channels "
+                f"{dup}; it stages into a single directory, so only one "
+                f"channel may hold it (reassign the rest to 'extra')"
+            )
+
     # Acquisition stem: caller-supplied or derived from the LIF filename.
     stem = acquisition_name or Path(lif_path).stem
     # We store stem on Acquisition.name so re-runs are idempotent on the

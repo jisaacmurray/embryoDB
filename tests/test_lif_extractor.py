@@ -495,6 +495,47 @@ def test_import_lif_single_channel_override_still_wins(
     assert not (l1 / "tif").exists()
 
 
+def test_import_lif_rejects_two_histone_channels(
+    install_fake_lif, db_session, seeded_protocols, tmp_path
+):
+    """Two channels assigned the histone role would both stage into tif/ and
+    collide, so the import must refuse rather than corrupt the data."""
+    from sqlalchemy import select
+
+    from embryodb.lif.import_flow import import_lif
+    from embryodb.models import Protocol
+    from embryodb.pipeline.orchestrate import ImportOptions
+
+    install_fake_lif(
+        series_specs=[("TileScan 1", ["Position 1"])],
+        n_channels=3,
+        bit_depth=(8, 8, 8),
+    )
+    proto = db_session.execute(
+        select(Protocol).where(Protocol.name == "Stellaris_JIM113")
+    ).scalar_one()
+
+    opts = ImportOptions(
+        image_loc_root=tmp_path / "images",
+        alias_root=None,
+        user="testuser",
+        run_through_step="write_matlab_params",
+    )
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+
+    with pytest.raises(ValueError, match="histone"):
+        import_lif(
+            db_session,
+            lif_path=tmp_path / "JIM593.lif",
+            series_name="TileScan 1",
+            protocol=proto,
+            options=opts,
+            legacy_xml_dir=legacy_dir,
+            channel_role_override={1: "histone", 2: "histone"},
+        )
+
+
 # ---------------------------------------------------------------------------
 # Extra-timepoint append ("<series>_t<N>" siblings)
 # ---------------------------------------------------------------------------

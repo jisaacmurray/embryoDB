@@ -26,6 +26,10 @@ from ..identity import current_user, known_persons, system_users, user_has_image
 # Roles the user can assign per channel. role_subdir() maps histone→tif/,
 # reporter→tifR/, anything else→tifC<n>/.
 _ROLES = ["histone", "reporter", "extra"]
+# Roles that stage into a single fixed dir (tif/ resp. tifR/), so at most one
+# channel may hold each — two would collide on disk. ``extra`` is exempt
+# (each lands in its own tifC<n>/).
+_EXCLUSIVE_ROLES = ("histone", "reporter")
 
 _PLANES_RE = re.compile(r":\s*(\d+)\s*/\s*(\d+)\s*planes")
 
@@ -400,14 +404,19 @@ class LifImportDialog(QtWidgets.QDialog):
         self._apply_protocol_roles()
 
     def _apply_protocol_roles(self) -> None:
-        """Pre-fill each channel's role dropdown from the protocol's map."""
+        """Pre-fill each channel's role dropdown from the protocol's map.
+
+        A channel the protocol does not map (e.g. a Trans-PMT/DIC channel)
+        must default to ``extra``, never to the combo's index-0 ``histone``:
+        two histone channels would both stage into ``tif/`` and collide.
+        """
         channel_map = self._protocol_combo.currentData() or {}
         for raw_idx, combo in self._channel_combos.items():
             role = channel_map.get(str(raw_idx))
             if role in _ROLES:
                 combo.setCurrentText(role)
-            elif role:
-                # Unknown role string → treat as extra.
+            else:
+                # Unmapped or unknown role string → treat as extra.
                 combo.setCurrentText("extra")
 
     def _update_launch_enabled(self) -> None:
@@ -433,6 +442,31 @@ class LifImportDialog(QtWidgets.QDialog):
             raw_idx: combo.currentText()
             for raw_idx, combo in self._channel_combos.items()
         }
+        # histone/reporter are exclusive: each stages into a single dir
+        # (tif/ resp. tifR/), so assigning two channels the same one would
+        # collide on disk. Block it before any extraction runs.
+        dupes = [
+            role
+            for role in _EXCLUSIVE_ROLES
+            if list(channel_roles.values()).count(role) > 1
+        ]
+        if dupes:
+            chans = {
+                role: [i for i, r in sorted(channel_roles.items()) if r == role]
+                for role in dupes
+            }
+            detail = "; ".join(
+                f"{role} → raw_ch {', '.join(map(str, idxs))}"
+                for role, idxs in chans.items()
+            )
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Duplicate channel role",
+                f"Each of histone/reporter may be assigned to only one "
+                f"channel ({detail}). Reassign the extra channel(s) to "
+                f"'extra' before launching.",
+            )
+            return
         # Confirm — extraction is long and irreversible-ish (writes lots of
         # files). Surface the channel mapping + any appended movies one more time.
         mapping = "\n".join(

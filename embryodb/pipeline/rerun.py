@@ -26,6 +26,14 @@ from .worker import WORKER_STEPS
 
 _STEP_ORDER = {s: i for i, s in enumerate(WORKER_STEPS)}
 
+# stage_images re-extracts every TIFF from the raw acquisition — slow, and it
+# rewrites the staged tree the later steps read. The overwhelmingly common
+# rerun is re-tracing/quantitating already-staged images, so stage_images is
+# NEVER selected by default; the user must opt in explicitly. (A FAILED
+# stage_images row whose images are in fact on disk would otherwise drag the
+# default selection back to a needless restage — and block run_starrynite.)
+_NEVER_DEFAULT_STEPS = frozenset({"stage_images"})
+
 
 def reset_step(session, series_id: int, step: str) -> None:
     """Set one worker step back to PENDING for a series (create row if absent)."""
@@ -58,7 +66,11 @@ def earliest_incomplete_step(runs_by_step: dict[str, RunStatus]) -> str | None:
 def default_steps(series_runs: list[dict[str, RunStatus]]) -> list[str]:
     """Default step selection: the earliest incomplete step across all the
     given series, plus everything downstream of it. If every series has all
-    worker steps complete, default to all worker steps (explicit redo)."""
+    worker steps complete, default to all worker steps (explicit redo).
+
+    ``stage_images`` is always dropped from the default (see
+    :data:`_NEVER_DEFAULT_STEPS`); a rerun that genuinely needs to restage
+    must select it explicitly."""
     earliest_idx: int | None = None
     for runs in series_runs:
         step = earliest_incomplete_step(runs)
@@ -67,8 +79,10 @@ def default_steps(series_runs: list[dict[str, RunStatus]]) -> list[str]:
             if earliest_idx is None or idx < earliest_idx:
                 earliest_idx = idx
     if earliest_idx is None:
-        return list(WORKER_STEPS)
-    return [s for s in WORKER_STEPS if _STEP_ORDER[s] >= earliest_idx]
+        candidates = list(WORKER_STEPS)
+    else:
+        candidates = [s for s in WORKER_STEPS if _STEP_ORDER[s] >= earliest_idx]
+    return [s for s in candidates if s not in _NEVER_DEFAULT_STEPS]
 
 
 def refresh_matlab_params(

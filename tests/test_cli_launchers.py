@@ -143,12 +143,33 @@ def test_default_steps_and_earliest_helpers():
          "run_starrynite": RunStatus.COMPLETE,
          "run_red_extract": RunStatus.PENDING}
     ) == "run_red_extract"
-    # all complete → default to all worker steps
+    # all complete → default to every worker step EXCEPT stage_images (an
+    # explicit redo of the analysis, never a restage)
     allc = {s: RunStatus.COMPLETE for s in
             ("stage_images", "run_starrynite", "run_red_extract", "run_measure")}
     assert default_steps([allc]) == [
-        "stage_images", "run_starrynite", "run_red_extract", "run_measure"
+        "run_starrynite", "run_red_extract", "run_measure"
     ]
+
+
+def test_default_steps_never_includes_stage_images():
+    """stage_images must never be selected by default, even when it is the
+    earliest incomplete step (e.g. a FAILED restage whose TIFFs are already on
+    disk). The default falls through to run_starrynite + downstream."""
+    # stage_images FAILED, everything else untouched → default starts at
+    # run_starrynite, not stage_images.
+    runs = {
+        "stage_images": RunStatus.FAILED,
+        "run_starrynite": RunStatus.PENDING,
+        "run_red_extract": RunStatus.PENDING,
+        "run_measure": RunStatus.PENDING,
+    }
+    steps = default_steps([runs])
+    assert "stage_images" not in steps
+    assert steps == ["run_starrynite", "run_red_extract", "run_measure"]
+
+    # Also when nothing has run yet (all rows absent): still no stage_images.
+    assert "stage_images" not in default_steps([{}])
 
 
 # --- CLI plumbing -----------------------------------------------------------

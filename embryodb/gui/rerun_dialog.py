@@ -27,17 +27,26 @@ from qtpy import QtCore, QtWidgets
 
 from ..parsers.matlab_params import TUNABLE_KEYS, load as load_params
 from ..pipeline.rerun import (
-    _STEP_ORDER,
-    earliest_incomplete_step as _earliest_incomplete_step,
+    default_steps as _default_steps,
     refresh_matlab_params,
     reset_step as _reset_one_step,
 )
 from ..pipeline.worker import WORKER_STEPS, spawn_worker
 
 _STEP_LABEL = {
+    "stage_images": "Stage images (re-extract TIFFs from raw acquisition)",
     "run_starrynite": "StarryNite (cell detection + tracking)",
     "run_red_extract": "Red Extract (reporter signal)",
     "run_measure": "Measure (morphometry)",
+}
+
+_STEP_TOOLTIP = {
+    "stage_images": (
+        "Off by default. Re-copies every raw TIFF into the staged tree — slow, "
+        "and only needed if the staged images are missing or corrupt. The usual "
+        "rerun re-traces already-staged images, so leave this unchecked unless "
+        "you specifically need to restage."
+    ),
 }
 
 
@@ -90,19 +99,10 @@ class RerunPipelineDialog(QtWidgets.QDialog):
                 })
 
     def _default_checked_steps(self) -> set[str]:
-        """Pick default-checked steps: the earliest incomplete step across all
-        series, plus everything downstream of it. If all series have all worker
-        steps complete, default to checking all three (user explicitly redoing)."""
-        earliest_idx = None
-        for sd in self._series_data:
-            step = _earliest_incomplete_step(sd["runs"])
-            if step is not None:
-                idx = _STEP_ORDER[step]
-                if earliest_idx is None or idx < earliest_idx:
-                    earliest_idx = idx
-        if earliest_idx is None:
-            return set(WORKER_STEPS)
-        return {s for s in WORKER_STEPS if _STEP_ORDER[s] >= earliest_idx}
+        """Default-checked steps, via the shared core so CLI and GUI agree:
+        the earliest incomplete step across all series plus everything
+        downstream, minus ``stage_images`` (never checked by default)."""
+        return set(_default_steps([sd["runs"] for sd in self._series_data]))
 
     # --- UI -----------------------------------------------------------------
 
@@ -139,6 +139,8 @@ class RerunPipelineDialog(QtWidgets.QDialog):
         for step in WORKER_STEPS:
             cb = QtWidgets.QCheckBox(_STEP_LABEL.get(step, step))
             cb.setChecked(step in default_steps)
+            if step in _STEP_TOOLTIP:
+                cb.setToolTip(_STEP_TOOLTIP[step])
             self._step_checks[step] = cb
             steps_vl.addWidget(cb)
         layout.addWidget(steps_box)

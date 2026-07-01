@@ -295,3 +295,20 @@ def test_cli_launch_acetree_py_unknown_series(fresh_db):
 def test_cli_jobs_empty(fresh_db):
     res = runner.invoke(cli.app, ["jobs"])
     assert res.exit_code == 0
+
+
+def test_cli_dataset_list_shows_member_count(fresh_db):
+    # Regression: the size column reads len(ds.series), a lazy relationship.
+    # Building the table outside the session raised DetachedInstanceError and
+    # crashed the whole command (grep saw nothing).
+    from embryodb.queries import datasets as q_datasets
+
+    with database.session_scope() as s:
+        s.add_all([Series(series_name="a_L1"), Series(series_name="b_L1")])
+        s.flush()
+        q_datasets.create(s, "wt_ref", description="WT", series_names=["a_L1", "b_L1"])
+
+    res = runner.invoke(cli.app, ["dataset", "list"])
+    assert res.exit_code == 0, res.output
+    assert "wt_ref" in res.output
+    assert "2" in res.output

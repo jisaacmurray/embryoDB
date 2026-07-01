@@ -853,11 +853,11 @@ def ds_create(
 def ds_list() -> None:
     with database.session_scope() as session:
         rows = q_datasets.list_datasets(session)
-    table = Table(title=f"datasets ({len(rows)})")
-    for col in ("name", "size", "description"):
-        table.add_column(col)
-    for r in rows:
-        table.add_row(r.name, str(len(r.series)), r.description)
+        table = Table(title=f"datasets ({len(rows)})")
+        for col in ("name", "size", "description"):
+            table.add_column(col)
+        for r in rows:
+            table.add_row(r.name, str(len(r.series)), r.description)
     console.print(table)
 
 

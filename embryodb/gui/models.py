@@ -126,6 +126,11 @@ class SeriesTableModel(QtCore.QAbstractTableModel):
     def __init__(self, parent: QtCore.QObject | None = None) -> None:
         super().__init__(parent)
         self._rows: list[dict[str, object]] = []
+        # Remember the user's chosen sort so a periodic refresh() (which
+        # re-queries in DB order) can re-apply it — otherwise the live
+        # pipeline poll silently resets the sort every few seconds.
+        self._sort_column: int | None = None
+        self._sort_order: int = QtCore.Qt.AscendingOrder
 
     # --- public API ------------------------------------------------------
 
@@ -159,6 +164,7 @@ class SeriesTableModel(QtCore.QAbstractTableModel):
             {**self._row_to_dict(r), "pipeline_summary": _summarize_runs(runs_by_series.get(r.id, []))}
             for r in rows
         ]
+        self._apply_sort()
         self.endResetModel()
 
     def row_at(self, row: int) -> dict[str, object] | None:
@@ -169,6 +175,12 @@ class SeriesTableModel(QtCore.QAbstractTableModel):
     def series_name_at(self, row: int) -> str | None:
         r = self.row_at(row)
         return r["series_name"] if r else None  # type: ignore[return-value]
+
+    def row_for_series(self, name: str) -> int | None:
+        for i, r in enumerate(self._rows):
+            if r.get("series_name") == name:
+                return i
+        return None
 
     # --- QAbstractTableModel ---------------------------------------------
 
@@ -205,14 +217,28 @@ class SeriesTableModel(QtCore.QAbstractTableModel):
     def sort(self, column: int, order: int) -> None:
         if not (0 <= column < len(COLUMNS)):
             return
-        attr = COLUMNS[column][0]
-        reverse = order == QtCore.Qt.DescendingOrder
+        self._sort_column = column
+        self._sort_order = order
         self.beginResetModel()
+        self._apply_sort()
+        self.endResetModel()
+
+    def _apply_sort(self) -> None:
+        """Sort `self._rows` in place by the remembered column/order.
+
+        No-op until the user has picked a sort. Called both from `sort()`
+        (user click) and `refresh()` (so a periodic re-query keeps the
+        user's chosen order instead of reverting to DB order). Caller owns
+        the beginResetModel/endResetModel bracket.
+        """
+        if self._sort_column is None:
+            return
+        attr = COLUMNS[self._sort_column][0]
+        reverse = self._sort_order == QtCore.Qt.DescendingOrder
         self._rows.sort(
             key=lambda r: ("" if r.get(attr) is None else self._render(r[attr]).lower()),
             reverse=reverse,
         )
-        self.endResetModel()
 
     # --- helpers ---------------------------------------------------------
 

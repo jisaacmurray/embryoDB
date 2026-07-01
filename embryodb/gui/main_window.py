@@ -213,9 +213,42 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_row_count()
 
     def _refresh_table(self) -> None:
+        selected_name = self._selected_series_name()
         with self._session_cm() as session:
             self._model.refresh(session, self._current_filters())
+        self._reselect_series(selected_name)
         self._update_row_count()
+
+    def _selected_series_name(self) -> str | None:
+        idx = self._table.selectionModel().currentIndex()
+        if idx.isValid():
+            return self._model.series_name_at(idx.row())
+        return None
+
+    def _reselect_series(self, name: str | None) -> None:
+        """Restore the current-row highlight to `name` after a model refresh.
+
+        A `refresh()` resets the model, which clears the selection; without
+        this the periodic pipeline poll drops the user's selected row every
+        few seconds. Signals are blocked because the same series is already
+        loaded in the detail panel — no need to re-trigger the load / unsaved
+        guard. If the series fell out of the filtered set, we simply leave the
+        selection empty.
+        """
+        if not name:
+            return
+        row = self._model.row_for_series(name)
+        if row is None:
+            return
+        sel = self._table.selectionModel()
+        sel.blockSignals(True)
+        try:
+            sel.setCurrentIndex(
+                self._model.index(row, 0),
+                QtCore.QItemSelectionModel.ClearAndSelect | QtCore.QItemSelectionModel.Rows,
+            )
+        finally:
+            sel.blockSignals(False)
 
     def _apply_default_column_widths(self) -> None:
         """Initial column widths tuned for typical lab data.

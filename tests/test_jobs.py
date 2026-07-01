@@ -16,8 +16,12 @@ import os
 import time
 from datetime import datetime, timedelta
 
+import pytest
+
 from embryodb import external_tools
 from embryodb.jobs import (
+    CancelError,
+    cancel_job,
     discover_jobs,
     discover_pipeline_jobs,
     list_jobs,
@@ -243,3 +247,90 @@ def test_discover_pipeline_jobs_no_session_in_list(tmp_path, monkeypatch):
     rows = list_jobs(None)
     assert len(rows) == 1
     assert rows[0].source == "detached"
+
+
+# ---------------------------------------------------------------------------
+# Cancelling queued jobs
+# ---------------------------------------------------------------------------
+
+
+def _seed_command(session, kind="extract", status="pending", **kw):
+    from embryodb.models import CommandJob, RunStatus
+
+    job = CommandJob(
+        kind=kind, params={"series_names": ["seriesX"]}, status=RunStatus(status), **kw
+    )
+    session.add(job)
+    session.flush()
+    return job
+
+
+def test_cancel_queued_pipeline_step_marks_failed_with_marker(db_session):
+    from embryodb import database
+    from embryodb.models import PipelineStepRun, RunStatus
+
+    run = _seed_run(db_session, "seriesX", "run_starrynite", "pending")
+    run_id = run.id
+    db_session.commit()
+
+    assert cancel_job(database.session_scope, "pipeline", run_id, user="tester") is True
+
+    with database.session_scope() as s:
+        row = s.get(PipelineStepRun, run_id)
+        # FAILED (not SKIPPED) so a dependent step isn't wrongly unblocked.
+        assert row.status == RunStatus.FAILED
+        assert row.output_summary.get("cancelled_by") == "tester"
+        assert row.started_at is None
+    # The panel surfaces the intent, not the raw FAILED status.
+    (job,) = discover_pipeline_jobs(database.session_scope, since=None)
+    assert job.status_label == "cancelled"
+    assert job.cancelable is False  # terminal now
+
+
+def test_cancel_queued_command_job_marks_skipped(db_session):
+    from embryodb import database
+    from embryodb.models import CommandJob, RunStatus
+
+    job = _seed_command(db_session, status="pending")
+    job_id = job.id
+    db_session.commit()
+
+    assert cancel_job(database.session_scope, "command", job_id, user="tester") is True
+    with database.session_scope() as s:
+        row = s.get(CommandJob, job_id)
+        assert row.status == RunStatus.SKIPPED
+        assert row.output_summary.get("cancelled_by") == "tester"
+
+
+def test_cancel_running_job_is_rejected_by_guard(db_session):
+    from embryodb import database
+    from embryodb.models import PipelineStepRun, RunStatus
+
+    run = _seed_run(
+        db_session, "seriesX", "run_starrynite", "running",
+        started_at=datetime.now(), heartbeat_at=datetime.now(),
+    )
+    run_id = run.id
+    db_session.commit()
+
+    # Already claimed by a worker → the PENDING-guarded UPDATE matches 0 rows.
+    assert cancel_job(database.session_scope, "pipeline", run_id) is False
+    with database.session_scope() as s:
+        assert s.get(PipelineStepRun, run_id).status == RunStatus.RUNNING
+
+
+def test_cancel_unknown_source_raises(db_session):
+    from embryodb import database
+
+    with pytest.raises(CancelError):
+        cancel_job(database.session_scope, "detached", 1)
+
+
+def test_cancelable_property_only_true_for_queued_db_jobs(db_session):
+    from embryodb import database
+
+    _seed_run(db_session, "seriesX", "run_measure", "pending")
+    db_session.commit()
+    (queued,) = discover_pipeline_jobs(database.session_scope, since=datetime.max)
+    assert queued.cancelable is True
+    assert queued.job_id is not None

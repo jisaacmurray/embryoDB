@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 
 from qtpy import QtCore, QtGui, QtWidgets
 
-from ..jobs import JobRow, list_jobs
+from ..jobs import CancelError, JobRow, cancel_job, list_jobs
 from .log_viewer import LogViewerDialog
 
 # (label, finished-job cutoff). timedelta(0) → running only; None → all.
@@ -80,15 +80,25 @@ class BackgroundJobsDialog(QtWidgets.QDialog):
         btns = QtWidgets.QHBoxLayout()
         self._view_btn = QtWidgets.QPushButton("View log")
         self._view_btn.clicked.connect(self._view_log)
+        self._cancel_btn = QtWidgets.QPushButton("Cancel job")
+        self._cancel_btn.setToolTip(
+            "Cancel a queued job so the worker won't run it. Only queued "
+            "(not yet started) pipeline/command jobs can be cancelled."
+        )
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.clicked.connect(self._cancel_selected)
         refresh = QtWidgets.QPushButton("Refresh")
         refresh.clicked.connect(self._refresh)
         close = QtWidgets.QPushButton("Close")
         close.clicked.connect(self.accept)
         btns.addWidget(self._view_btn)
+        btns.addWidget(self._cancel_btn)
         btns.addWidget(refresh)
         btns.addStretch(1)
         btns.addWidget(close)
         vl.addLayout(btns)
+
+        self._table.itemSelectionChanged.connect(self._sync_cancel_button)
 
         # Auto-refresh so running→finished transitions appear without a click.
         self._timer = QtCore.QTimer(self)
@@ -144,6 +154,13 @@ class BackgroundJobsDialog(QtWidgets.QDialog):
         self._count_label.setText(f"{len(self._rows)} job(s), {n_running} running")
         if selected is not None:
             self._reselect(selected)
+        self._sync_cancel_button()
+
+    def _sync_cancel_button(self) -> None:
+        job = self._current_job()
+        self._cancel_btn.setEnabled(
+            self._session_cm is not None and job is not None and job.cancelable
+        )
 
     @staticmethod
     def _row_key(job: JobRow) -> str:
@@ -184,6 +201,34 @@ class BackgroundJobsDialog(QtWidgets.QDialog):
             )
             return
         LogViewerDialog(job.log_path, follow=job.running, parent=self).exec()
+
+    def _cancel_selected(self) -> None:
+        job = self._current_job()
+        if job is None or not job.cancelable or self._session_cm is None:
+            return
+        if (
+            QtWidgets.QMessageBox.question(
+                self,
+                "Cancel job",
+                f"Cancel this queued job?\n\n{job.kind}: {job.name}\n\n"
+                "It will not run. (Already-running jobs can't be cancelled.)",
+            )
+            != QtWidgets.QMessageBox.Yes
+        ):
+            return
+        try:
+            cancelled = cancel_job(self._session_cm, job.source, job.job_id)
+        except (CancelError, Exception) as exc:  # noqa: BLE001 — surface any DB error
+            QtWidgets.QMessageBox.warning(self, "Cancel failed", str(exc))
+            self._refresh()
+            return
+        if not cancelled:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Too late",
+                "This job already started or finished, so it wasn't cancelled.",
+            )
+        self._refresh()
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt override)
         self._timer.stop()

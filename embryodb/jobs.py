@@ -193,14 +193,23 @@ _COMMAND_KIND_LABELS = {
 }
 
 
+# Marker written into a job's ``output_summary`` when a user cancels it while
+# queued. Lets the panel show "cancelled" instead of the raw terminal status
+# (FAILED for pipeline steps, SKIPPED for command jobs — see ``cancel_job``).
+_CANCELLED_KEY = "cancelled_by"
+
+
 @dataclass(frozen=True)
 class JobRow:
     """One row in the Background-jobs panel, from either source.
 
     ``source`` is ``"detached"`` (a fire-and-forget log file from
-    :mod:`embryodb.external_tools`) or ``"pipeline"`` (a
-    :class:`~embryodb.models.PipelineStepRun` run by the worker). ``log_path``
-    may be ``None`` for a pipeline step that hasn't started yet.
+    :mod:`embryodb.external_tools`), ``"pipeline"`` (a
+    :class:`~embryodb.models.PipelineStepRun` run by the worker), or
+    ``"command"`` (a queued :class:`~embryodb.models.CommandJob`). ``log_path``
+    may be ``None`` for a step that hasn't started yet. ``job_id`` is the DB
+    primary key for the ``pipeline``/``command`` sources (``None`` for detached
+    log-file jobs), and is what :func:`cancel_job` targets.
     """
 
     source: str
@@ -211,6 +220,22 @@ class JobRow:
     started_at: datetime | None
     last_activity: datetime | None
     log_path: Path | None
+    job_id: int | None = None
+
+    @property
+    def cancelable(self) -> bool:
+        """True when this is a DB-backed job still queued (PENDING).
+
+        Only queued worker/command jobs can be cancelled — once a job is
+        RUNNING it's executing on a (possibly remote) worker we can't reach,
+        and terminal jobs are already done. Detached log-file jobs aren't
+        queued (they start immediately) so they're never cancelable here.
+        """
+        return (
+            self.source in ("pipeline", "command")
+            and self.job_id is not None
+            and self.status_label == "queued"
+        )
 
     @classmethod
     def from_detached(cls, job: JobInfo) -> "JobRow":
@@ -226,6 +251,17 @@ class JobRow:
         )
 
 
+def _status_label(status: str, output_summary: dict | None) -> str:
+    """Human status, surfacing a user cancellation as ``"cancelled"``.
+
+    A cancelled job carries a terminal DB status (FAILED for a pipeline step so
+    its dependents don't wrongly unblock; SKIPPED for a standalone command job)
+    plus the ``_CANCELLED_KEY`` marker — show the intent, not the raw status."""
+    if output_summary and output_summary.get(_CANCELLED_KEY):
+        return "cancelled"
+    return _PIPELINE_STATUS_LABELS.get(status, status)
+
+
 def _pipeline_row(run, series_name: str) -> JobRow:
     status = str(getattr(run.status, "value", run.status))
     last = run.heartbeat_at or run.completed_at or run.started_at
@@ -234,11 +270,12 @@ def _pipeline_row(run, series_name: str) -> JobRow:
         source="pipeline",
         kind="Pipeline",
         name=f"{series_name} · {step_label}",
-        status_label=_PIPELINE_STATUS_LABELS.get(status, status),
+        status_label=_status_label(status, run.output_summary),
         running=status == "running",
         started_at=run.started_at,
         last_activity=last,
         log_path=Path(run.log_path) if run.log_path else None,
+        job_id=run.id,
     )
 
 
@@ -288,11 +325,12 @@ def _command_row(job) -> JobRow:
         source="command",
         kind=label,
         name=f"#{job.id} · {descr}",
-        status_label=_PIPELINE_STATUS_LABELS.get(status, status),
+        status_label=_status_label(status, job.output_summary),
         running=status == "running",
         started_at=job.started_at or job.created_at,
         last_activity=last,
         log_path=Path(job.log_path) if job.log_path else None,
+        job_id=job.id,
     )
 
 
@@ -344,6 +382,71 @@ def list_jobs(
     return rows
 
 
+class CancelError(ValueError):
+    """A job could not be cancelled (unknown source, or no longer queued)."""
+
+
+def cancel_job(
+    session_cm: Callable,
+    source: str,
+    job_id: int,
+    *,
+    user: str | None = None,
+) -> bool:
+    """Cancel a queued (PENDING) worker or command job. Returns True on success.
+
+    Race-safe against the worker's atomic claim: cancellation is a guarded
+    UPDATE that only matches while the row is still PENDING (mirroring
+    ``pipeline.worker._claim_next``). If a worker claimed the row first the
+    UPDATE affects 0 rows and this returns False — the caller reports "already
+    started". A cancelled row lands in a terminal state carrying the
+    ``_CANCELLED_KEY`` marker so the panel shows "cancelled":
+
+    - **pipeline**: → FAILED. SKIPPED would count as a satisfied prerequisite
+      and wrongly unblock the next step (see ``worker._prerequisite_ok``); the
+      worker's ``_fail_orphaned_steps`` then strands the dependents, exactly as
+      a real step failure would.
+    - **command**: → SKIPPED. Command jobs have no dependency chain, so the
+      neutral "not run" status is the honest one.
+
+    ``source`` must be ``"pipeline"`` or ``"command"``; anything else (e.g. a
+    detached log-file job) raises :class:`CancelError`.
+    """
+    from sqlalchemy import update
+
+    from .identity import current_user
+    from .models import CommandJob, PipelineStepRun, RunStatus
+
+    who = user or current_user()
+    now = datetime.now(tz=timezone.utc)
+    marker = {_CANCELLED_KEY: who}
+
+    if source == "pipeline":
+        model, cancelled_status = PipelineStepRun, RunStatus.FAILED
+        extra = {"started_at": None, "heartbeat_at": None}
+    elif source == "command":
+        model, cancelled_status = CommandJob, RunStatus.SKIPPED
+        extra = {}
+    else:
+        raise CancelError(
+            f"cannot cancel a {source!r} job — only queued pipeline/command jobs"
+        )
+
+    with session_cm() as s:
+        result = s.execute(
+            update(model)
+            .where(model.id == job_id, model.status == RunStatus.PENDING)
+            .values(
+                status=cancelled_status,
+                completed_at=now,
+                error_excerpt=f"cancelled by {who} while queued",
+                output_summary=marker,
+                **extra,
+            )
+        )
+        return result.rowcount == 1
+
+
 def _as_aware(dt: datetime | None) -> datetime:
     """Normalize to a tz-aware datetime so naive (detached-log) and aware
     (Postgres timestamptz) values sort together. Naive values are assumed UTC;
@@ -356,8 +459,10 @@ def _as_aware(dt: datetime | None) -> datetime:
 
 
 __all__ = [
+    "CancelError",
     "JobInfo",
     "JobRow",
+    "cancel_job",
     "discover_jobs",
     "discover_pipeline_jobs",
     "discover_command_jobs",

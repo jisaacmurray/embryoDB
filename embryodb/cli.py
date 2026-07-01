@@ -2340,6 +2340,7 @@ def jobs_cmd(
         console.print("[dim]no background jobs[/dim]")
         return
     table = Table(title="background jobs")
+    table.add_column("id", style="dim")
     table.add_column("type", style="cyan")
     table.add_column("job")
     table.add_column("status")
@@ -2349,8 +2350,42 @@ def jobs_cmd(
         started = r.started_at.strftime("%Y-%m-%d %H:%M") if r.started_at else "—"
         last = r.last_activity.strftime("%Y-%m-%d %H:%M") if r.last_activity else "—"
         style = "yellow" if r.running else ""
-        table.add_row(r.kind, r.name, r.status_label, started, last, style=style)
+        # Cancel handle: only DB-backed queued jobs carry one.
+        handle = f"{r.source}:{r.job_id}" if r.job_id is not None else "—"
+        table.add_row(handle, r.kind, r.name, r.status_label, started, last, style=style)
     console.print(table)
+    console.print(
+        "[dim]cancel a queued job with[/dim] "
+        "[cyan]embryodb cancel-job <source> <id>[/cyan] "
+        "[dim](id column, e.g. pipeline:42)[/dim]"
+    )
+
+
+@app.command("cancel-job")
+def cancel_job_cmd(
+    source: Annotated[
+        str, typer.Argument(help="'pipeline' or 'command' (the id column's prefix)")
+    ],
+    job_id: Annotated[int, typer.Argument(help="Job id from `embryodb jobs`")],
+) -> None:
+    """Cancel a queued job so the worker won't run it (CLI twin of the GUI
+    Background-jobs "Cancel job" button). Only queued (PENDING) pipeline/command
+    jobs can be cancelled; a job the worker already claimed won't be."""
+    from .jobs import CancelError, cancel_job
+
+    try:
+        ok = cancel_job(database.session_scope, source, job_id)
+    except CancelError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    if ok:
+        console.print(f"[green]cancelled[/green] {source} job {job_id}")
+    else:
+        console.print(
+            f"[yellow]not cancelled[/yellow] — {source} job {job_id} already "
+            "started or finished"
+        )
+        raise typer.Exit(1)
 
 
 @app.command("fix-permissions")

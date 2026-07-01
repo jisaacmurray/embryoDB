@@ -255,6 +255,26 @@ class ExtractDialog(QtWidgets.QDialog):
             f"<b>Series list:</b> <code>{self._launch_result.series_list}</code>"
         )
 
+    def done(self, result: int) -> None:  # noqa: N802 (Qt override)
+        """Tear down the progress poller before the dialog is dismissed.
+
+        `done()` is the QDialog funnel for every dismissal path — the Launch→
+        Close button (which calls `reject()`), Cancel, and the window-manager
+        X — so stopping and disconnecting the timer here guarantees no queued
+        timeout fires into a half-destroyed dialog after close. A `QTimer`
+        outliving its dialog was the source of an intermittent segfault after
+        Run extract → Launch → wait → Close (the crash was GC-timing
+        dependent, hence its on-again/off-again nature).
+        """
+        if self._poll_timer is not None:
+            self._poll_timer.stop()
+            try:
+                self._poll_timer.timeout.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            self._poll_timer = None
+        super().done(result)
+
     def _view_log(self) -> None:
         if self._launched_log is None:
             return

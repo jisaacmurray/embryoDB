@@ -23,6 +23,7 @@ from qtpy import QtCore, QtGui, QtWidgets
 from .. import database
 from ..config import settings
 from ..exporters.xml_exporter import export_all
+from ..importers.list_importer import import_list_file
 from ..importers.xml_importer import import_dir
 from ..queries import datasets as q_datasets
 from .dataset_panel import DatasetPanel
@@ -121,6 +122,10 @@ class MainWindow(QtWidgets.QMainWindow):
         act_import_lif = QtGui.QAction("Import from LIF…", self)
         act_import_lif.triggered.connect(self._on_import_from_lif)
         file_menu.addAction(act_import_lif)
+
+        act_import_list = QtGui.QAction("Import dataset from list…", self)
+        act_import_list.triggered.connect(self._on_import_dataset_list)
+        file_menu.addAction(act_import_list)
 
         act_export = QtGui.QAction("Export all to export-dir…", self)
         act_export.triggered.connect(self._on_export)
@@ -402,6 +407,42 @@ class MainWindow(QtWidgets.QMainWindow):
         with self._session_cm() as session:
             report = export_all(session, export_dir=Path(out_str))
         QtWidgets.QMessageBox.information(self, "Export complete", report.summary())
+
+    def _on_import_dataset_list(self) -> None:
+        """Import a single flat list file as one Dataset.
+
+        Parity with CLI `embryodb dataset import-list`. The efficient
+        single-file path: pick one list file (one series per line) and it
+        becomes / refreshes one dataset, rather than pointing at a whole
+        directory (`import-lists`) or hand-typing member names.
+        """
+        f, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Choose a list file (one series name per line)"
+        )
+        if not f:
+            return
+        default_name = Path(f).name
+        if default_name.endswith(".txt"):
+            default_name = default_name[: -len(".txt")]
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "Dataset name", "Dataset name:", text=default_name
+        )
+        if not ok or not name.strip():
+            return
+        try:
+            with self._session_cm() as session:
+                report = import_list_file(session, Path(f), name=name.strip())
+        except (FileNotFoundError, OSError) as exc:
+            QtWidgets.QMessageBox.warning(self, "Import failed", str(exc))
+            return
+        msg = report.summary()
+        for ds_name, missing in report.missing_series.items():
+            msg += (
+                f"\n\n{ds_name}: {len(missing)} unknown series skipped "
+                f"(e.g. {', '.join(missing[:3])}{'…' if len(missing) > 3 else ''})"
+            )
+        QtWidgets.QMessageBox.information(self, "Import complete", msg)
+        self._refresh_all()
 
     # --- dataset actions --------------------------------------------------
 

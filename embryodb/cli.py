@@ -17,7 +17,7 @@ from rich.table import Table
 from . import audits, database
 from .config import settings
 from .exporters.xml_exporter import export_all, export_series
-from .importers.list_importer import import_lists
+from .importers.list_importer import import_list_file, import_lists
 from .importers.xml_importer import import_dir
 from .pipeline.backfill import backfill_directory
 from .pipeline.orchestrate import ImportOptions, STEPS, import_acquisition
@@ -886,6 +886,28 @@ def ds_remove(name: str, series: list[str]) -> None:
     with database.session_scope() as session:
         ds = q_datasets.remove_series(session, name, series)
         console.print(f"{ds.name}: {len(ds.series)} series")
+
+
+@datasets_app.command("import-list")
+def ds_import_list(
+    file: Annotated[
+        Path,
+        typer.Argument(help="A flat list file (one series per line; # comments ok)"),
+    ],
+    name: Annotated[
+        str | None,
+        typer.Option("--name", help="Dataset name (defaults to the file stem)"),
+    ] = None,
+) -> None:
+    """Import a single flat list file as one Dataset (create or refresh)."""
+    with database.session_scope() as session:
+        report = import_list_file(session, file, name=name)
+    console.print(report.summary())
+    for ds_name, missing in report.missing_series.items():
+        console.print(
+            f"[yellow]{ds_name}: {len(missing)} unknown series skipped[/yellow] "
+            f"(e.g. {', '.join(missing[:3])}{'…' if len(missing) > 3 else ''})"
+        )
 
 
 @datasets_app.command("import-lists")

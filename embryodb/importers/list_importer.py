@@ -142,70 +142,112 @@ def import_lists(
         if path.suffix in {".jpg", ".png", ".pdf", ".zip", ".log"}:
             report.skipped.append((name, f"unsupported suffix {path.suffix}"))
             continue
-        try:
-            members = _parse_list_file(path)
-        except UnicodeDecodeError:
-            report.skipped.append((name, "binary file"))
-            continue
-        if not members:
-            report.skipped.append((name, "empty"))
-            continue
-
-        ds_name = _stem(path)
-        tags_csv = ",".join(derive_tags(ds_name))
-
-        # Deduplicate but preserve order: list files occasionally repeat
-        # the same series, and dataset membership is a set.
-        seen_members: set[str] = set()
-        unique_members: list[str] = []
-        for m in members:
-            if m in seen_members:
-                continue
-            seen_members.add(m)
-            unique_members.append(m)
-        resolved = [m for m in unique_members if m in all_series]
-        missing = [m for m in unique_members if m not in all_series]
-
-        existing = session.execute(
-            select(Dataset).where(Dataset.name == ds_name)
-        ).scalar_one_or_none()
-
-        if existing is None:
-            ds = Dataset(
-                name=ds_name,
-                description="",
-                tags=tags_csv,
-                source_path=str(path),
-                series=[
-                    session.execute(
-                        select(Series).where(Series.series_name == m)
-                    ).scalar_one()
-                    for m in resolved
-                ],
-            )
-            session.add(ds)
-            report.inserted.append(ds_name)
-        else:
-            # Check whether the existing dataset matches the on-disk content.
-            current_members = {s.series_name for s in existing.series}
-            if (
-                current_members == set(resolved)
-                and existing.tags == tags_csv
-                and existing.source_path == str(path)
-            ):
-                report.unchanged.append(ds_name)
-            else:
-                existing.tags = tags_csv
-                existing.source_path = str(path)
-                existing.series = [
-                    session.execute(
-                        select(Series).where(Series.series_name == m)
-                    ).scalar_one()
-                    for m in resolved
-                ]
-                report.refreshed.append(ds_name)
-
-        if missing:
-            report.missing_series[ds_name] = missing
+        _import_one(session, path, all_series, report)
 
     return report
+
+
+def import_list_file(
+    session: Session,
+    path: Path,
+    *,
+    name: str | None = None,
+) -> ListImportReport:
+    """Import a single flat list file as one Dataset (create or refresh).
+
+    The efficient single-file counterpart to `import_lists`: the user picks
+    one list file (CLI `dataset import-list` / GUI Import menu) rather than a
+    whole directory. `name` overrides the dataset name (defaults to the file
+    stem). Shares the exact create/refresh/tag/missing-series logic with the
+    bulk importer via `_import_one`, so both paths behave identically.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"list file does not exist: {path}")
+    all_series = {
+        n for (n,) in session.execute(select(Series.series_name)).all()
+    }
+    report = ListImportReport()
+    _import_one(session, path, all_series, report, name_override=name)
+    return report
+
+
+def _import_one(
+    session: Session,
+    path: Path,
+    all_series: set[str],
+    report: ListImportReport,
+    *,
+    name_override: str | None = None,
+) -> None:
+    """Import one list file into a Dataset, appending outcomes to `report`.
+
+    Shared by `import_lists` (bulk) and `import_list_file` (single). Caller
+    owns cruft/suffix filtering; this handles parse → dedup → resolve →
+    insert-or-refresh.
+    """
+    try:
+        members = _parse_list_file(path)
+    except UnicodeDecodeError:
+        report.skipped.append((path.name, "binary file"))
+        return
+    if not members:
+        report.skipped.append((path.name, "empty"))
+        return
+
+    ds_name = name_override or _stem(path)
+    tags_csv = ",".join(derive_tags(ds_name))
+
+    # Deduplicate but preserve order: list files occasionally repeat
+    # the same series, and dataset membership is a set.
+    seen_members: set[str] = set()
+    unique_members: list[str] = []
+    for m in members:
+        if m in seen_members:
+            continue
+        seen_members.add(m)
+        unique_members.append(m)
+    resolved = [m for m in unique_members if m in all_series]
+    missing = [m for m in unique_members if m not in all_series]
+
+    existing = session.execute(
+        select(Dataset).where(Dataset.name == ds_name)
+    ).scalar_one_or_none()
+
+    if existing is None:
+        ds = Dataset(
+            name=ds_name,
+            description="",
+            tags=tags_csv,
+            source_path=str(path),
+            series=[
+                session.execute(
+                    select(Series).where(Series.series_name == m)
+                ).scalar_one()
+                for m in resolved
+            ],
+        )
+        session.add(ds)
+        report.inserted.append(ds_name)
+    else:
+        # Check whether the existing dataset matches the on-disk content.
+        current_members = {s.series_name for s in existing.series}
+        if (
+            current_members == set(resolved)
+            and existing.tags == tags_csv
+            and existing.source_path == str(path)
+        ):
+            report.unchanged.append(ds_name)
+        else:
+            existing.tags = tags_csv
+            existing.source_path = str(path)
+            existing.series = [
+                session.execute(
+                    select(Series).where(Series.series_name == m)
+                ).scalar_one()
+                for m in resolved
+            ]
+            report.refreshed.append(ds_name)
+
+    if missing:
+        report.missing_series[ds_name] = missing

@@ -29,7 +29,7 @@ from ..queries import datasets as q_datasets
 from .dataset_panel import DatasetPanel
 from .detail_panel import DetailPanel
 from .filter_bar import FilterBar
-from .models import Filters, SeriesTableModel
+from .models import COLUMNS, Filters, SeriesTableModel
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -57,6 +57,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalHeader().setVisible(False)
         self.setCentralWidget(self._table)
+
+        # Default the browser to newest-acquired first. date_acquired is
+        # stored zero-padded YYYYMMDD, so a descending string sort is
+        # chronological — and more reliable than series_name, whose legacy
+        # form is MMDDYY. The model remembers this across periodic refreshes.
+        _date_col = next(
+            i for i, (attr, _) in enumerate(COLUMNS) if attr == "date_acquired"
+        )
+        self._table.sortByColumn(_date_col, QtCore.Qt.DescendingOrder)
 
         # Filter bar lives in a top toolbar — always on, no docking needed.
         self._filter_bar = FilterBar()

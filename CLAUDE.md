@@ -301,6 +301,8 @@ functions):
 | `embryodb launch-acetree-py <series>` | Browser right-click → **Open in AceTree (Python)** | `external.launch_acetree_py` |
 | `embryodb pipeline recover <series…\|-d DATASET> [--action auto\|truncate\|stub] [--min-prefix N] [--run/--no-run]` | _(automatic in worker; CLI is the manual escape hatch)_ | `pipeline/sn_recovery.py::recover_series` |
 | `embryodb pipeline stub <series…\|-d DATASET>` | _(automatic in worker; CLI is the manual escape hatch)_ | `pipeline/stub_annotation.py::write_stub_for_series` |
+| `embryodb audit-permissions <series…\|-d DATASET>` | _(read-only; no GUI twin yet)_ | `permissions.audit_series` |
+| `embryodb fix-permissions <series…\|-d DATASET> [--dats-only]` | "Fix permissions" button | `permissions.normalize_series` |
 
 `cli.py::_resolve_series_arg(series, dataset)` is the shared "names or
 `--dataset`" resolver for rerun/extract/print-trees.
@@ -363,9 +365,23 @@ find <annot_loc> -type f -exec chmod 0664 {} +
 find <annot_loc> -type d -exec chmod 2775 {} +   # 2 = setgid, so future writes inherit `users`
 ```
 
-There is **no `embryodb fix-permissions` CLI yet** — a natural addition that
-would wrap exactly this over `fsutil` for a series or dataset (parity with the
-GUI). Propose it when the external-edit handoff becomes routine.
+Two CLI commands wrap this over `fsutil`/DB-resolved series (never a mount
+walk):
+
+- `embryodb audit-permissions <series…|-d DATASET>` — **read-only.** Stats each
+  series' `dats/`, `matlab/`, `MLtemp/` and `matlabParams` (the modifiable
+  outputs; `tif/`/`tifR/` are skipped so a whole-dataset audit stays bounded)
+  and reports every entry that isn't group `users` + group-writable (dirs
+  setgid). Exits non-zero if any issue is found. `permissions.audit_series`.
+- `embryodb fix-permissions <series…|-d DATASET> [--dats-only]` — **mutating.**
+  Applies the recipe via `fsutil.normalize_tree`. `permissions.normalize_series`.
+  Ownership-gated: entries owned by another user are silently skipped (chgrp/chmod
+  need ownership or root), so audit sees everything but a non-root fix may not
+  correct everything. The **setgid on dirs** is the durable half — it stops the
+  next sshfs write from re-introducing the wrong group.
+
+ACL presence (the `+` in `ls -l`) is intentionally *not* audited: the GPFS
+mounts carry a default ACL on every entry, so it would flag everything.
 
 ## Gotchas
 

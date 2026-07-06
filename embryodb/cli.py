@@ -2455,6 +2455,98 @@ def cancel_job_cmd(
         raise typer.Exit(1)
 
 
+@app.command("audit-permissions")
+def audit_permissions_cmd(
+    series: Annotated[
+        list[str] | None,
+        typer.Argument(help="Series names (omit when using --dataset)"),
+    ] = None,
+    dataset: Annotated[
+        str | None,
+        typer.Option("--dataset", "-d", help="Audit every series in this dataset"),
+    ] = None,
+    show: Annotated[
+        int,
+        typer.Option("--show", help="Max offending entries to print per series."),
+    ] = 10,
+) -> None:
+    """Read-only check that a series' modifiable files are writable by the
+    `users` group (CLI counterpart of `fix-permissions`, which applies the fix).
+
+    Scans each series' `dats/`, `matlab/`, `MLtemp/` and `matlabParams` (the
+    curation + analysis outputs a handoff re-saves) and flags any entry that
+    isn't group `users` + group-writable (dirs setgid). The raw `tif/`/`tifR/`
+    image trees are deliberately skipped so a whole-dataset audit stays bounded.
+    Touches nothing; run `embryodb fix-permissions` on the flagged series to
+    correct them.
+    """
+    from . import permissions
+    from .fsutil import DEFAULT_GROUP
+
+    names = _resolve_series_arg(series, dataset)
+    missing: list[str] = []
+    no_paths: list[str] = []
+    flagged: list[permissions.SeriesAuditReport] = []
+    total_f = total_d = total_issues = 0
+    problem_counts: dict[str, int] = {}
+    with database.session_scope() as session:
+        for nm in names:
+            rep = permissions.audit_series(session, nm)
+            if rep.missing:
+                missing.append(nm)
+                continue
+            if rep.no_paths:
+                no_paths.append(nm)
+                continue
+            total_f += rep.n_files
+            total_d += rep.n_dirs
+            total_issues += rep.n_issues
+            for issue in rep.issues:
+                for p in issue.problems:
+                    # Collapse the numeric group id into a stable bucket label.
+                    key = "wrong group" if p.startswith("group=") else p
+                    problem_counts[key] = problem_counts.get(key, 0) + 1
+            if rep.issues:
+                flagged.append(rep)
+
+    for rep in flagged:
+        console.print(f"\n[bold]{rep.name}[/bold] — {rep.n_issues} issue(s)")
+        for issue in rep.issues[:show]:
+            kind = "d" if issue.is_dir else "f"
+            console.print(f"  [{kind}] {issue.path}  [yellow]{', '.join(issue.problems)}[/yellow]")
+        if rep.n_issues > show:
+            console.print(f"  …and {rep.n_issues - show} more")
+
+    if missing:
+        console.print(f"\n[yellow]not found:[/yellow] {', '.join(missing)}")
+    if no_paths:
+        console.print(
+            f"[dim]no dats/matlab/MLtemp/matlabParams on disk:[/dim] "
+            f"{', '.join(no_paths[:20])}"
+            + (f" …(+{len(no_paths) - 20})" if len(no_paths) > 20 else "")
+        )
+
+    scanned = len(names) - len(missing) - len(no_paths)
+    console.print(
+        f"\n[bold]Summary:[/bold] {scanned} series scanned "
+        f"({total_f} files, {total_d} dirs) — "
+        + (
+            f"[red]{total_issues} issue(s) across {len(flagged)} series[/red]"
+            if total_issues
+            else "[green]all conform[/green]"
+        )
+    )
+    if problem_counts:
+        for label, n in sorted(problem_counts.items(), key=lambda kv: -kv[1]):
+            console.print(f"  {n:>6}  {label}")
+        console.print(
+            f"[dim]fix with:[/dim] embryodb fix-permissions "
+            f"{'-d ' + dataset if dataset else '<series…>'}  "
+            f"(→ group {DEFAULT_GROUP}, 0664/02775)"
+        )
+    raise typer.Exit(1 if total_issues else 0)
+
+
 @app.command("fix-permissions")
 def fix_permissions_cmd(
     series: Annotated[

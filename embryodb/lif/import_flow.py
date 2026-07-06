@@ -686,6 +686,9 @@ def _import_one_position(
         wrun = _get_or_create_run(session, series.id, ws)
         if not_before is not None and wrun.status == RunStatus.PENDING:
             wrun.not_before = not_before
+        # Record the StarryNite engine choice (default "old" => no-op).
+        if ws == "run_starrynite" and opts.sn_engine and opts.sn_engine != "old":
+            wrun.params = {**(wrun.params or {}), "sn_engine": opts.sn_engine}
 
     return outcome
 

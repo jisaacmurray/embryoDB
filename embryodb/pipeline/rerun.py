@@ -35,8 +35,14 @@ _STEP_ORDER = {s: i for i, s in enumerate(WORKER_STEPS)}
 _NEVER_DEFAULT_STEPS = frozenset({"stage_images"})
 
 
-def reset_step(session, series_id: int, step: str) -> None:
-    """Set one worker step back to PENDING for a series (create row if absent)."""
+def reset_step(session, series_id: int, step: str, *, params: dict | None = None) -> None:
+    """Set one worker step back to PENDING for a series (create row if absent).
+
+    Clears result fields (log/error/timestamps/output_summary) but PRESERVES
+    the input ``params`` unless `params` is given — so a series keeps its
+    ``sn_engine`` choice across a plain rerun. Pass `params` (merged, not
+    replaced) to change it, e.g. ``{"sn_engine": "new"}``.
+    """
     run = (
         session.query(PipelineStepRun)
         .filter_by(series_id=series_id, step=step)
@@ -52,6 +58,8 @@ def reset_step(session, series_id: int, step: str) -> None:
     run.error_excerpt = None
     run.log_path = None
     run.output_summary = {}
+    if params:
+        run.params = {**(run.params or {}), **params}
 
 
 def earliest_incomplete_step(runs_by_step: dict[str, RunStatus]) -> str | None:
@@ -123,6 +131,7 @@ def requeue_series(
     steps: list[str] | None = None,
     overrides: dict[str, str] | None = None,
     refresh_resolution: bool = True,
+    sn_engine: str | None = None,
 ) -> RequeueResult:
     """Reset worker steps to PENDING for each named series.
 
@@ -134,6 +143,9 @@ def requeue_series(
         refresh_resolution: when ``run_starrynite`` is reset, rewrite
             matlabParams to refresh xyres/zres from DB microscopy metadata
             (plus apply ``overrides``). Mirrors the GUI dialog.
+        sn_engine: "old" | "new" — which StarryNite to use when re-running the
+            ``run_starrynite`` step. ``None`` leaves the existing choice intact
+            (defaults to "old" if never set). Only applied to that step.
 
     Does not spawn the worker — callers decide whether to.
     """
@@ -168,7 +180,12 @@ def requeue_series(
             except Exception as exc:  # surface, don't abort the whole batch
                 result.errors.append(f"{row.series_name}: {exc}")
         for step in steps:
-            reset_step(session, row.id, step)
+            step_params = (
+                {"sn_engine": sn_engine}
+                if step == "run_starrynite" and sn_engine is not None
+                else None
+            )
+            reset_step(session, row.id, step, params=step_params)
         result.matched.append(row.series_name)
 
     return result

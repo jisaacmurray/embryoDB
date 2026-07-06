@@ -28,6 +28,7 @@ from ..config import settings
 from ..database import session_scope
 from ..fsutil import chmod_if_possible, ensure_dir
 from ..models import PipelineStepRun, RunStatus
+from ..parsers.matlab_params import load as load_params
 
 HEARTBEAT_INTERVAL = 30  # seconds between DB heartbeat writes during subprocess run
 
@@ -399,11 +400,18 @@ def step_run_starrynite(
     """
     log_path = ensure_dir(image_loc / "logs") / f"{series_name}-run_starrynite.log"
 
-    # Record log_path before the subprocess starts so the GUI can open it.
+    # Record log_path before the subprocess starts so the GUI can open it, and
+    # read the per-run engine choice (params.sn_engine; default "old").
+    engine = "old"
     with session_scope() as s:
         run = s.get(PipelineStepRun, run_id)
         if run is not None:
             run.log_path = str(log_path)
+            engine = (run.params or {}).get("sn_engine", "old")
+
+    if engine == "new":
+        _run_starrynite_new(series_id, series_name, image_loc, run_id, log_path)
+        return
 
     cmd = [
         "nice",
@@ -445,6 +453,100 @@ def step_run_starrynite(
         run_id, log_path, returncode,
         diagnostic=diagnostic, output_summary=output_summary,
     )
+
+
+def _run_starrynite_new(
+    series_id: int,
+    series_name: str,
+    image_loc: Path,
+    run_id: int,
+    log_path: Path,
+) -> None:
+    """Run the NEW all-MATLAB StarryNite (release_v1) for one series.
+
+    Selected via the run row's ``params.sn_engine == "new"``. The whole run
+    happens under ``settings.starrynite_scratch_root`` (never image_loc); only
+    the final lineage lands in ``dats/`` — in the SAME slot the legacy pipeline
+    uses (``<series>-edit.zip`` + pristine ``<series>.zip``), so downstream
+    steps and AceTree find it identically.
+
+    On success it also runs the GT-free curation-effort predictor (new-SN only;
+    documented negative transfer forbids it on legacy lineages) and records the
+    triage bucket in ``output_summary`` for display in the embryoDB entry.
+
+    Unlike the legacy path there is no detection-collapse auto-recovery: the
+    retrained tracker's robustness is the whole point (it does not wedge), and
+    the effort predictor is the triage signal instead.
+    """
+    from . import starrynite_v1 as snv1
+
+    params_path = image_loc / "matlabParams"
+    if not params_path.exists():
+        _finish_run(
+            run_id, log_path, 1,
+            diagnostic=(
+                f"new StarryNite: no matlabParams at {params_path}; run "
+                "write_matlab_params first"
+            ),
+        )
+        return
+
+    dats_dir = image_loc / "dats"
+    mp = load_params(params_path)
+    xyres = mp.get_float("xyres")
+    zres = mp.get_float("zres")
+
+    scratch = Path(
+        tempfile.mkdtemp(
+            prefix=f"embryodb-sn-{series_name}-",
+            dir=str(ensure_dir(settings.starrynite_scratch_root)),
+        )
+    )
+    scratch_out = scratch / "out"
+    try:
+        paramfile = snv1.build_newmatlab_paramfile(params_path, scratch / "params.txt")
+        image_first = image_loc / "tif" / f"{series_name}-t001-p01.tif"
+        cmd, env = snv1.build_matlab_command(paramfile, image_first, scratch_out)
+        returncode = _run_with_heartbeat(
+            cmd, log_path, run_id,
+            cwd=str(scratch), env=env,
+            max_seconds=settings.starrynite_max_seconds,
+        )
+        if returncode != 0:
+            _finish_run(
+                run_id, log_path, returncode,
+                diagnostic="new StarryNite (release_v1) run failed; see log tail.",
+            )
+            return
+
+        # Land the lineage in the legacy slot.
+        try:
+            landed = snv1.land_lineage(scratch_out, dats_dir, series_name)
+        except FileNotFoundError as exc:
+            _finish_run(run_id, log_path, 1, diagnostic=str(exc))
+            return
+
+        summary: dict = {"sn_engine": "new", **landed}
+
+        # GT-free effort estimate (NEW-SN ONLY — see run_effort scope note).
+        # PLACEHOLDER: a future generalized estimator calibrated for legacy
+        # classic-SN lineages would run on the "old" engine path instead; it is
+        # deliberately NOT invoked there today (documented negative transfer).
+        nuclei_dir = snv1.find_nuclei_dir(scratch_out)
+        if nuclei_dir is not None and xyres and zres:
+            summary["effort"] = snv1.run_effort(
+                nuclei_dir, xyres, zres, dats_dir, series_name
+            )
+        else:
+            summary["effort"] = {
+                "ran": False,
+                "error": "no nuclei dir or missing xyres/zres in matlabParams",
+            }
+
+        _finish_run(run_id, log_path, 0, output_summary=summary)
+        _normalize_dats_perms(series_name)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _auto_recover(series_name: str):

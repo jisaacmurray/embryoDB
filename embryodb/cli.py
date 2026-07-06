@@ -33,6 +33,15 @@ app = typer.Typer(
 )
 console = Console()
 
+SN_ENGINES = ("old", "new")
+
+
+def _validate_sn_engine(value: str) -> str:
+    v = (value or "old").strip().lower()
+    if v not in SN_ENGINES:
+        raise typer.BadParameter(f"--sn-engine must be one of {SN_ENGINES}, got {value!r}")
+    return v
+
 
 def _resolve_series_arg(
     series: list[str] | None, dataset: str | None
@@ -1099,6 +1108,14 @@ def pipeline_import_acquisition(
             help="Override a Matlab parameter, e.g. --set-param parameters.intensitythreshold=0.01",
         ),
     ] = None,
+    sn_engine: Annotated[
+        str,
+        typer.Option(
+            "--sn-engine",
+            help="StarryNite engine for run_starrynite: 'old' (legacy compiled) "
+            "or 'new' (all-MATLAB release_v1 + effort estimate).",
+        ),
+    ] = "old",
 ) -> None:
     """Import one microscope acquisition end-to-end.
 
@@ -1144,6 +1161,7 @@ def pipeline_import_acquisition(
             compress_with_lzw=not no_compress,
             overwrite_existing_images=overwrite,
             run_through_step=run_through,
+            sn_engine=_validate_sn_engine(sn_engine),
         )
         result = import_acquisition(
             session,
@@ -1456,6 +1474,14 @@ def pipeline_import_lif_cmd(
     set_param: Annotated[
         list[str] | None, typer.Option("--set-param", "-s")
     ] = None,
+    sn_engine: Annotated[
+        str,
+        typer.Option(
+            "--sn-engine",
+            help="StarryNite engine for run_starrynite: 'old' (legacy compiled) "
+            "or 'new' (all-MATLAB release_v1 + effort estimate).",
+        ),
+    ] = "old",
 ) -> None:
     """Import a LIF file end-to-end (extract directly to staged layout + run pipeline).
 
@@ -1662,6 +1688,7 @@ def pipeline_import_lif_cmd(
             overwrite_existing_images=overwrite,
             run_through_step=run_through,
             delay_hours=delay_hours,
+            sn_engine=_validate_sn_engine(sn_engine),
         )
         result = import_lif(
             session,
@@ -1803,6 +1830,14 @@ def pipeline_rerun_cmd(
             "when run_starrynite is reset.",
         ),
     ] = None,
+    sn_engine: Annotated[
+        str | None,
+        typer.Option(
+            "--sn-engine",
+            help="StarryNite engine when run_starrynite is reset: 'old' or 'new'. "
+            "Omit to keep the series' existing choice.",
+        ),
+    ] = None,
     run: Annotated[
         bool,
         typer.Option("--run/--no-run", help="Spawn the background worker now (default: yes)."),
@@ -1839,9 +1874,11 @@ def pipeline_rerun_cmd(
         k, v = item.split("=", 1)
         overrides[k.strip()] = v.strip()
 
+    engine = _validate_sn_engine(sn_engine) if sn_engine is not None else None
+
     with database.session_scope() as session:
         result = requeue_series(
-            session, names, steps=steps, overrides=overrides
+            session, names, steps=steps, overrides=overrides, sn_engine=engine
         )
 
     for miss in result.missing:

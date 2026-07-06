@@ -105,6 +105,11 @@ class ImportOptions:
     # and leaves the StarryNite + acebatch3 steps as PENDING rows for the
     # worker to pick up later.
     run_through_step: str = "write_matlab_params"
+    # Which StarryNite to use for the run_starrynite worker step: "old" (legacy
+    # compiled MATLAB+C via matlab_SN_cluster.pl) or "new" (all-MATLAB
+    # release_v1). Stored on the run row's params; default keeps the legacy
+    # engine (no switchover).
+    sn_engine: str = "old"
     # Off-hours scheduling: when > 0, the orchestrator skips inline
     # stage_images and instead writes `not_before = now + delay_hours` on
     # stage_images + every worker step row. The worker picks them up after
@@ -621,6 +626,12 @@ def import_acquisition(
         # Pre-create PENDING rows for every step so the GUI can show them.
         for step in STEPS:
             _get_or_create_run(session, series.id, step)
+
+        # Record the StarryNite engine choice on the run_starrynite row so the
+        # worker dispatches old vs new when it eventually claims it.
+        if opts.sn_engine and opts.sn_engine != "old":
+            sn_run = _get_or_create_run(session, series.id, "run_starrynite")
+            sn_run.params = {**(sn_run.params or {}), "sn_engine": opts.sn_engine}
 
         # On overwrite: reset worker (subprocess) steps to PENDING so the
         # worker re-runs analysis against the freshly-staged images. Without

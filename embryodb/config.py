@@ -125,6 +125,42 @@ class Settings(BaseSettings):
             "processes can defeat (EMBRYODB_STARRYNITE_MAX_SECONDS)."
         ),
     )
+    # --- New all-MATLAB StarryNite (release_v1) ---------------------------
+    # Optional alternative to the legacy compiled-MATLAB+C StarryNite. Selected
+    # per pipeline run via the run_starrynite step's `params.sn_engine == "new"`
+    # (default remains "old"). Needs a FULL MATLAB (not the MCR) with Image
+    # Processing + Statistics/ML toolboxes; the retrained tracking model is
+    # resolved from starrynite_v1_dir/../distribution_lineaging on the path.
+    matlab_command: Path = Field(
+        default=Path("/gpfs/fs0/l/murr/local/MATLAB/R2026a/bin/matlab"),
+        description="Full MATLAB launcher for the new all-MATLAB StarryNite (EMBRYODB_MATLAB_COMMAND).",
+    )
+    starrynite_v1_dir: Path = Field(
+        default=Path("/murrlab/gpfs/fs0/l/murr/new_tools/StarryNite/release_v1"),
+        description="release_v1 dir holding run_starrynite.m, the param template, and effort/.",
+    )
+    starrynite_tracking_model: str = Field(
+        default="MurrayTrackingModel_20260704.mat",
+        description="Retrained tracking model .mat name loaded by the new-SN param file.",
+    )
+    effort_python: Path = Field(
+        default=Path(
+            "/home/jmurr/anaconda3/envs/"
+            "EmbNucEnhancementPYEnvironment20240329Ver/bin/python"
+        ),
+        description="Python interpreter (numpy/pandas/sklearn/joblib) for the GT-free effort predictor.",
+    )
+    starrynite_scratch_root: Path = Field(
+        default_factory=lambda: Path(
+            os.environ.get("EMBRYODB_STARRYNITE_SCRATCH_ROOT")
+            or ("/scratch" if Path("/scratch").is_dir() else "/tmp")
+        ),
+        description=(
+            "Scratch root for new-SN runs. New SN NEVER writes into image_loc; it "
+            "runs in <root>/embryodb-sn-<series>-<pid>/ and only the final lineage "
+            "zip + effort QC are copied back (EMBRYODB_STARRYNITE_SCRATCH_ROOT)."
+        ),
+    )
     command_log_dir: Path = Field(
         default_factory=_default_command_log_dir,
         description=(

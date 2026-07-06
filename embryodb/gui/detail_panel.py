@@ -391,6 +391,31 @@ class DetailPanel(QtWidgets.QWidget):
             else:
                 table.setItem(r_idx, 2, QtWidgets.QTableWidgetItem(""))
 
+    @staticmethod
+    def _sn_effort_text(sn_run) -> str:
+        """One-line StarryNite engine + effort-estimate summary for the
+        pipeline-details popup, or "" if the new engine wasn't used / has no
+        effort result yet. Reads the run's ``output_summary`` written by
+        ``_run_starrynite_new`` (``sn_engine`` + nested ``effort`` dict)."""
+        summary = (sn_run.output_summary or {}) if sn_run else {}
+        if summary.get("sn_engine") != "new":
+            return ""
+        parts = ["StarryNite engine: new (all-MATLAB v1)"]
+        effort = summary.get("effort") or {}
+        if effort.get("ran"):
+            events = effort.get("effort_events")
+            triage = effort.get("triage")
+            bits = []
+            if events is not None:
+                bits.append(f"~{events:g} events")
+            if triage:
+                bits.append(f"triage: {triage}")
+            if bits:
+                parts.append("Curation effort — " + ", ".join(bits))
+        elif effort:
+            parts.append("Curation effort — estimator did not complete")
+        return "  •  ".join(parts)
+
     def _on_pipeline_details(self) -> None:
         """Open a dialog showing the per-step pipeline state for the loaded series."""
         if not self._series_name:
@@ -424,6 +449,17 @@ class DetailPanel(QtWidgets.QWidget):
                 return
             self._fill_pipeline_table(table, row)
             has_sn = any(r.step == "run_starrynite" for r in row.runs)
+            sn_run = next(
+                (r for r in row.runs if r.step == "run_starrynite"), None
+            )
+            effort_text = self._sn_effort_text(sn_run)
+
+        if effort_text:
+            effort_label = QtWidgets.QLabel(effort_text)
+            effort_label.setWordWrap(True)
+            effort_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            effort_label.setStyleSheet("color: #444;")
+            layout.addWidget(effort_label)
 
         button_row = QtWidgets.QHBoxLayout()
         rerun_btn = QtWidgets.QPushButton("Re-run pipeline…")

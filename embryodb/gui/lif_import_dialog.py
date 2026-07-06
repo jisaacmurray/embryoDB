@@ -172,6 +172,17 @@ class LifImportDialog(QtWidgets.QDialog):
         adv_form.addRow(self._no_compress_cb)
         self._overwrite_cb = QtWidgets.QCheckBox("Overwrite existing TIFs")
         adv_form.addRow(self._overwrite_cb)
+        # StarryNite engine: old (legacy compiled MATLAB, default) vs new
+        # (all-MATLAB v1 + retrained tracker + effort estimate). Same output slot.
+        self._engine_combo = QtWidgets.QComboBox()
+        self._engine_combo.addItem("Old (legacy compiled MATLAB)", "old")
+        self._engine_combo.addItem("New (all-MATLAB v1)", "new")
+        self._engine_combo.setToolTip(
+            "Which StarryNite to run. Old (default) is the legacy compiled-MATLAB "
+            "tracer; New runs full MATLAB with the retrained tracker, lands into "
+            "the same slot, and records an effort estimate on the run."
+        )
+        adv_form.addRow("StarryNite engine:", self._engine_combo)
         layout.addWidget(adv)
 
         # Scheduling: run the queued analysis steps now, or defer to off-hours.
@@ -550,6 +561,7 @@ class LifImportDialog(QtWidgets.QDialog):
                 no_compress=self._no_compress_cb.isChecked(),
                 overwrite=self._overwrite_cb.isChecked(),
                 delay_hours=delay_hours,
+                sn_engine=self._engine_combo.currentData() or "old",
             )
         except Exception as exc:  # noqa: BLE001
             QtWidgets.QMessageBox.warning(

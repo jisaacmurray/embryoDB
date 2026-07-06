@@ -519,6 +519,7 @@ def run_lif_import(
     alias_root: Path | None = None,
     run_through: str | None = None,
     delay_hours: float = 0.0,
+    sn_engine: str | None = None,
     spawn_worker: bool = True,
 ) -> LaunchResult:
     """Spawn ``embryodb pipeline import-lif`` detached.
@@ -571,6 +572,8 @@ def run_lif_import(
         cmd += ["--run-through", shell_quote(run_through)]
     if delay_hours and delay_hours > 0:
         cmd += ["--delay-hours", shell_quote(f"{delay_hours:g}")]
+    if sn_engine:
+        cmd += ["--sn-engine", shell_quote(sn_engine)]
     if not spawn_worker:
         cmd += ["--no-worker"]
 

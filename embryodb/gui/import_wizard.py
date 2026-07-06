@@ -527,6 +527,20 @@ class TargetsPage(QtWidgets.QWizardPage):
         self._immediate_check.toggled.connect(self._delay_spin.setDisabled)
         layout.addRow("", self._immediate_check)
 
+        # StarryNite engine: old (legacy compiled MATLAB, default) vs new
+        # (all-MATLAB v1 with the retrained tracker + effort estimate). Both
+        # land into the same dats/ slot; picking new is opt-in per import.
+        self._engine_combo = QtWidgets.QComboBox()
+        self._engine_combo.addItem("Old (legacy compiled MATLAB)", "old")
+        self._engine_combo.addItem("New (all-MATLAB v1)", "new")
+        self._engine_combo.setToolTip(
+            "Which StarryNite to run for these series.\n"
+            "Old (default): the legacy compiled-MATLAB tracer.\n"
+            "New: full MATLAB with the retrained tracker; lands into the same "
+            "slot and records an effort estimate on the run."
+        )
+        layout.addRow("StarryNite engine:", self._engine_combo)
+
         self._disk_label = QtWidgets.QLabel("—")
         layout.addRow("Est. disk usage:", self._disk_label)
 
@@ -600,6 +614,9 @@ class TargetsPage(QtWidgets.QWizardPage):
         if self._immediate_check.isChecked():
             return 0.0
         return float(self._delay_spin.value())
+
+    def sn_engine(self) -> str:
+        return self._engine_combo.currentData() or "old"
 
 
 # ---------------------------------------------------------------------------
@@ -743,6 +760,7 @@ class ImportWizard(QtWidgets.QWizard):
             parameter_overrides=meta_page.parameter_overrides(),
             overwrite_existing_images=targets_page.overwrite_existing_images(),
             delay_hours=targets_page.delay_hours(),
+            sn_engine=targets_page.sn_engine(),
             run_through_step="write_matlab_params",
         )
 

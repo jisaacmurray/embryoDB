@@ -152,6 +152,24 @@ class RerunPipelineDialog(QtWidgets.QDialog):
             "Blank = keep current value. Applied only if StarryNite is checked above."
         ))
 
+        # Engine picker: old (legacy compiled-MATLAB) vs new (all-MATLAB v1).
+        # "Keep current" (None) leaves each series' stored choice intact.
+        engine_row = QtWidgets.QHBoxLayout()
+        engine_row.addWidget(QtWidgets.QLabel("StarryNite engine:"))
+        self._engine_combo = QtWidgets.QComboBox()
+        self._engine_combo.addItem("Keep current choice", None)
+        self._engine_combo.addItem("Old (legacy compiled MATLAB)", "old")
+        self._engine_combo.addItem("New (all-MATLAB v1)", "new")
+        self._engine_combo.setToolTip(
+            "Which StarryNite to use for this rerun.\n"
+            "Keep current: leave each series' existing engine choice (defaults "
+            "to old if never set).\n"
+            "New runs full MATLAB with the retrained tracker and lands into the "
+            "same slot; it also records an effort estimate on the run."
+        )
+        engine_row.addWidget(self._engine_combo, 1)
+        params_vl.addLayout(engine_row)
+
         # Protocol picker: select an existing Protocol and bulk-populate the
         # override column from its defaults. Useful when retuning across
         # multiple acquisitions or comparing brightness presets.
@@ -280,6 +298,7 @@ class RerunPipelineDialog(QtWidgets.QDialog):
             return
         sn_checked = "run_starrynite" in steps_to_run
         overrides = self._overrides() if sn_checked else {}
+        sn_engine = self._engine_combo.currentData() if sn_checked else None
         errors: list[str] = []
 
         with self._session_cm() as s:
@@ -303,7 +322,12 @@ class RerunPipelineDialog(QtWidgets.QDialog):
                         except Exception as exc:
                             errors.append(f"{sd['name']}: {exc}")
                 for step in steps_to_run:
-                    _reset_one_step(s, sd["id"], step)
+                    step_params = (
+                        {"sn_engine": sn_engine}
+                        if step == "run_starrynite" and sn_engine is not None
+                        else None
+                    )
+                    _reset_one_step(s, sd["id"], step, params=step_params)
             s.flush()
 
         if errors:

@@ -23,7 +23,6 @@ its lineage-walk logic is part of the bigger v3 effort. What changes here:
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -32,6 +31,7 @@ from pathlib import Path
 
 from . import database
 from .config import settings
+from .fsutil import safe_write_bytes
 from .queries import series as q_series
 
 
@@ -191,7 +191,12 @@ def run_partial_for_series(
         moved: list[str] = []
         for f in Path(tmp).glob(f"*{series_name}.csv"):
             target = dats / f.name
-            shutil.move(str(f), str(target))
+            # Content-write (not move): partialCSV.jar stages into /tmp, which
+            # is a different filesystem from GPFS dats/. A cross-device move
+            # degrades to copy2 → copystat → utime, which fails with EPERM when
+            # the destination file is owned by another user (reprocessing
+            # someone else's series). safe_write_bytes needs only group-write.
+            safe_write_bytes(target, f.read_bytes())
             moved.append(f.name)
         print(
             f"Partial: {series_name}: wrote {len(moved)} file(s) to {dats}: "

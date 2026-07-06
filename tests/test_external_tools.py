@@ -42,17 +42,14 @@ def test_run_extract_builds_correct_shell(captured_popen, tmp_path):
     assert result.proc.args[0] == "bash"
     assert result.proc.args[1] == "-c"
     cmd = result.proc.args[2]
-    # Canonical order — partial (now a Python CLI step) sits between the two
-    # Java steps. The banner echo is what's stable across step kinds.
-    red_pos = cmd.find("== RedExtractor1 ==")
-    partial_pos = cmd.find("== Partial ==")
-    align_pos = cmd.find("== Align1 ==")
-    assert red_pos > 0 < partial_pos < align_pos
-    # Partial is invoked via the new Python entry, not legacy Partial.pl.
-    assert "embryodb.cli partial" in cmd
-    assert "Partial.pl" not in cmd
-    # acebatch3.jar path quoted with single quotes
-    assert "'/fake/tools3/acebatch3.jar'" in cmd
+    # The extract chain no longer inlines java/perl per step. It delegates to the
+    # per-series tracked runner, which isolates failures and records
+    # PipelineStepRun rows (see embryodb.pipeline.extract_run).
+    assert "-m embryodb.cli run-extract-batch" in cmd
+    # Chosen steps are passed through in canonical order (comma-joined).
+    assert "--steps 'red_extractor,partial,align'" in cmd
+    # The list file the runner reads is the one written under EMBRYODB_RUNS_DIR.
+    assert f"--list '{result.series_list}'" in cmd
     # detached subprocess kwargs
     assert result.proc.kwargs["start_new_session"] is True
     # series list file was written under EMBRYODB_RUNS_DIR

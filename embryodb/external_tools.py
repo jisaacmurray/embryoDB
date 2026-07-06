@@ -5,11 +5,17 @@ Each function spawns a fully-detached subprocess (same pattern as
 `external.launch_acetree`) so the GUI can fire-and-forget without blocking.
 
 These are *analysis* operations — distinct from the v2 *import* pipeline
-that lives in `embryodb.pipeline.subprocess_steps`. They don't write
-`PipelineStepRun` rows; outputs land where the legacy tools always put
-them (under each series' `dats/` directory for extract; under
-`/gpfs/fs0/l/murr/trees/` for Tree1). The Popen handle is returned for
-callers that want a PID; the typical use is just to spawn and forget.
+that lives in `embryodb.pipeline.subprocess_steps`. Outputs land where the
+legacy tools always put them (under each series' `dats/` directory for
+extract; under `/gpfs/fs0/l/murr/trees/` for Tree1). The Popen handle is
+returned for callers that want a PID; the typical use is just to spawn and
+forget.
+
+The **extract** chain is the exception: it delegates to
+`embryodb.pipeline.extract_run`, which runs each series independently (a
+failure on one embryo no longer halts the rest) and records a
+`PipelineStepRun` row per step so the GUI Pipeline field shows extract
+progress/failures. `print_trees` / `getacd` remain opaque batch shells.
 
 The same subprocess pattern works on either a single series or a whole
 dataset — the unit is "a list of series names", and the caller supplies
@@ -247,27 +253,26 @@ def build_extract_command(
     list_file: Path | str,
     base_dir: Path,
 ) -> str:
-    """Render the `&&`-chained extract shell for the chosen steps."""
-    chosen = [s for s in EXTRACT_STEPS if s.key in set(step_keys)]
-    parts: list[str] = []
-    for step in chosen:
-        # per_series steps have no list-file batch mode: invoke once per name.
-        # All other steps accept a list file directly.
-        if step.per_series:
-            invocations = [
-                _step_invocation(step, name, base_dir) for name in series_names
-            ]
-            parts.append(
-                f"echo '== {step.label} ==' && " + " && ".join(invocations)
-            )
-        else:
-            parts.append(
-                f"echo '== {step.label} ==' && "
-                + _step_invocation(step, str(list_file), base_dir)
-            )
-    # `&&` so a failed step halts the rest. Each step echoes a banner so
-    # the log is human-skimmable.
-    return " && ".join(parts)
+    """Render the extract shell: delegate to the per-series tracked runner.
+
+    Rather than one global `&&` chain (whose first failure halted every step of
+    every series), this hands the list file + step keys to
+    ``embryodb.cli run-extract-batch``, which runs each series independently and
+    records a ``PipelineStepRun`` row per step (see
+    :mod:`embryodb.pipeline.extract_run`). A crash on one embryo no longer
+    stops the others, and failures show up in the GUI Pipeline field.
+
+    Uses `sys.executable` so the detached subprocess (or the worker) runs the
+    same interpreter/venv that rendered the command.
+    """
+    chosen = [s.key for s in EXTRACT_STEPS if s.key in set(step_keys)]
+    return (
+        f"echo '== extract: {len(series_names)} series, "
+        f"{len(chosen)} step(s) ==' && "
+        f"nice {shell_quote(sys.executable)} -m embryodb.cli run-extract-batch "
+        f"--list {shell_quote(str(list_file))} "
+        f"--steps {shell_quote(','.join(chosen))}"
+    )
 
 
 def build_print_trees_command(

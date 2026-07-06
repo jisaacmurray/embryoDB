@@ -2321,6 +2321,36 @@ def extract_cmd(
     _report_launch(result, f"extract ({', '.join(step_keys)})", len(names))
 
 
+@app.command("run-extract-batch", hidden=True)
+def run_extract_batch_cmd(
+    list_file: Annotated[
+        Path,
+        typer.Option("--list", help="Newline-delimited series-list file."),
+    ],
+    steps: Annotated[
+        str,
+        typer.Option("--steps", help="Comma-separated extract step keys."),
+    ],
+) -> None:
+    """Internal worker entry point for the tracked extract chain.
+
+    Not user-facing (the public command is ``extract``): the detached launcher
+    and the penticton worker both invoke this so each series' steps are run
+    independently and recorded as PipelineStepRun rows. Exits with the worst
+    per-series return code.
+    """
+    from .pipeline.extract_run import run_extract_batch
+
+    names = [
+        line.strip()
+        for line in list_file.read_text().splitlines()
+        if line.strip()
+    ]
+    step_keys = [k.strip() for k in steps.split(",") if k.strip()]
+    worst = run_extract_batch(names, step_keys)
+    raise typer.Exit(worst)
+
+
 @app.command("print-trees")
 def print_trees_cmd(
     series: Annotated[

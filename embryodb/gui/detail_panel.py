@@ -337,9 +337,9 @@ class DetailPanel(QtWidgets.QWidget):
         the widget lifecycle. Expects the table already to have 3 columns
         configured.
         """
-        from ..pipeline.orchestrate import STEPS
+        from ..pipeline.extract_run import DETAIL_STEP_ORDER
         runs_by_step = {r.step: r for r in row.runs}
-        table.setRowCount(len(STEPS))
+        table.setRowCount(len(DETAIL_STEP_ORDER))
         _STATUS_COLOR = {
             RunStatus.COMPLETE: "#2a8a2a",
             RunStatus.FAILED: "#b00000",
@@ -347,7 +347,7 @@ class DetailPanel(QtWidgets.QWidget):
             RunStatus.SKIPPED: "#888888",
             RunStatus.PENDING: "#555555",
         }
-        for r_idx, step in enumerate(STEPS):
+        for r_idx, step in enumerate(DETAIL_STEP_ORDER):
             run = runs_by_step.get(step)
             status = run.status if run else None
             short = step.replace("write_", "").replace("stage_", "stage/").replace("create_", "")

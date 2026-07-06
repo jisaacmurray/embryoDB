@@ -69,13 +69,17 @@ COLUMNS: list[tuple[str, str]] = [
 _STEP_SHORT: dict[str, str] = {
     "stage_images": "stage",
     "stage_metadata": "meta",
+    "compute_timestamps": "time",
     "write_acetree_config": "cfg",
     "write_embryodb_xml": "xml",
     "create_alias_symlink": "lnk",
     "write_matlab_params": "prm",
     "run_starrynite": "SN",
     "run_red_extract": "red",
+    "output_excel": "xls",
     "run_measure": "meas",
+    "align": "aln",
+    "permissions": "perm",
 }
 
 _STATUS_GLYPH: dict[RunStatus, str] = {
@@ -91,25 +95,37 @@ def _summarize_runs(runs: list[PipelineStepRun]) -> str:
     """One-line summary of a series' pipeline state.
 
     Empty for series that have no PipelineStepRun rows (legacy imports).
-    For pipelined series, returns the count of completed steps + a compact
-    glyph string showing per-step status in the canonical order.
+    Otherwise a `done/total` head plus a compact per-unit glyph string in
+    canonical order. The extract phase is shown as three rolled-up categories
+    (output_excel / align / permissions) so a Partial or permissions failure is
+    visible in the cell; the Details… popup breaks them back into steps.
     """
     if not runs:
         return ""
+    from ..pipeline.extract_run import (
+        EXTRACT_CATEGORY_COMPONENTS,
+        SUMMARY_STEP_ORDER,
+        rollup_category,
+    )
+
     by_step = {r.step: r.status for r in runs}
-    parts: list[str] = []
-    n_done = sum(1 for s in by_step.values() if s == RunStatus.COMPLETE)
-    n_failed = sum(1 for s in by_step.values() if s == RunStatus.FAILED)
-    for step in (
-        "stage_images", "stage_metadata", "write_acetree_config",
-        "write_embryodb_xml", "create_alias_symlink", "write_matlab_params",
-        "run_starrynite", "run_red_extract", "run_measure",
-    ):
-        status = by_step.get(step)
+    units: list[tuple[str, RunStatus]] = []
+    for name in SUMMARY_STEP_ORDER:
+        if name in EXTRACT_CATEGORY_COMPONENTS:
+            status = rollup_category(by_step, EXTRACT_CATEGORY_COMPONENTS[name])
+        else:
+            status = by_step.get(name)
         if status is None:
             continue
-        parts.append(f"{_STEP_SHORT.get(step, step[:4])}{_STATUS_GLYPH.get(status, '?')}")
-    head = f"{n_done}/{len(by_step)}"
+        units.append((name, status))
+    if not units:
+        return ""
+    n_done = sum(1 for _, s in units if s == RunStatus.COMPLETE)
+    n_failed = sum(1 for _, s in units if s == RunStatus.FAILED)
+    parts = [
+        f"{_STEP_SHORT.get(n, n[:4])}{_STATUS_GLYPH.get(s, '?')}" for n, s in units
+    ]
+    head = f"{n_done}/{len(units)}"
     if n_failed:
         head += f"  {n_failed}!"
     return f"{head}  " + " ".join(parts)

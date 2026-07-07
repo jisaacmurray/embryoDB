@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import grp
 import os
+import pwd
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -199,6 +200,19 @@ def audit_series(session: Session, name: str) -> SeriesAuditReport:
         return report
 
     gid_want = _target_gid()
+    roots = _series_roots(row)
+    report.roots = [str(r) for r in roots]
+    if not roots:
+        report.no_paths = True
+        return report
+    for r in roots:
+        _audit_tree(r, gid_want, report)
+    return report
+
+
+def _series_roots(row) -> list[Path]:
+    """The AUDIT_SUBPATHS that actually exist under a series' annot_loc /
+    image_loc, deduped by resolved path. Never includes tif/tifR."""
     bases = [b for b in (row.annot_loc, row.image_loc) if b]
     roots: list[Path] = []
     seen: set[Path] = set()
@@ -213,10 +227,142 @@ def audit_series(session: Session, name: str) -> SeriesAuditReport:
                 continue
             seen.add(key)
             roots.append(c)
-    report.roots = [str(r) for r in roots]
+    return roots
+
+
+# --- lockout census (whole-DB, per-owner fix scripts) -----------------------
+
+
+@dataclass
+class LockedEntry:
+    """One entry a `users`-group member cannot write, so curation can't hand off.
+
+    `owner` is the file's owner (the account that must run the chgrp/chmod, since
+    the lab filesystem doesn't let root override permissions).
+    """
+
+    series: str
+    path: str
+    is_dir: bool
+    owner_uid: int
+    owner: str
+    gid: int
+    mode: int  # stat.S_IMODE
+
+
+def account_exists(uid: int) -> bool:
+    """Whether `uid` maps to a real login account on this host. Orphaned uids
+    (departed lab members) can't be `su`'d to, so their files can't be fixed
+    by the owner-runs-a-script route — flagged separately."""
+    try:
+        pwd.getpwuid(uid)
+        return True
+    except KeyError:
+        return False
+
+
+def _owner_name(uid: int) -> str:
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
+def writable_by_group_member(st: os.stat_result, gid_want: int | None) -> bool:
+    """Can a (non-owner) member of the `users` group write this entry?
+
+    True when it is world-writable OR (group is `users` AND group-writable).
+    World-writable counts as writable — it's looser than the 0664 policy but
+    still lets any lab member re-save, which is the goal here.
+    """
+    mode = stat.S_IMODE(st.st_mode)
+    if mode & 0o002:
+        return True
+    if gid_want is not None and st.st_gid == gid_want and (mode & 0o020):
+        return True
+    return False
+
+
+def census_series(session: Session, name: str) -> "SeriesCensus":
+    """Read-only: find every entry in a series' modifiable subtrees that a
+    `users`-group member cannot write (the curation-handoff lockout subset)."""
+    row = q_series.get_by_name(session, name)
+    census = SeriesCensus(name=name)
+    if row is None:
+        census.missing = True
+        return census
+    gid_want = _target_gid()
+    roots = _series_roots(row)
     if not roots:
-        report.no_paths = True
-        return report
-    for r in roots:
-        _audit_tree(r, gid_want, report)
-    return report
+        census.no_paths = True
+        return census
+    for root in roots:
+        for p, is_dir in _iter_entries(root):
+            try:
+                st = p.lstat()
+            except OSError:
+                continue
+            if is_dir:
+                census.n_dirs += 1
+            else:
+                census.n_files += 1
+            if not writable_by_group_member(st, gid_want):
+                census.locked.append(
+                    LockedEntry(
+                        series=name,
+                        path=str(p),
+                        is_dir=is_dir,
+                        owner_uid=st.st_uid,
+                        owner=_owner_name(st.st_uid),
+                        gid=st.st_gid,
+                        mode=stat.S_IMODE(st.st_mode),
+                    )
+                )
+    return census
+
+
+@dataclass
+class SeriesCensus:
+    name: str
+    n_files: int = 0
+    n_dirs: int = 0
+    locked: list[LockedEntry] = field(default_factory=list)
+    missing: bool = False
+    no_paths: bool = False
+
+
+def _iter_entries(root: Path):
+    """Yield (path, is_dir) for `root` and its descendants, skipping symlinks.
+    Bounded — `root` is one of AUDIT_SUBPATHS, never a raw-image tree."""
+    if root.is_symlink():
+        return
+    if root.is_file():
+        yield root, False
+        return
+    if not root.is_dir():
+        return
+    yield root, True
+    for dirpath, dirnames, filenames in os.walk(root):
+        for d in dirnames:
+            p = Path(dirpath) / d
+            if not p.is_symlink():
+                yield p, True
+        for f in filenames:
+            p = Path(dirpath) / f
+            if not p.is_symlink():
+                yield p, False
+
+
+def fix_line(entry: LockedEntry, group: str = fsutil.DEFAULT_GROUP) -> str:
+    """The additive shell command to make one locked entry group-writable.
+
+    Adds group ownership + group access WITHOUT stripping any existing world
+    bits (the corpus's legacy world-writable mode is intentionally preserved).
+    Dirs also get setgid so future writes inherit the group.
+    """
+    from .external_tools import shell_quote
+
+    q = shell_quote(entry.path)
+    if entry.is_dir:
+        return f"chgrp {group} -- {q} && chmod g+rwxs -- {q}"
+    return f"chgrp {group} -- {q} && chmod g+rw -- {q}"

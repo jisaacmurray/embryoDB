@@ -2547,6 +2547,185 @@ def audit_permissions_cmd(
     raise typer.Exit(1 if total_issues else 0)
 
 
+@app.command("plan-permission-fix")
+def plan_permission_fix_cmd(
+    series: Annotated[
+        list[str] | None,
+        typer.Argument(help="Series names (omit when using --dataset or --all)"),
+    ] = None,
+    dataset: Annotated[
+        str | None,
+        typer.Option("--dataset", "-d", help="Census every series in this dataset"),
+    ] = None,
+    all_series: Annotated[
+        bool,
+        typer.Option("--all", help="Census every non-deleted series in the DB."),
+    ] = False,
+    out_dir: Annotated[
+        Path,
+        typer.Option("--out", help="Where to write census.tsv + per-user scripts."),
+    ] = Path("./permission_fix"),
+    limit: Annotated[
+        int | None, typer.Option("--limit", help="Cap series scanned (testing).")
+    ] = None,
+    batch_size: Annotated[
+        int,
+        typer.Option("--batch-size", help="Series per DB session (resilience)."),
+    ] = 200,
+) -> None:
+    """Whole-DB census of the curation-handoff lockout subset + per-owner fix
+    scripts.
+
+    Read-only against the filesystem: for each series it stats `dats/`,
+    `matlab/`, `MLtemp/` and `matlabParams` (never the tif/ image tree) and
+    records every entry a `users`-group member cannot write — i.e. NOT
+    world-writable AND NOT (group `users` + group-writable). Writes
+    `census.tsv` (the raw findings) and one `fix_permissions_<owner>.sh` per
+    owning account.
+
+    The scripts are **additive** (add group `users` + group-write, setgid on
+    dirs; world bits left alone) and must be run **as each owner** — the lab
+    filesystem doesn't let root override permissions:
+
+        su - <owner> -c 'bash <out>/fix_permissions_<owner>.sh'
+    """
+    from . import permissions
+    from .external_tools import shell_quote
+    from .fsutil import DEFAULT_GROUP
+
+    if all_series:
+        if series or dataset:
+            console.print("[red]--all takes no series names or --dataset[/red]")
+            raise typer.Exit(2)
+        from sqlalchemy import select
+        from .models import Series
+
+        with database.session_scope() as session:
+            stmt = (
+                select(Series.series_name)
+                .where(Series.deleted_at.is_(None))
+                .order_by(Series.series_name)
+            )
+            if limit:
+                stmt = stmt.limit(limit)
+            names = [r[0] for r in session.execute(stmt).all()]
+    else:
+        names = _resolve_series_arg(series, dataset)
+        if limit:
+            names = names[:limit]
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    census_path = out_dir / "census.tsv"
+
+    by_owner: dict[str, list[permissions.LockedEntry]] = {}
+    scanned = missing = no_paths = 0
+    total_locked = 0
+    total = len(names)
+    console.print(f"census: {total} series → {out_dir}")
+
+    with census_path.open("w") as fh:
+        fh.write("series\tpath\ttype\towner\tgid\tmode\n")
+        for start in range(0, total, batch_size):
+            batch = names[start : start + batch_size]
+            with database.session_scope() as session:
+                for nm in batch:
+                    c = permissions.census_series(session, nm)
+                    if c.missing:
+                        missing += 1
+                        continue
+                    if c.no_paths:
+                        no_paths += 1
+                        continue
+                    scanned += 1
+                    for e in c.locked:
+                        by_owner.setdefault(e.owner, []).append(e)
+                        fh.write(
+                            f"{e.series}\t{e.path}\t{'d' if e.is_dir else 'f'}\t"
+                            f"{e.owner}\t{e.gid}\t{oct(e.mode)}\n"
+                        )
+                        total_locked += 1
+            fh.flush()
+            done = min(start + batch_size, total)
+            console.print(
+                f"  [dim]progress[/dim] {done}/{total} — {total_locked} locked "
+                f"entr(ies) so far across {len(by_owner)} owner(s)"
+            )
+
+    # Per-owner additive fix scripts. Orphaned uids (no account) are split out:
+    # they can't be su'd to, so their files need a different remedy.
+    scripts: list[Path] = []
+    orphan_owners: list[str] = []
+    for owner, entries in sorted(by_owner.items()):
+        uid = entries[0].owner_uid
+        real = permissions.account_exists(uid)
+        if not real:
+            orphan_owners.append(owner)
+        sp = out_dir / f"fix_permissions_{owner}.sh"
+        header = [
+            "#!/bin/bash",
+            f"# embryoDB permission fix — files owned by {owner}",
+            f"# {len(entries)} entr(ies) a 'users'-group member cannot currently write.",
+        ]
+        if real:
+            header += [
+                f"# Run AS {owner} (root can't override perms on this filesystem):",
+                f"#     su - {owner} -c 'bash {sp.resolve()}'",
+            ]
+        else:
+            header += [
+                f"# WARNING: uid {uid} has NO account on this host — you cannot su to it.",
+                "# These files can't be chgrp'd by their (departed) owner. Remedy is",
+                "# either a GPFS admin with override capability, or the DIRECTORY owner",
+                "# deleting each stale file so a users-group member can re-save it.",
+                "# The chgrp/chmod below will only succeed if run with override rights.",
+            ]
+        header += [
+            "# Additive: adds group 'users' + group-write (setgid on dirs); "
+            "world bits untouched.",
+            "ok=0; fail=0",
+            "",
+        ]
+        lines = list(header)
+        for e in entries:
+            q = shell_quote(e.path)
+            lines.append(
+                f"if {permissions.fix_line(e)}; then ok=$((ok+1)); "
+                f"else fail=$((fail+1)); echo FAILED: {q} >&2; fi"
+            )
+        lines += ["", f'echo "{owner}: $ok fixed, $fail failed"', ""]
+        sp.write_text("\n".join(lines))
+        sp.chmod(0o755)
+        scripts.append(sp)
+
+    console.print(
+        f"\n[bold]Census:[/bold] {scanned} scanned, {no_paths} with no target "
+        f"paths, {missing} missing — "
+        + (
+            f"[red]{total_locked} locked entr(ies) across {len(by_owner)} owner(s)[/red]"
+            if total_locked
+            else "[green]none locked out[/green]"
+        )
+    )
+    for owner, entries in sorted(by_owner.items(), key=lambda kv: -len(kv[1])):
+        tag = "" if permissions.account_exists(entries[0].owner_uid) else "  [red](no account)[/red]"
+        console.print(f"  {len(entries):>7}  {owner}{tag}")
+    if orphan_owners:
+        console.print(
+            f"[red]⚠ {len(orphan_owners)} owner(s) have no account "
+            f"({', '.join(orphan_owners)}) — their files can't be fixed by "
+            f"`su - <owner>`; need admin override or dir-owner recreate.[/red]"
+        )
+    console.print(f"\ncensus → [cyan]{census_path}[/cyan]")
+    for sp in scripts:
+        console.print(f"script → [cyan]{sp}[/cyan]  (run as its owner)")
+    if scripts:
+        console.print(
+            f"[dim]each script only touches its owner's files; target group "
+            f"{DEFAULT_GROUP}[/dim]"
+        )
+    raise typer.Exit(1 if total_locked else 0)
+
+
 @app.command("fix-permissions")
 def fix_permissions_cmd(
     series: Annotated[

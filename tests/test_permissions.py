@@ -245,3 +245,69 @@ def test_audit_series_flags_wrong_group(db_session, tmp_path, monkeypatch):
     rep = permissions.audit_series(db_session, "20260528_aud_L5")
     issue = _issue_for(rep, f)
     assert issue and any(p.startswith("group=") for p in issue.problems)
+
+
+# --- lockout census ---------------------------------------------------------
+
+
+class _FakeStat:
+    def __init__(self, mode: int, gid: int):
+        self.st_mode = stat.S_IFREG | mode
+        self.st_gid = gid
+
+
+def test_writable_by_group_member_logic():
+    users_gid = 100
+    # world-writable → writable regardless of group.
+    assert permissions.writable_by_group_member(_FakeStat(0o646, 999), users_gid)
+    # group users + group-writable → writable.
+    assert permissions.writable_by_group_member(_FakeStat(0o664, 100), users_gid)
+    # group users but NOT group-writable → locked out.
+    assert not permissions.writable_by_group_member(_FakeStat(0o644, 100), users_gid)
+    # group-writable but WRONG group, not world-writable → locked out.
+    assert not permissions.writable_by_group_member(_FakeStat(0o664, 999), users_gid)
+
+
+def test_census_series_finds_locked_and_skips_writable(db_session, tmp_path, monkeypatch):
+    file_gid = tmp_path.stat().st_gid
+    # Pretend the test's own group is the target `users` group.
+    monkeypatch.setattr(permissions, "_target_gid", lambda *a, **k: file_gid)
+    root = tmp_path / "series"
+    dats = root / "dats"
+    dats.mkdir(parents=True)
+    locked = dats / "locked.csv"
+    locked.write_text("x")
+    os.chmod(locked, 0o644)  # own group but not group-writable → locked out
+    okfile = dats / "ok.csv"
+    okfile.write_text("y")
+    os.chmod(okfile, 0o664)  # group-writable → fine
+    worldw = dats / "world.csv"
+    worldw.write_text("z")
+    os.chmod(worldw, 0o646)  # world-writable → fine
+
+    db_session.add(
+        Series(series_name="20260528_cen_L1", annot_loc=str(root), image_loc=str(root))
+    )
+    db_session.flush()
+
+    c = permissions.census_series(db_session, "20260528_cen_L1")
+    paths = {e.path for e in c.locked}
+    assert str(locked) in paths
+    assert str(okfile) not in paths
+    assert str(worldw) not in paths
+
+
+def test_fix_line_shape():
+    f = permissions.LockedEntry(
+        series="s", path="/a b/c.csv", is_dir=False, owner_uid=1, owner="u", gid=1, mode=0o644
+    )
+    d = permissions.LockedEntry(
+        series="s", path="/a b/dats", is_dir=True, owner_uid=1, owner="u", gid=1, mode=0o755
+    )
+    fl = permissions.fix_line(f)
+    dl = permissions.fix_line(d)
+    # Additive: chmod g+rw for files, g+rwxs (setgid) for dirs; paths quoted.
+    assert "chmod g+rw " in fl and "g+rwxs" not in fl
+    assert "chmod g+rwxs " in dl
+    assert "'/a b/c.csv'" in fl  # single-quoted (has a space)
+    assert fl.startswith("chgrp users -- ")

@@ -23,6 +23,7 @@ from __future__ import annotations
 import grp
 import os
 import shutil
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -79,24 +80,40 @@ def ensure_dir(path: Path | str) -> Path:
 
 
 def safe_write_bytes(path: Path | str, data: bytes) -> Path:
-    """Write `data` to `path`, ensuring parent dirs + permissions."""
+    """Atomically write `data` to `path`, ensuring parent dirs + permissions.
+
+    Writes to a sibling temp file, applies the project mode/group, then
+    `os.replace`s it into place. Two reasons this is temp-file + rename and not
+    an in-place `write_bytes`:
+      1. Atomicity — a reader never sees a half-written file.
+      2. Perm-laundering — the replacement is a FRESH inode. Created in the
+         per-series setgid `dats/` dir, it inherits gid `users` passively. An
+         in-place `write_bytes` truncates the EXISTING inode, so a wrong-group
+         legacy file would keep its wrong group even after a re-extract (the NFS
+         `manage-gids` server blocks our `chgrp`, so inheritance is the only
+         lever we have). The rename relaunders it.
+    """
     p = Path(path)
     ensure_dir(p.parent)
     with _scoped_umask():
-        p.write_bytes(data)
-    chmod_if_possible(p, DEFAULT_FILE_MODE)
-    chgrp_if_possible(p)
+        fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=f".{p.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+            chmod_if_possible(tmp, DEFAULT_FILE_MODE)
+            chgrp_if_possible(tmp)
+            os.replace(tmp, p)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     return p
 
 
 def safe_write_text(path: Path | str, text: str, encoding: str = "utf-8") -> Path:
-    p = Path(path)
-    ensure_dir(p.parent)
-    with _scoped_umask():
-        p.write_text(text, encoding=encoding)
-    chmod_if_possible(p, DEFAULT_FILE_MODE)
-    chgrp_if_possible(p)
-    return p
+    return safe_write_bytes(path, text.encode(encoding))
 
 
 def safe_copy(src: Path | str, dst: Path | str) -> Path:

@@ -532,15 +532,19 @@ def _run_starrynite_new(
         # PLACEHOLDER: a future generalized estimator calibrated for legacy
         # classic-SN lineages would run on the "old" engine path instead; it is
         # deliberately NOT invoked there today (documented negative transfer).
-        nuclei_dir = snv1.find_nuclei_dir(scratch_out)
-        if nuclei_dir is not None and xyres and zres:
+        # Prefer the durable landed lineage zip (survives scratch cleanup, so
+        # it's backfillable and independent of the driver's scratch layout);
+        # fall back to the loose scratch nuclei dir if the zip is somehow absent.
+        edit_zip = Path(landed["edit_zip"])
+        effort_source = edit_zip if edit_zip.exists() else snv1.find_nuclei_dir(scratch_out)
+        if effort_source is not None and xyres and zres:
             summary["effort"] = snv1.run_effort(
-                nuclei_dir, xyres, zres, dats_dir, series_name
+                effort_source, xyres, zres, dats_dir, series_name
             )
         else:
             summary["effort"] = {
                 "ran": False,
-                "error": "no nuclei dir or missing xyres/zres in matlabParams",
+                "error": "no lineage zip / nuclei dir or missing xyres/zres in matlabParams",
             }
 
         _finish_run(run_id, log_path, 0, output_summary=summary)

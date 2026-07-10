@@ -117,9 +117,15 @@ def build_matlab_command(
     on one series. `image_first_plane` is ``<image_loc>/tif/<series>-t001-p01.tif``;
     `scratch_out` is the (scratch) output dir the lineage lands in."""
     release = settings.starrynite_v1_dir
+    # The legacy driver builds every output path by string-concatenating
+    # `outputdirectory` with a filename, so it MUST end in a separator; without
+    # one the lineage zip lands as `<scratch>/out<series>_run.zip` (sibling of
+    # `out/`) instead of `<scratch>/out/<series>_run.zip`, where land_lineage /
+    # find_lineage_zip look — and the run is wrongly reported as producing none.
+    scratch_out_slash = os.path.join(str(scratch_out), "")
     matlab_expr = (
         f"addpath('{release}'); "
-        f"run_starrynite('{paramfile}', '{image_first_plane}', '{scratch_out}')"
+        f"run_starrynite('{paramfile}', '{image_first_plane}', '{scratch_out_slash}')"
     )
     cmd = [
         str(settings.matlab_command),
@@ -150,6 +156,11 @@ def find_nuclei_dir(scratch_out: Path | str) -> Path | None:
         return cand
     if glob.glob(str(out / "t*-nuclei")):
         return out
+    # The release driver writes tracked nuclei to `<out>/<suffix><series>/nuclei/`
+    # (e.g. `out/run<series>/nuclei/`) — one level deeper than the checks above.
+    for nested in sorted(glob.glob(os.path.join(str(out), "*", "nuclei"))):
+        if glob.glob(os.path.join(nested, "t*-nuclei")):
+            return Path(nested)
     return None
 
 
@@ -180,13 +191,20 @@ _TRIAGE_RE = re.compile(
 
 
 def run_effort(
-    nuclei_dir: Path | str,
+    nuclei_source: Path | str,
     xyres: float,
     zres: float,
     dats_dir: Path | str,
     series_name: str,
 ) -> dict:
-    """Run the GT-free curation-effort predictor on a NEW-SN nuclei dir.
+    """Run the GT-free curation-effort predictor on NEW-SN output.
+
+    `nuclei_source` is either a loose tracked-nuclei dir (``tNNN-nuclei`` files)
+    or an AceTree lineage ``.zip`` — the release ``predict_effort.py`` accepts
+    both and, for a zip, extracts its internal ``nuclei/tNNN-nuclei`` entries to
+    a tempdir before running the same featurizer/model. We prefer the landed
+    ``dats/<series>-edit.zip`` because it is durable (survives scratch cleanup,
+    so it is also backfillable) and decoupled from the driver's scratch layout.
 
     Writes the full predictor stdout to ``dats/<series>_sn_effort.txt`` and
     returns a structured summary (triage bucket + full-movie effort +
@@ -204,7 +222,7 @@ def run_effort(
     cmd = [
         str(settings.effort_python),
         str(script),
-        str(nuclei_dir),
+        str(nuclei_source),
         str(xyres),
         str(zres),
     ]

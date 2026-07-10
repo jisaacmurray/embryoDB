@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from qtpy import QtCore
+from qtpy import QtCore, QtGui
 from sqlalchemy.orm import Session
 
 from ..models import PipelineStepRun, RunStatus, Series, Status
@@ -40,6 +40,10 @@ class Filters:
 # database column keeps the legacy name for round-trip XML compatibility.
 COLUMNS: list[tuple[str, str]] = [
     ("series_name", "Series"),
+    # v2: GT-free StarryNite curation-effort estimate, adjacent to the name so
+    # the triage bucket reads at a glance. Derived from the latest run_starrynite
+    # run's output_summary; color-coded via _EFFORT_COLORS in data().
+    ("effort", "Effort"),
     ("date_acquired", "Date"),
     ("person", "Person"),
     ("strain_name", "Strain"),
@@ -131,6 +135,58 @@ def _summarize_runs(runs: list[PipelineStepRun]) -> str:
     return f"{head}  " + " ".join(parts)
 
 
+# Triage bucket -> (friendly label, cell background). Buckets are matched by
+# keyword because the predictor's triage token has varied ("hard",
+# "curate/moderate", "leave-easy"). Backgrounds are deliberately pale so the
+# black cell text stays readable.
+_EFFORT_BUCKETS: list[tuple[tuple[str, ...], str, QtGui.QColor]] = [
+    (("hard",), "Hard", QtGui.QColor(244, 199, 195)),        # pale red
+    (("moderate", "curate"), "Moderate", QtGui.QColor(252, 232, 178)),  # pale amber
+    (("easy", "leave"), "Easy", QtGui.QColor(199, 232, 201)),  # pale green
+]
+
+
+def _classify_triage(triage: str) -> tuple[str, QtGui.QColor | None]:
+    """Map a raw predictor triage token to a (label, background) pair."""
+    t = (triage or "").lower()
+    for keys, label, color in _EFFORT_BUCKETS:
+        if any(k in t for k in keys):
+            return label, color
+    return (triage or ""), None
+
+
+def _latest_effort(runs: list[PipelineStepRun]) -> dict | None:
+    """The effort dict from the most-recent run_starrynite run that produced one.
+
+    Returns None when no new-SN run has an effort estimate (legacy / old-engine
+    series, or a run that skipped the predictor)."""
+    sn = [
+        r for r in runs
+        if r.step == "run_starrynite" and isinstance(r.output_summary, dict)
+        and isinstance(r.output_summary.get("effort"), dict)
+        and r.output_summary["effort"].get("ran")
+    ]
+    if not sn:
+        return None
+    sn.sort(key=lambda r: (r.completed_at or r.started_at or datetime.min), reverse=True)
+    return sn[0].output_summary["effort"]
+
+
+def _summarize_effort(runs: list[PipelineStepRun]) -> tuple[str, QtGui.QColor | None]:
+    """(display text, background color) for the Effort cell. Empty when none."""
+    eff = _latest_effort(runs)
+    if eff is None:
+        return "", None
+    label, color = _classify_triage(str(eff.get("triage", "")))
+    events = eff.get("effort_events")
+    if events is not None:
+        try:
+            label = f"{label} — {int(round(float(events)))}"
+        except (TypeError, ValueError):
+            pass
+    return label, color
+
+
 class SeriesTableModel(QtCore.QAbstractTableModel):
     """List-of-rows table; one row per Series. Pure read model.
 
@@ -176,10 +232,16 @@ class SeriesTableModel(QtCore.QAbstractTableModel):
                 select(PipelineStepRun).where(PipelineStepRun.series_id.in_(ids))
             ).scalars():
                 runs_by_series.setdefault(run.series_id, []).append(run)
-        self._rows = [
-            {**self._row_to_dict(r), "pipeline_summary": _summarize_runs(runs_by_series.get(r.id, []))}
-            for r in rows
-        ]
+        self._rows = []
+        for r in rows:
+            runs = runs_by_series.get(r.id, [])
+            effort_text, effort_color = _summarize_effort(runs)
+            self._rows.append({
+                **self._row_to_dict(r),
+                "pipeline_summary": _summarize_runs(runs),
+                "effort": effort_text,
+                "effort_color": effort_color,
+            })
         self._apply_sort()
         self.endResetModel()
 
@@ -228,6 +290,8 @@ class SeriesTableModel(QtCore.QAbstractTableModel):
         if role == QtCore.Qt.ToolTipRole:
             attr = COLUMNS[index.column()][0]
             return self._render(self._rows[index.row()].get(attr, ""))
+        if role == QtCore.Qt.BackgroundRole and COLUMNS[index.column()][0] == "effort":
+            return self._rows[index.row()].get("effort_color")
         return None
 
     def sort(self, column: int, order: int) -> None:

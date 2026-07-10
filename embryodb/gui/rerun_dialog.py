@@ -188,6 +188,17 @@ class RerunPipelineDialog(QtWidgets.QDialog):
         proto_row.addWidget(self._proto_combo, 1)
         self._proto_combo.currentIndexChanged.connect(self._on_protocol_picked)
         params_vl.addLayout(proto_row)
+        copy_row = QtWidgets.QHBoxLayout()
+        copy_btn = QtWidgets.QPushButton("Copy current → new")
+        copy_btn.setToolTip(
+            "Pre-fill all New value cells from the current file so you only\n"
+            "need to edit the parameters you want to change."
+        )
+        copy_btn.clicked.connect(self._on_copy_current)
+        copy_row.addWidget(copy_btn)
+        copy_row.addStretch(1)
+        params_vl.addLayout(copy_row)
+
         self._params_table = QtWidgets.QTableWidget(len(TUNABLE_KEYS), 3)
         self._params_table.setHorizontalHeaderLabels(["Key", "Current value", "New value"])
         self._params_table.horizontalHeader().setStretchLastSection(True)
@@ -209,6 +220,7 @@ class RerunPipelineDialog(QtWidgets.QDialog):
                 if "start_time" not in current_vals or not current_vals["start_time"]:
                     current_vals["start_time"] = "1"
 
+        self._current_vals = current_vals
         for row_idx, key in enumerate(TUNABLE_KEYS):
             key_item = QtWidgets.QTableWidgetItem(key)
             key_item.setFlags(key_item.flags() & ~QtCore.Qt.ItemIsEditable)
@@ -256,6 +268,14 @@ class RerunPipelineDialog(QtWidgets.QDialog):
         layout.addWidget(btns)
 
     # --- action -------------------------------------------------------------
+
+    def _on_copy_current(self) -> None:
+        """Pre-fill every non-empty New value cell from the Current value column."""
+        for row_idx in range(self._params_table.rowCount()):
+            cur = self._params_table.item(row_idx, 1)
+            new = self._params_table.item(row_idx, 2)
+            if cur and new and cur.text():
+                new.setText(cur.text())
 
     def _on_protocol_picked(self, idx: int) -> None:
         """Populate the Override column from the selected protocol's defaults.

@@ -136,8 +136,13 @@ class Settings(BaseSettings):
         description="Full MATLAB launcher for the new all-MATLAB StarryNite (EMBRYODB_MATLAB_COMMAND).",
     )
     starrynite_v1_dir: Path = Field(
-        default=Path("/murrlab/gpfs/fs0/l/murr/new_tools/StarryNite/release_v1"),
-        description="release_v1 dir holding run_starrynite.m, the param template, and effort/.",
+        # FROZEN release copy, committed + isolated from the active dev tree at
+        # new_tools/StarryNite/ (whose uncommitted edits break runs -- e.g. an
+        # 11-dim perp feature vs this release's 10-dim model). Point production
+        # runs here; never at the dev tree. The tracking model + .m code resolve
+        # from starrynite_v1_dir/../distribution_lineaging, i.e. the frozen tree.
+        default=Path("/murrlab/gpfs/fs0/l/murr/new_tools/StarryNite_release_v1/release_v1"),
+        description="Frozen release_v1 dir holding run_starrynite.m, the param template, and effort/.",
     )
     starrynite_tracking_model: str = Field(
         default="MurrayTrackingModel_20260704.mat",

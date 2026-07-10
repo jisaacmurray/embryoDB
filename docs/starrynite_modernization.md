@@ -25,6 +25,18 @@ A reference checkout of the current upstream is at `new_tools/StarryNite/`
 (github.com/zhirongbaolab/StarryNite, last pushed 2025-01-13). Findings below
 come from reading it.
 
+> **Which StarryNite tree production runs from.** `new_tools/StarryNite/` is the
+> **active development tree** — it carries uncommitted, half-finished edits and
+> must **never** be used for embryoDB runs. A run against it will crash if a dev
+> edit is mid-flight (e.g. an experimental 11-dim `perp` feature vs the release's
+> 10-dim model). The frozen, committed, self-consistent release lives at
+> **`new_tools/StarryNite_release_v1/`** (retrained 10-dim Murray tracking model,
+> no experimental perp/tilt/rescue). `config.py`'s `starrynite_v1_dir` default
+> points at `StarryNite_release_v1/release_v1`; the model + `.m` code resolve from
+> its sibling `../distribution_lineaging`. Override with `EMBRYODB_STARRYNITE_V1_DIR`
+> only to point at a *newer frozen release*, never at the dev tree. New wins from
+> the dev tree reach production by cutting a new frozen `StarryNite_release_v2/`.
+
 ## Key findings (from the 2025 source)
 
 1. **The 2025 version is 100% MATLAB** — the C tracer is gone, replaced by an

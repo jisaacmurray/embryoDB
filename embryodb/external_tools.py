@@ -92,6 +92,10 @@ EXTRACT_STEPS: tuple[ExtractStep, ...] = (
     ExtractStep("align", "Align1",
         "Sulston-lineage alignment.",
         "java", "Align1"),
+    ExtractStep("getacd", "GetACD",
+        "Map trajectories onto the Richards 2013 reference embryo "
+        "(writes ACD<series>.csv via get_acd.R). Requires AuxInfo.csv from Measure.",
+        "python_cli", "extract-getacd", per_series=True),
     ExtractStep("process_time", "ProcessTime",
         "Per-timepoint timestamps via legacy ProcessTime.pl (SP5 era + older "
         "Stellaris exports). v2-imported acquisitions already have these in "
@@ -283,10 +287,23 @@ def build_print_trees_command(
     max_expr: int | None = None,
     color_scheme: str = "rainbow",
     linewidth: int = 3,
+    cd_prefix: str = "CD",
     base_dir: Path,
 ) -> str:
-    """Render the `acexpress_CL2.jar Tree1` shell."""
-    args = [shell_quote(str(list_file))]
+    """Render the `acexpress_CL2.jar Tree1` shell.
+
+    When `cd_prefix` is not "CD" each series-list line is written as
+    ``<series> - <cd_prefix>`` so Tree1's series-list parser uses the chosen
+    file type (SCD or ACD) instead of the default CD<series>.csv.  The "-"
+    sentinel tells the patched Tree1 that no editRules are active.
+    """
+    list_path = Path(list_file)
+    if cd_prefix != "CD":
+        list_path.write_text(
+            "\n".join(f"{n} - {cd_prefix}" for n in series_names) + "\n",
+            encoding="utf-8",
+        )
+    args = [shell_quote(str(list_path))]
     if min_expr is not None:
         args.append(str(int(min_expr)))
         if max_expr is not None:
@@ -294,7 +311,7 @@ def build_print_trees_command(
             args.append(shell_quote(color_scheme))
             args.append(str(int(linewidth)))
     return (
-        f"echo '== PrintTrees ({len(series_names)} series) ==' && "
+        f"echo '== PrintTrees ({len(series_names)} series, {cd_prefix}) ==' && "
         f"nice java -Xmx1000m -cp {shell_quote(str(base_dir / 'acexpress_CL2.jar'))} "
         f"Tree1 {' '.join(args)}"
     )
@@ -337,6 +354,7 @@ def build_command_for_kind(
             max_expr=params.get("max_expr"),
             color_scheme=params.get("color_scheme", "rainbow"),
             linewidth=params.get("linewidth", 3),
+            cd_prefix=params.get("cd_prefix", "CD"),
             base_dir=base_dir,
         )
     if kind == "getacd":
@@ -419,6 +437,7 @@ def run_print_trees(
     max_expr: int | None = None,
     color_scheme: str = "rainbow",
     linewidth: int = 3,
+    cd_prefix: str = "CD",
     tools3_dir: Path | None = None,
 ) -> LaunchResult:
     """Spawn `acexpress_CL2.jar Tree1` detached against the given series.
@@ -428,6 +447,11 @@ def run_print_trees(
 
     minExpr/maxExpr/linewidth are parsed by Tree1 via `Integer.parseInt` — they
     must be ints (passing "0.0" fails with NumberFormatException).
+
+    `cd_prefix` selects which CSV type Tree1 reads for expression data: "CD"
+    (default), "SCD" (Sulston-aligned), or "ACD" (reference-embryo aligned).
+    Requires the patched acexpress_CL2.jar that handles the three-token series
+    list format (``<series> - <prefix>``).
 
     Output PNGs land in /gpfs/fs0/l/murr/trees/ (hardcoded inside Tree1).
     """
@@ -443,6 +467,7 @@ def run_print_trees(
                 "max_expr": max_expr,
                 "color_scheme": color_scheme,
                 "linewidth": linewidth,
+                "cd_prefix": cd_prefix,
             },
         )
 
@@ -456,6 +481,7 @@ def run_print_trees(
         max_expr=max_expr,
         color_scheme=color_scheme,
         linewidth=linewidth,
+        cd_prefix=cd_prefix,
         base_dir=base_dir,
     )
     proc = _spawn_detached(shell, log_path)

@@ -166,6 +166,19 @@ class Settings(BaseSettings):
             "zip + effort QC are copied back (EMBRYODB_STARRYNITE_SCRATCH_ROOT)."
         ),
     )
+    # --- R-based GetACD (get_acd.R port of GetACD.pl) -----------------------
+    get_acd_dir: Path = Field(
+        default=Path("/murrlab/gpfs/fs0/l/murr/new_tools/accessory/get_ACD"),
+        description=(
+            "Directory containing get_acd.R and SupplementalTable2_DivisionTimes.txt "
+            "(EMBRYODB_GET_ACD_DIR)."
+        ),
+    )
+    rscript_command: Path = Field(
+        default=Path("Rscript"),
+        description="Rscript executable for running get_acd.R (EMBRYODB_RSCRIPT_COMMAND).",
+    )
+
     command_log_dir: Path = Field(
         default_factory=_default_command_log_dir,
         description=(

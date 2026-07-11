@@ -17,6 +17,12 @@ from qtpy import QtCore, QtWidgets
 
 from ..external_tools import LaunchResult, run_print_trees
 
+_CD_PREFIXES: list[tuple[str, str]] = [
+    ("CD",  "CD — raw expression (default)"),
+    ("SCD", "SCD — Sulston-aligned timing"),
+    ("ACD", "ACD — reference-embryo aligned"),
+]
+
 
 _TREE_OUTPUT_DIR = Path("/gpfs/fs0/l/murr/trees")
 
@@ -113,6 +119,18 @@ class PrintTreesDialog(QtWidgets.QDialog):
         self._min_expr_check.toggled.connect(self._color_scheme.setEnabled)
         self._min_expr_check.toggled.connect(self._linewidth.setEnabled)
 
+        self._cd_prefix = QtWidgets.QComboBox()
+        for key, label in _CD_PREFIXES:
+            self._cd_prefix.addItem(label, key)
+        self._cd_prefix.setToolTip(
+            "Which expression CSV file Tree1 reads per series:\n"
+            "  CD   — raw RedExtract output (default)\n"
+            "  SCD  — Sulston-aligned: timing warped to canonical cell-cycle lengths\n"
+            "  ACD  — spatially aligned to the Richards 2013 reference embryo\n"
+            "SCD/ACD require the patched acexpress_CL2.jar."
+        )
+        fl.addRow("Expression file:", self._cd_prefix)
+
         layout.addWidget(form)
 
         info = QtWidgets.QLabel(
@@ -152,6 +170,9 @@ class PrintTreesDialog(QtWidgets.QDialog):
             kwargs["max_expr"] = int(self._max_expr.value())
             kwargs["color_scheme"] = self._color_scheme.currentText().strip() or "rainbow"
             kwargs["linewidth"] = int(self._linewidth.value())
+        cd_prefix = self._cd_prefix.currentData() or "CD"
+        if cd_prefix != "CD":
+            kwargs["cd_prefix"] = cd_prefix
         try:
             result: LaunchResult = run_print_trees(self._series_names, **kwargs)
         except Exception as exc:

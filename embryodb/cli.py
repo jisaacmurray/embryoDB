@@ -2321,6 +2321,64 @@ def extract_cmd(
     _report_launch(result, f"extract ({', '.join(step_keys)})", len(names))
 
 
+@app.command("extract-getacd", hidden=True)
+def extract_getacd_cmd(
+    series_name: Annotated[str, typer.Argument(help="Series name")],
+) -> None:
+    """Run get_acd.R for one series (called per-series from the extract pipeline).
+
+    Resolves the series' dats/ directory from the DB, then runs
+    ``Rscript get_acd.R --input CD<name>.csv --auxinfo <name>AuxInfo.csv
+    --output ACD<name>.csv``.  Exits 0 (soft skip) when AuxInfo.csv is absent
+    (Measure not yet run); exits non-zero on R failure.
+    """
+    import subprocess
+    from pathlib import Path
+
+    from .config import settings
+    from .database import session_scope
+    from .queries.series import get_by_name
+
+    with session_scope() as s:
+        row = get_by_name(s, series_name)
+        if row is None:
+            console.print(f"[red]extract-getacd: series {series_name!r} not found[/red]")
+            raise typer.Exit(2)
+        annot_loc = row.annot_loc
+
+    if not annot_loc:
+        console.print(f"[red]extract-getacd: {series_name!r} has no annot_loc[/red]")
+        raise typer.Exit(2)
+
+    dats = Path(annot_loc) / "dats"
+    cd_file = dats / f"CD{series_name}.csv"
+    aux_file = dats / f"{series_name}AuxInfo.csv"
+    out_file = dats / f"ACD{series_name}.csv"
+
+    if not cd_file.exists():
+        console.print(f"[red]extract-getacd: CD file not found: {cd_file}[/red]")
+        raise typer.Exit(1)
+    if not aux_file.exists():
+        console.print(
+            f"[yellow]extract-getacd: AuxInfo not found: {aux_file} — skipping[/yellow]"
+        )
+        raise typer.Exit(0)
+
+    script = settings.get_acd_dir / "get_acd.R"
+    div_times = settings.get_acd_dir / "SupplementalTable2_DivisionTimes.txt"
+    cmd = [
+        str(settings.rscript_command), str(script),
+        "--input", str(cd_file),
+        "--auxinfo", str(aux_file),
+        "--output", str(out_file),
+        "--division_times", str(div_times),
+    ]
+    console.print(f"extract-getacd: {series_name}")
+    result = subprocess.run(cmd, text=True)
+    if result.returncode != 0:
+        raise typer.Exit(result.returncode)
+
+
 @app.command("run-extract-batch", hidden=True)
 def run_extract_batch_cmd(
     list_file: Annotated[
@@ -2371,6 +2429,13 @@ def print_trees_cmd(
         str, typer.Option("--color-scheme", help="Color scheme or root cell")
     ] = "rainbow",
     linewidth: Annotated[int, typer.Option("--linewidth")] = 3,
+    cd_prefix: Annotated[
+        str,
+        typer.Option(
+            "--cd-prefix",
+            help="Expression CSV type: CD (default), SCD (Sulston-aligned), or ACD (reference-embryo aligned).",
+        ),
+    ] = "CD",
 ) -> None:
     """Render lineage-tree PNGs via Tree1 (CLI twin of the GUI "Print trees…").
     Detached job; PNGs land in /gpfs/fs0/l/murr/trees/.
@@ -2384,6 +2449,7 @@ def print_trees_cmd(
         max_expr=max_expr,
         color_scheme=color_scheme,
         linewidth=linewidth,
+        cd_prefix=cd_prefix,
     )
     _report_launch(result, "PrintTrees", len(names))
 

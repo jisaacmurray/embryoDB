@@ -51,6 +51,7 @@ EXTRACT_STEP_PIPELINE_NAME: dict[str, str] = {
     "partial": "partial",
     "measure": "run_measure",               # dedup: == Measure1
     "align": "align1",
+    "getacd": "getacd",
     "process_time": "compute_timestamps",    # dedup: == ProcessTime
     "update_perms": "update_perms",
 }
@@ -85,7 +86,7 @@ DETAIL_STEP_ORDER: tuple[str, ...] = (
     "write_acetree_config", "write_embryodb_xml", "create_alias_symlink",
     "write_matlab_params", "run_starrynite",
     "run_red_extract", "red_excel1", "red_excel2", "partial",
-    "run_measure", "align1", "update_perms",
+    "run_measure", "align1", "getacd", "update_perms",
 )
 
 

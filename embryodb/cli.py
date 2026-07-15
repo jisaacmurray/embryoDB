@@ -2325,18 +2325,17 @@ def extract_cmd(
 def extract_getacd_cmd(
     series_name: Annotated[str, typer.Argument(help="Series name")],
 ) -> None:
-    """Run get_acd.R for one series (called per-series from the extract pipeline).
+    """Run GetACD for one series (called per-series from the extract pipeline).
 
-    Resolves the series' dats/ directory from the DB, then runs
-    ``Rscript get_acd.R --input CD<name>.csv --auxinfo <name>AuxInfo.csv
-    --output ACD<name>.csv``.  Exits 0 (soft skip) when AuxInfo.csv is absent
-    (Measure not yet run); exits non-zero on R failure.
+    Resolves the series' dats/ directory from the DB, runs the Python port of
+    GetACD.pl (embryodb.getacd), and writes ACD<name>.csv.  Exits 0 (soft
+    skip) when AuxInfo.csv is absent (Measure not yet run).
     """
-    import subprocess
     from pathlib import Path
 
     from .config import settings
     from .database import session_scope
+    from .getacd import _write_csv, load_division_times, process_series
     from .queries.series import get_by_name
 
     with session_scope() as s:
@@ -2351,7 +2350,7 @@ def extract_getacd_cmd(
         raise typer.Exit(2)
 
     dats = Path(annot_loc) / "dats"
-    cd_file = dats / f"CD{series_name}.csv"
+    cd_file  = dats / f"CD{series_name}.csv"
     aux_file = dats / f"{series_name}AuxInfo.csv"
     out_file = dats / f"ACD{series_name}.csv"
 
@@ -2364,19 +2363,16 @@ def extract_getacd_cmd(
         )
         raise typer.Exit(0)
 
-    script = settings.get_acd_dir / "get_acd.R"
-    div_times = settings.get_acd_dir / "SupplementalTable2_DivisionTimes.txt"
-    cmd = [
-        str(settings.rscript_command), str(script),
-        "--input", str(cd_file),
-        "--auxinfo", str(aux_file),
-        "--output", str(out_file),
-        "--division_times", str(div_times),
-    ]
+    div_times_path = settings.get_acd_dir / "SupplementalTable2_DivisionTimes.txt"
     console.print(f"extract-getacd: {series_name}")
-    result = subprocess.run(cmd, text=True)
-    if result.returncode != 0:
-        raise typer.Exit(result.returncode)
+    div_times = load_division_times(div_times_path)
+    out = process_series(cd_file, aux_file, div_times)
+    if out is None:
+        console.print(f"[red]extract-getacd: no output produced for {series_name}[/red]")
+        raise typer.Exit(1)
+    header, rows = out
+    _write_csv(out_file, header, rows)
+    console.print(f"extract-getacd: wrote {out_file}")
 
 
 @app.command("run-extract-batch", hidden=True)

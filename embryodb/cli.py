@@ -840,6 +840,150 @@ def stats_cmd() -> None:
         console.print(f"  {status.value:>14}: {n}")
 
 
+@app.command("effort-manifest")
+def effort_manifest_cmd(
+    dataset: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--dataset", "-d",
+            help="Restrict to this dataset's members (repeatable). Default: all curated series.",
+        ),
+    ] = None,
+    out: Annotated[
+        Path | None,
+        typer.Option("--out", "-o", help="Manifest TSV path (default: EMBRYODB_EXPORT_DIR/effort_manifest.tsv)"),
+    ] = None,
+    trusted_list: Annotated[
+        list[str] | None,
+        typer.Option("--trusted-list", help="Dataset name to treat as high-confidence (repeatable)."),
+    ] = None,
+    no_stat: Annotated[
+        bool,
+        typer.Option("--no-stat", help="Skip the on-disk raw/edit zip existence check."),
+    ] = False,
+    show_missing: Annotated[
+        bool,
+        typer.Option("--show-missing", help="List curated series missing a raw or edit zip."),
+    ] = False,
+    write: Annotated[
+        bool,
+        typer.Option("--write/--no-write", help="Write the manifest TSV (default: on)."),
+    ] = True,
+    date_from: Annotated[
+        str | None,
+        typer.Option("--date-from", help="Include only series with date_acquired >= YYYYMMDD (e.g. 20250101)."),
+    ] = None,
+) -> None:
+    """Build the curation-effort corpus manifest for the SN editing-difficulty model.
+
+    Enumerates curated series (via the DB, no mount walk), scopes each to its
+    ground-truth extent from the editing codes, buckets by curation confidence,
+    and checks that both raw and curated zips exist on disk. Prints a summary so
+    the control collection can be validated before training. See
+    docs/editing_codes.md and effort_manifest.py.
+    """
+    from . import effort_manifest as em
+
+    trusted = tuple(trusted_list) if trusted_list else em.DEFAULT_TRUSTED_LISTS
+    with database.session_scope() as s:
+        rows = em.build_manifest(
+            s, dataset_names=dataset, trusted_lists=trusted,
+            stat_zips=not no_stat, date_from=date_from,
+        )
+        summ = em.summarize(rows)
+        out_path = out or (settings.export_dir / "effort_manifest.tsv")
+        if write:
+            em.write_manifest(rows, out_path)
+
+    scope = f"datasets={dataset}" if dataset else "all curated series"
+    console.print(f"[bold]effort manifest[/bold] ({scope}) — {summ.total} series considered")
+    if write:
+        console.print(f"  wrote -> [cyan]{out_path}[/cyan]")
+    console.print(f"  [green]usable[/green] (curated + both zips): [bold]{summ.usable}[/bold]")
+
+    table = Table(title="by curation bucket")
+    table.add_column("bucket")
+    table.add_column("n", justify="right")
+    table.add_column("meaning")
+    meanings = {
+        em.BUCKET_PARTIAL: "per-branch code (branch scoping possible)",
+        em.BUCKET_WHOLE_CODE: "explicit whole-embryo depth code",
+        em.BUCKET_TIME_ONLY: "edited_timepts only — aspirational risk",
+        em.BUCKET_INITIALS: "legacy checkedby initials — aspirational risk",
+        em.BUCKET_UNCURATED: "no curation depth — excluded",
+    }
+    for bucket in (em.BUCKET_PARTIAL, em.BUCKET_WHOLE_CODE, em.BUCKET_TIME_ONLY,
+                   em.BUCKET_INITIALS, em.BUCKET_UNCURATED):
+        n = summ.by_bucket.get(bucket, 0)
+        if n:
+            table.add_row(bucket, str(n), meanings[bucket])
+    console.print(table)
+
+    console.print(f"  trusted-list members: {summ.trusted}  (lists: {', '.join(trusted)})")
+    console.print(
+        f"  [yellow]aspirational-risk[/yellow] (verify before training): {summ.aspirational}"
+    )
+    if not no_stat:
+        console.print(
+            f"  missing zips: raw={summ.missing_raw}  edit={summ.missing_edit}  "
+            f"(curated series that can't be used yet)"
+        )
+    if show_missing and summ.missing_series:
+        console.print("\n[dim]curated series missing a zip:[/dim]")
+        for name in summ.missing_series[:50]:
+            console.print(f"    {name}")
+        if len(summ.missing_series) > 50:
+            console.print(f"    … and {len(summ.missing_series) - 50} more")
+
+
+@app.command("effort-import-predictions")
+def effort_import_predictions_cmd(
+    predictions_tsv: Annotated[
+        Path,
+        typer.Argument(help="Predictions TSV produced by predict_effort_legacy.py"),
+    ],
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Parse and validate without writing to DB."),
+    ] = False,
+) -> None:
+    """Import curation-difficulty predictions into the DB.
+
+    Reads the TSV produced by ``predict_effort_legacy.py`` (columns: series,
+    stage, effort_predicted, effort_bucket, model_version, predicted_at) and
+    upserts one row per (series, stage, model_version) into the
+    ``series_difficulty`` table. Existing rows with the same key are replaced.
+    """
+    import csv
+    from .queries.difficulty import upsert_predictions
+
+    if not predictions_tsv.exists():
+        console.print(f"[red]file not found:[/red] {predictions_tsv}")
+        raise typer.Exit(1)
+
+    by_series: dict[str, list[dict]] = {}
+    with predictions_tsv.open(newline="") as f:
+        for row in csv.DictReader(f, delimiter="\t"):
+            by_series.setdefault(row["series"], []).append(row)
+
+    ok = skipped = 0
+    with database.session_scope() as session:
+        for name, preds in by_series.items():
+            try:
+                if not dry_run:
+                    upsert_predictions(session, name, preds)
+                ok += 1
+            except KeyError:
+                console.print(f"  [yellow]skip[/yellow] {name!r} — not in DB")
+                skipped += 1
+
+    status = "[dim](dry run)[/dim] " if dry_run else ""
+    console.print(
+        f"{status}[green]imported[/green] difficulty predictions: "
+        f"{ok} series ({ok * 4} rows), {skipped} skipped (not in DB)"
+    )
+
+
 # --- datasets ---------------------------------------------------------------
 
 

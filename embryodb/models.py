@@ -206,6 +206,9 @@ class Series(Base, TimestampMixin):
         cascade="all, delete-orphan",
         order_by="VolumeTimestamp.timepoint",
     )
+    difficulty: Mapped[list["SeriesDifficulty"]] = relationship(
+        back_populates="series", cascade="all, delete-orphan"
+    )
 
     def __repr__(self) -> str:
         return f"<Series {self.series_name!r} status={self.status} v={self.version}>"
@@ -519,6 +522,38 @@ class CommandJob(Base):
         return f"<CommandJob {self.kind} status={self.status} id={self.id}>"
 
 
+class SeriesDifficulty(Base):
+    """Per-stage curation-difficulty prediction for a series.
+
+    One row per (series, stage, model_version). Stages are ``to100 / to200 /
+    to350 / toEnd`` matching the effort-model stage boundaries. Populated by
+    ``embryodb effort import-predictions`` after running the SN-side predictor.
+    The UNIQUE constraint allows upsert (re-running predictions overwrites the
+    previous values for the same model version).
+    """
+
+    __tablename__ = "series_difficulty"
+    __table_args__ = (UniqueConstraint("series_id", "stage", "model_version"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    series_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("series.id", ondelete="CASCADE"), nullable=False
+    )
+    stage: Mapped[str] = mapped_column(String(16), nullable=False)
+    effort_predicted: Mapped[float | None] = mapped_column(Float)
+    effort_bucket: Mapped[str | None] = mapped_column(String(16))  # easy/moderate/hard
+    model_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    predicted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    series: Mapped["Series"] = relationship("Series", back_populates="difficulty")
+
+    def __repr__(self) -> str:
+        return (
+            f"<SeriesDifficulty series_id={self.series_id} stage={self.stage!r}"
+            f" bucket={self.effort_bucket!r}>"
+        )
+
+
 __all__ = [
     "Base",
     "Series",
@@ -532,5 +567,6 @@ __all__ = [
     "PipelineStepRun",
     "CommandJob",
     "VolumeTimestamp",
+    "SeriesDifficulty",
     "dataset_series_table",
 ]

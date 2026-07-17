@@ -391,30 +391,87 @@ class DetailPanel(QtWidgets.QWidget):
             else:
                 table.setItem(r_idx, 2, QtWidgets.QTableWidgetItem(""))
 
+    # Bucket → CSS for the effort label in the pipeline-details popup.
+    _EFFORT_BUCKET_CSS: dict[str, str] = {
+        "hard":     "background: #f4c7c3; color: #333; padding: 4px; border-radius: 3px;",
+        "moderate": "background: #fce8b2; color: #333; padding: 4px; border-radius: 3px;",
+        "easy":     "background: #c7e8c9; color: #333; padding: 4px; border-radius: 3px;",
+    }
+
     @staticmethod
-    def _sn_effort_text(sn_run) -> str:
-        """One-line StarryNite engine + effort-estimate summary for the
-        pipeline-details popup, or "" if the new engine wasn't used / has no
-        effort result yet. Reads the run's ``output_summary`` written by
-        ``_run_starrynite_new`` (``sn_engine`` + nested ``effort`` dict)."""
+    def _parse_sn_report(report_path: str) -> dict[str, float]:
+        """Parse per-stage effort values from a <ser>_sn_effort.txt report file."""
+        result: dict[str, float] = {}
+        try:
+            for line in Path(report_path).read_text().splitlines():
+                parts = line.split()
+                if len(parts) >= 4 and parts[0] in ("to100", "to200", "to350", "toEnd"):
+                    try:
+                        result[parts[0]] = float(parts[3])
+                    except ValueError:
+                        pass
+        except OSError:
+            pass
+        return result
+
+    @staticmethod
+    def _effort_detail(sn_run, difficulty_rows: list) -> tuple[str, str]:
+        """Return (text, css_style) for the effort row in the pipeline-details popup.
+
+        For new-SN series: reads the per-stage report file for to100/to350/end.
+        For legacy series: reads SeriesDifficulty rows (legacy model), coloring
+        by the to350 bucket.  Returns ("", "") when no effort data is available.
+        """
         summary = (sn_run.output_summary or {}) if sn_run else {}
-        if summary.get("sn_engine") != "new":
-            return ""
-        parts = ["StarryNite engine: new (all-MATLAB v1)"]
-        effort = summary.get("effort") or {}
-        if effort.get("ran"):
-            events = effort.get("effort_events")
-            triage = effort.get("triage")
+        is_new_sn = summary.get("sn_engine") == "new"
+        eff = (summary.get("effort") or {}) if is_new_sn else {}
+
+        if is_new_sn:
+            parts = ["StarryNite engine: new (all-MATLAB v1)"]
+            triage = ""
+            if eff.get("ran"):
+                stage_vals: dict[str, float] = {}
+                report_path = eff.get("report_path")
+                if report_path:
+                    stage_vals = DetailPanel._parse_sn_report(report_path)
+                bits = []
+                for disp, key in [("to100", "to100"), ("to350", "to350"), ("end", "toEnd")]:
+                    v = stage_vals.get(key)
+                    if v is not None:
+                        bits.append(f"{disp}: {int(round(v))}")
+                if not bits:
+                    events = eff.get("effort_events")
+                    if events is not None:
+                        bits.append(f"end: {int(round(float(events)))}")
+                triage = (eff.get("triage") or "").lower()
+                if bits:
+                    parts.append("Predicted effort — " + "  ·  ".join(bits))
+                if triage:
+                    parts.append(f"Triage: {triage.title()}")
+            elif eff:
+                parts.append("Curation effort — estimator did not complete")
+            css = DetailPanel._EFFORT_BUCKET_CSS.get(triage, "color: #444;")
+            return "  •  ".join(parts), css
+
+        if difficulty_rows:
+            by_stage = {r.stage: r for r in difficulty_rows}
             bits = []
-            if events is not None:
-                bits.append(f"~{events:g} events")
-            if triage:
-                bits.append(f"triage: {triage}")
+            for disp, key in [("to100", "to100"), ("to350", "to350"), ("end", "toEnd")]:
+                r = by_stage.get(key)
+                if r is not None and r.effort_predicted is not None:
+                    bits.append(f"{disp}: {int(round(r.effort_predicted))}")
+            to350 = by_stage.get("to350")
+            bucket = ((to350.effort_bucket or "").lower() if to350 else "")
+            model_version = difficulty_rows[0].model_version if difficulty_rows else ""
+            parts = [f"Predicted effort ({model_version})"]
             if bits:
-                parts.append("Curation effort — " + ", ".join(bits))
-        elif effort:
-            parts.append("Curation effort — estimator did not complete")
-        return "  •  ".join(parts)
+                parts.append("  ·  ".join(bits))
+            if bucket:
+                parts.append(f"Triage: {bucket.title()}")
+            css = DetailPanel._EFFORT_BUCKET_CSS.get(bucket, "color: #444;")
+            return "  •  ".join(parts), css
+
+        return "", ""
 
     def _on_pipeline_details(self) -> None:
         """Open a dialog showing the per-step pipeline state for the loaded series."""
@@ -452,13 +509,15 @@ class DetailPanel(QtWidgets.QWidget):
             sn_run = next(
                 (r for r in row.runs if r.step == "run_starrynite"), None
             )
-            effort_text = self._sn_effort_text(sn_run)
+            from ..queries.difficulty import get_predictions
+            difficulty_rows = get_predictions(session, self._series_name)
 
+        effort_text, effort_css = self._effort_detail(sn_run, difficulty_rows)
         if effort_text:
             effort_label = QtWidgets.QLabel(effort_text)
             effort_label.setWordWrap(True)
             effort_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-            effort_label.setStyleSheet("color: #444;")
+            effort_label.setStyleSheet(effort_css or "color: #444;")
             layout.addWidget(effort_label)
 
         button_row = QtWidgets.QHBoxLayout()

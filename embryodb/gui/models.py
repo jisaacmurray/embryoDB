@@ -13,7 +13,7 @@ from datetime import datetime
 from qtpy import QtCore, QtGui
 from sqlalchemy.orm import Session
 
-from ..models import PipelineStepRun, RunStatus, Series, Status
+from ..models import PipelineStepRun, RunStatus, Series, SeriesDifficulty, Status
 from ..queries import series as q_series
 
 
@@ -172,19 +172,50 @@ def _latest_effort(runs: list[PipelineStepRun]) -> dict | None:
     return sn[0].output_summary["effort"]
 
 
-def _summarize_effort(runs: list[PipelineStepRun]) -> tuple[str, QtGui.QColor | None]:
-    """(display text, background color) for the Effort cell. Empty when none."""
-    eff = _latest_effort(runs)
-    if eff is None:
+def _difficulty_display(difficulty_rows: list) -> tuple[str, QtGui.QColor | None]:
+    """Compact Effort-cell (text, background) from SeriesDifficulty rows.
+
+    Colors by the to350 bucket; shows rounded to100 · to350 · toEnd integers.
+    """
+    if not difficulty_rows:
         return "", None
-    label, color = _classify_triage(str(eff.get("triage", "")))
-    events = eff.get("effort_events")
-    if events is not None:
-        try:
-            label = f"{label} — {int(round(float(events)))}"
-        except (TypeError, ValueError):
-            pass
+    by_stage = {r.stage: r for r in difficulty_rows}
+    to350 = by_stage.get("to350")
+    color: QtGui.QColor | None = None
+    bucket_label = ""
+    if to350 and to350.effort_bucket:
+        bucket_label, color = _classify_triage(to350.effort_bucket)
+    vals = []
+    for stage in ("to100", "to350", "toEnd"):
+        r = by_stage.get(stage)
+        if r is not None and r.effort_predicted is not None:
+            vals.append(str(int(round(r.effort_predicted))))
+    if not vals and not bucket_label:
+        return "", None
+    label = (bucket_label + " — " if bucket_label else "") + " · ".join(vals)
     return label, color
+
+
+def _summarize_effort(
+    runs: list[PipelineStepRun],
+    difficulty_rows: list = (),
+) -> tuple[str, QtGui.QColor | None]:
+    """(display text, background color) for the Effort cell. Empty when none.
+
+    Prefers the new-SN model result from PipelineStepRun output_summary; falls
+    back to SeriesDifficulty rows (legacy model) when no new-SN result exists.
+    """
+    eff = _latest_effort(runs)
+    if eff is not None:
+        label, color = _classify_triage(str(eff.get("triage", "")))
+        events = eff.get("effort_events")
+        if events is not None:
+            try:
+                label = f"{label} — {int(round(float(events)))}"
+            except (TypeError, ValueError):
+                pass
+        return label, color
+    return _difficulty_display(difficulty_rows)
 
 
 class SeriesTableModel(QtCore.QAbstractTableModel):
@@ -223,19 +254,25 @@ class SeriesTableModel(QtCore.QAbstractTableModel):
             dataset_id=filters.dataset_id,
             limit=filters.limit,
         )
-        # Bulk-fetch PipelineStepRun rows in one query so we don't N+1.
+        # Bulk-fetch PipelineStepRun and SeriesDifficulty rows to avoid N+1.
         from sqlalchemy import select
         ids = [r.id for r in rows]
         runs_by_series: dict[int, list[PipelineStepRun]] = {i: [] for i in ids}
+        difficulty_by_series: dict[int, list] = {i: [] for i in ids}
         if ids:
             for run in session.execute(
                 select(PipelineStepRun).where(PipelineStepRun.series_id.in_(ids))
             ).scalars():
                 runs_by_series.setdefault(run.series_id, []).append(run)
+            for diff in session.execute(
+                select(SeriesDifficulty).where(SeriesDifficulty.series_id.in_(ids))
+            ).scalars():
+                difficulty_by_series.setdefault(diff.series_id, []).append(diff)
         self._rows = []
         for r in rows:
             runs = runs_by_series.get(r.id, [])
-            effort_text, effort_color = _summarize_effort(runs)
+            diff = difficulty_by_series.get(r.id, [])
+            effort_text, effort_color = _summarize_effort(runs, diff)
             self._rows.append({
                 **self._row_to_dict(r),
                 "pipeline_summary": _summarize_runs(runs),

@@ -186,7 +186,9 @@ def _difficulty_display(difficulty_rows: list) -> tuple[str, QtGui.QColor | None
     if to350 and to350.effort_bucket:
         bucket_label, color = _classify_triage(to350.effort_bucket)
     vals = []
-    for stage in ("to100", "to350", "toEnd"):
+    # to600 is the preferred "all" endpoint; fall back to toEnd for older rows.
+    end_stage = "to600" if "to600" in by_stage else "toEnd"
+    for stage in ("to100", "to350", end_stage):
         r = by_stage.get(stage)
         if r is not None and r.effort_predicted is not None:
             vals.append(str(int(round(r.effort_predicted))))

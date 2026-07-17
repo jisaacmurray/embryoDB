@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from ..models import Series, SeriesDifficulty
 
-STAGES = ("to100", "to200", "to350", "toEnd")
+STAGES = ("to100", "to200", "to350", "to600", "toEnd")
 
 
 def upsert_predictions(

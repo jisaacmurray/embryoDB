@@ -435,14 +435,16 @@ class DetailPanel(QtWidgets.QWidget):
                 if report_path:
                     stage_vals = DetailPanel._parse_sn_report(report_path)
                 bits = []
-                for disp, key in [("to100", "to100"), ("to350", "to350"), ("end", "toEnd")]:
+                # new-SN report uses toEnd (= max raw tps); label it "all" since
+                # the new-SN model was trained on a corpus capped near 600 cells.
+                for disp, key in [("to100", "to100"), ("to350", "to350"), ("all", "toEnd")]:
                     v = stage_vals.get(key)
                     if v is not None:
                         bits.append(f"{disp}: {int(round(v))}")
                 if not bits:
                     events = eff.get("effort_events")
                     if events is not None:
-                        bits.append(f"end: {int(round(float(events)))}")
+                        bits.append(f"all: {int(round(float(events)))}")
                 triage = (eff.get("triage") or "").lower()
                 if bits:
                     parts.append("Predicted effort — " + "  ·  ".join(bits))
@@ -455,8 +457,10 @@ class DetailPanel(QtWidgets.QWidget):
 
         if difficulty_rows:
             by_stage = {r.stage: r for r in difficulty_rows}
+            # to600 is the preferred "all" endpoint; fall back to toEnd for older rows.
+            end_key = "to600" if "to600" in by_stage else "toEnd"
             bits = []
-            for disp, key in [("to100", "to100"), ("to350", "to350"), ("end", "toEnd")]:
+            for disp, key in [("to100", "to100"), ("to350", "to350"), ("all", end_key)]:
                 r = by_stage.get(key)
                 if r is not None and r.effort_predicted is not None:
                     bits.append(f"{disp}: {int(round(r.effort_predicted))}")

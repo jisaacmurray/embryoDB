@@ -310,10 +310,16 @@ def build_print_trees_command(
             args.append(str(int(max_expr)))
             args.append(shell_quote(color_scheme))
             args.append(str(int(linewidth)))
-    return (
-        f"echo '== PrintTrees ({len(series_names)} series, {cd_prefix}) ==' && "
+    # Tree1 builds a JFrame even though it only ever writes PNGs, so it needs a
+    # real display: headless mode throws HeadlessException. xvfb-run supplies a
+    # throwaway one, which also stops a dead ssh X-forward from killing the run.
+    java = (
         f"nice java -Xmx1000m -cp {shell_quote(str(base_dir / 'acexpress_CL2.jar'))} "
         f"Tree1 {' '.join(args)}"
+    )
+    return (
+        f"echo '== PrintTrees ({len(series_names)} series, {cd_prefix}) ==' && "
+        f"xvfb-run -a {java}"
     )
 
 

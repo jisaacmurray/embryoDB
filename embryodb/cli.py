@@ -2576,6 +2576,10 @@ def print_trees_cmd(
             help="Expression CSV type: CD (default), SCD (Sulston-aligned), or ACD (reference-embryo aligned).",
         ),
     ] = "CD",
+    heap_mb: Annotated[
+        int,
+        typer.Option("--heap-mb", help="Java heap for Tree1; raise for deep (600+ cell) embryos."),
+    ] = 4000,
 ) -> None:
     """Render lineage-tree PNGs via Tree1 (CLI twin of the GUI "Print trees…").
     Detached job; PNGs land in /gpfs/fs0/l/murr/trees/.
@@ -2590,6 +2594,7 @@ def print_trees_cmd(
         color_scheme=color_scheme,
         linewidth=linewidth,
         cd_prefix=cd_prefix,
+        heap_mb=heap_mb,
     )
     _report_launch(result, "PrintTrees", len(names))
 

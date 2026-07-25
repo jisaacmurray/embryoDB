@@ -288,6 +288,7 @@ def build_print_trees_command(
     color_scheme: str = "rainbow",
     linewidth: int = 3,
     cd_prefix: str = "CD",
+    heap_mb: int = 4000,
     base_dir: Path,
 ) -> str:
     """Render the `acexpress_CL2.jar Tree1` shell.
@@ -313,8 +314,11 @@ def build_print_trees_command(
     # Tree1 builds a JFrame even though it only ever writes PNGs, so it needs a
     # real display: headless mode throws HeadlessException. xvfb-run supplies a
     # throwaway one, which also stops a dead ssh X-forward from killing the run.
+    # Tree1 holds every rendered tree in memory, so deeply-curated embryos
+    # (~600+ cells) blow through the old 1000m heap partway down a long list.
     java = (
-        f"nice java -Xmx1000m -cp {shell_quote(str(base_dir / 'acexpress_CL2.jar'))} "
+        f"nice java -Xmx{int(heap_mb)}m "
+        f"-cp {shell_quote(str(base_dir / 'acexpress_CL2.jar'))} "
         f"Tree1 {' '.join(args)}"
     )
     return (
@@ -361,6 +365,7 @@ def build_command_for_kind(
             color_scheme=params.get("color_scheme", "rainbow"),
             linewidth=params.get("linewidth", 3),
             cd_prefix=params.get("cd_prefix", "CD"),
+            heap_mb=params.get("heap_mb", 4000),
             base_dir=base_dir,
         )
     if kind == "getacd":
@@ -444,6 +449,7 @@ def run_print_trees(
     color_scheme: str = "rainbow",
     linewidth: int = 3,
     cd_prefix: str = "CD",
+    heap_mb: int = 4000,
     tools3_dir: Path | None = None,
 ) -> LaunchResult:
     """Spawn `acexpress_CL2.jar Tree1` detached against the given series.
@@ -474,6 +480,7 @@ def run_print_trees(
                 "color_scheme": color_scheme,
                 "linewidth": linewidth,
                 "cd_prefix": cd_prefix,
+                "heap_mb": heap_mb,
             },
         )
 
@@ -488,6 +495,7 @@ def run_print_trees(
         color_scheme=color_scheme,
         linewidth=linewidth,
         cd_prefix=cd_prefix,
+        heap_mb=heap_mb,
         base_dir=base_dir,
     )
     proc = _spawn_detached(shell, log_path)

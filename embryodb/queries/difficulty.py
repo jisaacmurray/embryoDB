@@ -59,15 +59,37 @@ def upsert_predictions(
     return out
 
 
-def get_predictions(session: Session, series_name: str) -> list[SeriesDifficulty]:
-    """Return all difficulty rows for a series, ordered by stage."""
+def get_predictions(
+    session: Session,
+    series_name: str,
+    model_version: str | None = None,
+) -> list[SeriesDifficulty]:
+    """Return a series' difficulty rows for ONE model version, ordered by stage.
+
+    A series can carry rows from several model vintages at once (stage sets
+    differ between them), so callers that key by stage would collide if handed
+    a mixed list. Defaults to the most recently predicted version.
+    """
     s = session.query(Series).filter_by(series_name=series_name).first()
     if s is None:
         return []
-    stage_order = {st: i for i, st in enumerate(STAGES)}
     rows = session.execute(
         select(SeriesDifficulty).where(SeriesDifficulty.series_id == s.id)
     ).scalars().all()
+    if not rows:
+        return []
+    if model_version is None:
+        # Newest vintage wins; rows lacking predicted_at sort oldest.
+        model_version = max(
+            {r.model_version for r in rows},
+            key=lambda mv: max(
+                (r.predicted_at for r in rows
+                 if r.model_version == mv and r.predicted_at is not None),
+                default=datetime.min.replace(tzinfo=timezone.utc),
+            ),
+        )
+    rows = [r for r in rows if r.model_version == model_version]
+    stage_order = {st: i for i, st in enumerate(STAGES)}
     return sorted(rows, key=lambda r: stage_order.get(r.stage, 99))
 
 

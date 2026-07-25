@@ -8,7 +8,7 @@ change to re-query the DB.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 
 from qtpy import QtCore, QtGui
 from sqlalchemy.orm import Session
@@ -179,7 +179,17 @@ def _difficulty_display(difficulty_rows: list) -> tuple[str, QtGui.QColor | None
     """
     if not difficulty_rows:
         return "", None
-    by_stage = {r.stage: r for r in difficulty_rows}
+    # A series can carry several model vintages with differing stage sets;
+    # keying by stage across them would mix vintages. Newest vintage wins.
+    newest = max(
+        {r.model_version for r in difficulty_rows},
+        key=lambda mv: max(
+            (r.predicted_at for r in difficulty_rows
+             if r.model_version == mv and r.predicted_at is not None),
+            default=datetime.min.replace(tzinfo=timezone.utc),
+        ),
+    )
+    by_stage = {r.stage: r for r in difficulty_rows if r.model_version == newest}
     to350 = by_stage.get("to350")
     color: QtGui.QColor | None = None
     bucket_label = ""

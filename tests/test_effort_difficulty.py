@@ -78,6 +78,31 @@ def test_get_predictions_missing_series(db_session):
     assert get_predictions(db_session, "nobody") == []
 
 
+def test_get_predictions_picks_newest_model_version(db_session):
+    """Mixed vintages must not be blended — stage sets differ between them."""
+    from datetime import datetime, timezone
+    _series(db_session, "mixed")
+    old = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    new = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    upsert_predictions(db_session, "mixed", [
+        _predictions("to350", 100.0, "easy", "legacy_v1", old),
+        _predictions("toEnd", 9999.0, "hard", "legacy_v1", old),
+    ])
+    upsert_predictions(db_session, "mixed", [
+        _predictions("to350", 400.0, "moderate", "legacy_v2", new),
+    ])
+    db_session.flush()
+
+    rows = get_predictions(db_session, "mixed")
+    assert {r.model_version for r in rows} == {"legacy_v2"}
+    assert [r.stage for r in rows] == ["to350"]
+    assert rows[0].effort_predicted == pytest.approx(400.0)
+
+    # Explicit pin still reaches the older vintage.
+    old_rows = get_predictions(db_session, "mixed", model_version="legacy_v1")
+    assert [r.stage for r in old_rows] == ["to350", "toEnd"]
+
+
 def test_list_difficulty_filter_bucket(db_session):
     _series(db_session, "easy1")
     _series(db_session, "hard1")

@@ -27,8 +27,7 @@ from pathlib import Path
 from ..config import settings
 from ..database import session_scope
 from ..fsutil import chmod_if_possible, ensure_dir
-from ..models import PipelineStepRun, RunStatus
-from ..parsers.matlab_params import load as load_params
+from ..models import PipelineStepRun, RunStatus, Series
 
 HEARTBEAT_INTERVAL = 30  # seconds between DB heartbeat writes during subprocess run
 
@@ -470,9 +469,9 @@ def _run_starrynite_new(
     uses (``<series>-edit.zip`` + pristine ``<series>.zip``), so downstream
     steps and AceTree find it identically.
 
-    On success it also runs the GT-free curation-effort predictor (new-SN only;
-    documented negative transfer forbids it on legacy lineages) and records the
-    triage bucket in ``output_summary`` for display in the embryoDB entry.
+    The curation-effort estimate is NOT computed here — it is its own
+    ``compute_difficulty`` step, so it runs for every engine and every route
+    (fresh import, rerun, recovery) and is retryable on its own.
 
     Unlike the legacy path there is no detection-collapse auto-recovery: the
     retrained tracker's robustness is the whole point (it does not wedge), and
@@ -492,9 +491,6 @@ def _run_starrynite_new(
         return
 
     dats_dir = image_loc / "dats"
-    mp = load_params(params_path)
-    xyres = mp.get_float("xyres")
-    zres = mp.get_float("zres")
 
     scratch = Path(
         tempfile.mkdtemp(
@@ -527,30 +523,119 @@ def _run_starrynite_new(
             return
 
         summary: dict = {"sn_engine": "new", **landed}
-
-        # GT-free effort estimate (NEW-SN ONLY — see run_effort scope note).
-        # PLACEHOLDER: a future generalized estimator calibrated for legacy
-        # classic-SN lineages would run on the "old" engine path instead; it is
-        # deliberately NOT invoked there today (documented negative transfer).
-        # Prefer the durable landed lineage zip (survives scratch cleanup, so
-        # it's backfillable and independent of the driver's scratch layout);
-        # fall back to the loose scratch nuclei dir if the zip is somehow absent.
-        edit_zip = Path(landed["edit_zip"])
-        effort_source = edit_zip if edit_zip.exists() else snv1.find_nuclei_dir(scratch_out)
-        if effort_source is not None and xyres and zres:
-            summary["effort"] = snv1.run_effort(
-                effort_source, xyres, zres, dats_dir, series_name
-            )
-        else:
-            summary["effort"] = {
-                "ran": False,
-                "error": "no lineage zip / nuclei dir or missing xyres/zres in matlabParams",
-            }
-
         _finish_run(run_id, log_path, 0, output_summary=summary)
         _normalize_dats_perms(series_name)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+def step_compute_difficulty(
+    series_id: int,
+    series_name: str,
+    image_loc: Path,
+    run_id: int,
+) -> None:
+    """Predict curation effort for one series and store it in `series_difficulty`.
+
+    Reads the RAW tracker lineage ``dats/<series>.zip`` — never ``-edit.zip``,
+    which on a curated series is human-corrected and would predict near-zero
+    effort for a movie that in fact took hours to fix.
+
+    This step never FAILs. It sits between run_starrynite and run_red_extract
+    (the lineage is its only input), so a FAILED row would strand extraction
+    behind an advisory triage number. Anything that prevents a prediction is
+    recorded as SKIPPED with the reason, and is retryable on its own via
+    ``embryodb pipeline rerun --step compute_difficulty``.
+
+    The model is calibrated on new-SN output. Legacy classic-SN lineages are
+    predicted anyway — every series deserves a triage signal — but their rows
+    carry ``difficulty.OUT_OF_SCOPE_SUFFIX`` on the model_version so the documented
+    negative transfer can never be mistaken for an in-scope number.
+    """
+    from ..effort_manifest import resolution_for
+    from ..queries import difficulty as q_difficulty
+    from . import starrynite_v1 as snv1
+
+    log_path = ensure_dir(image_loc / "logs") / f"{series_name}-compute_difficulty.log"
+
+    with session_scope() as s:
+        run = s.get(PipelineStepRun, run_id)
+        if run is not None:
+            run.log_path = str(log_path)
+        series = s.get(Series, series_id)
+        if series is None:
+            _skip_run(run_id, f"series id {series_id} is not in the DB")
+            return
+        xyres, zres = resolution_for(series)
+        annot_loc = series.annot_loc or str(image_loc)
+        sn_run = (
+            s.query(PipelineStepRun)
+            .filter_by(series_id=series_id, step="run_starrynite")
+            .one_or_none()
+        )
+        engine = (sn_run.params or {}).get("sn_engine", "old") if sn_run else "old"
+
+    dats = Path(annot_loc) / "dats"
+    lineage = dats / f"{series_name}.zip"
+    if not lineage.exists():
+        _skip_run(run_id, f"no raw lineage at {lineage}; nothing to predict on")
+        return
+
+    result = snv1.run_effort(lineage, xyres, zres, dats, series_name)
+    if not result.get("ran"):
+        _skip_run(
+            run_id,
+            f"effort predictor produced no result: {result.get('error') or 'unknown'}",
+        )
+        return
+
+    model_version = result.get("model_version") or "unknown"
+    if engine != "new":
+        model_version += q_difficulty.OUT_OF_SCOPE_SUFFIX
+
+    predictions = [
+        {
+            "stage": st["stage"],
+            "effort_predicted": st.get("effort_predicted"),
+            "effort_bucket": st.get("effort_bucket"),
+            "model_version": model_version,
+        }
+        for st in result.get("stages") or []
+        if st.get("stage")
+    ]
+    if not predictions:
+        _skip_run(run_id, "effort predictor returned no per-stage predictions")
+        return
+
+    try:
+        with session_scope() as s:
+            q_difficulty.upsert_predictions(s, series_name, predictions)
+    except Exception as exc:  # noqa: BLE001 — the numbers are on disk either way
+        _skip_run(run_id, f"could not store predictions: {type(exc).__name__}: {exc}")
+        return
+
+    report = result.get("report_path")
+    try:
+        log_path.write_text(
+            Path(report).read_text(encoding="utf-8") if report else "",
+            encoding="utf-8",
+        )
+        chmod_if_possible(log_path, 0o664)
+    except OSError:
+        pass
+
+    _finish_run(
+        run_id, log_path, 0,
+        output_summary={
+            "sn_engine": engine,
+            "model_version": model_version,
+            "triage": result.get("triage"),
+            "effort_events": result.get("effort_events"),
+            "report_path": report,
+            "json_path": result.get("json_path"),
+            "n_stages": len(predictions),
+        },
+    )
 
 
 def _auto_recover(series_name: str):
@@ -879,6 +964,7 @@ class _DummyProtocol:
 
 __all__ = [
     "step_run_starrynite",
+    "step_compute_difficulty",
     "step_run_red_extract",
     "step_run_measure",
     "step_stage_images",

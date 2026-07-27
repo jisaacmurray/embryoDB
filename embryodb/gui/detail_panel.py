@@ -24,6 +24,7 @@ from ..identity import known_persons
 from ..legacy_sync import sync_legacy_xml
 from ..models import RunStatus, Series, Status
 from ..queries import series as q_series
+from ..queries.difficulty import OUT_OF_SCOPE_SUFFIX
 from .acetree_config_dialog import AceTreeConfigDialog
 
 
@@ -399,83 +400,41 @@ class DetailPanel(QtWidgets.QWidget):
     }
 
     @staticmethod
-    def _parse_sn_report(report_path: str) -> dict[str, float]:
-        """Parse per-stage effort values from a <ser>_sn_effort.txt report file."""
-        result: dict[str, float] = {}
-        try:
-            for line in Path(report_path).read_text().splitlines():
-                parts = line.split()
-                if len(parts) >= 4 and parts[0] in ("to100", "to200", "to350", "toEnd"):
-                    try:
-                        result[parts[0]] = float(parts[3])
-                    except ValueError:
-                        pass
-        except OSError:
-            pass
-        return result
-
-    @staticmethod
     def _effort_detail(sn_run, difficulty_rows: list) -> tuple[str, str]:
         """Return (text, css_style) for the effort row in the pipeline-details popup.
 
-        For new-SN series: reads the per-stage report file for to100/to350/end.
-        For legacy series: reads SeriesDifficulty rows (legacy model), coloring
-        by the to350 bucket.  Returns ("", "") when no effort data is available.
+        Effort comes from the SeriesDifficulty rows the ``compute_difficulty``
+        step writes; ``sn_run`` only supplies the engine note. Returns ("", "")
+        when the series has no prediction yet.
         """
         summary = (sn_run.output_summary or {}) if sn_run else {}
-        is_new_sn = summary.get("sn_engine") == "new"
-        eff = (summary.get("effort") or {}) if is_new_sn else {}
+        parts = []
+        if summary.get("sn_engine") == "new":
+            parts.append("StarryNite engine: new (all-MATLAB v1)")
 
-        if is_new_sn:
-            parts = ["StarryNite engine: new (all-MATLAB v1)"]
-            triage = ""
-            if eff.get("ran"):
-                stage_vals: dict[str, float] = {}
-                report_path = eff.get("report_path")
-                if report_path:
-                    stage_vals = DetailPanel._parse_sn_report(report_path)
-                bits = []
-                # new-SN report uses toEnd (= max raw tps); label it "all" since
-                # the new-SN model was trained on a corpus capped near 600 cells.
-                for disp, key in [("to100", "to100"), ("to350", "to350"), ("all", "toEnd")]:
-                    v = stage_vals.get(key)
-                    if v is not None:
-                        bits.append(f"{disp}: {int(round(v))}")
-                if not bits:
-                    events = eff.get("effort_events")
-                    if events is not None:
-                        bits.append(f"all: {int(round(float(events)))}")
-                triage = (eff.get("triage") or "").lower()
-                if bits:
-                    parts.append("Predicted effort — " + "  ·  ".join(bits))
-                if triage:
-                    parts.append(f"Triage: {triage.title()}")
-            elif eff:
-                parts.append("Curation effort — estimator did not complete")
-            css = DetailPanel._EFFORT_BUCKET_CSS.get(triage, "color: #444;")
-            return "  •  ".join(parts), css
+        if not difficulty_rows:
+            return ("  •  ".join(parts), "color: #444;") if parts else ("", "")
 
-        if difficulty_rows:
-            by_stage = {r.stage: r for r in difficulty_rows}
-            # to600 is the preferred "all" endpoint; fall back to toEnd for older rows.
-            end_key = "to600" if "to600" in by_stage else "toEnd"
-            bits = []
-            for disp, key in [("to100", "to100"), ("to350", "to350"), ("all", end_key)]:
-                r = by_stage.get(key)
-                if r is not None and r.effort_predicted is not None:
-                    bits.append(f"{disp}: {int(round(r.effort_predicted))}")
-            to350 = by_stage.get("to350")
-            bucket = ((to350.effort_bucket or "").lower() if to350 else "")
-            model_version = difficulty_rows[0].model_version if difficulty_rows else ""
-            parts = [f"Predicted effort ({model_version})"]
-            if bits:
-                parts.append("  ·  ".join(bits))
-            if bucket:
-                parts.append(f"Triage: {bucket.title()}")
-            css = DetailPanel._EFFORT_BUCKET_CSS.get(bucket, "color: #444;")
-            return "  •  ".join(parts), css
-
-        return "", ""
+        by_stage = {r.stage: r for r in difficulty_rows}
+        # to600 is the preferred "all" endpoint; fall back to toEnd for older rows.
+        end_key = "to600" if "to600" in by_stage else "toEnd"
+        bits = []
+        for disp, key in [("to100", "to100"), ("to350", "to350"), ("all", end_key)]:
+            r = by_stage.get(key)
+            if r is not None and r.effort_predicted is not None:
+                bits.append(f"{disp}: {int(round(r.effort_predicted))}")
+        to350 = by_stage.get("to350")
+        bucket = ((to350.effort_bucket or "").lower() if to350 else "")
+        model_version = difficulty_rows[0].model_version
+        parts.append(f"Predicted effort ({model_version})")
+        if model_version.endswith(OUT_OF_SCOPE_SUFFIX):
+            parts.append("OUT OF SCOPE — model not calibrated on this lineage")
+        if bits:
+            parts.append("  ·  ".join(bits))
+        if bucket:
+            parts.append(f"Triage: {bucket.title()}")
+        css = DetailPanel._EFFORT_BUCKET_CSS.get(bucket, "color: #444;")
+        return "  •  ".join(parts), css
 
     def _on_pipeline_details(self) -> None:
         """Open a dialog showing the per-step pipeline state for the loaded series."""

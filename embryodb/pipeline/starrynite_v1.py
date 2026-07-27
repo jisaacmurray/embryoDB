@@ -17,7 +17,7 @@ heartbeat/log/DB machinery:
   in the SAME slot the legacy pipeline uses (``<series>-edit.zip`` + pristine
   ``<series>.zip``), so downstream steps / AceTree find it identically.
 - :func:`run_effort` — the GT-free curation-effort predictor (release
-  ``effort/predict_effort.py``). NEW-SN output only; see the scope note there.
+  ``effort/predict_effort.py``); see the calibration scope note there.
 
 Nothing here writes into ``image_loc`` except the final ``dats/`` products; the
 run itself happens entirely under ``settings.starrynite_scratch_root``.
@@ -184,10 +184,32 @@ def land_lineage(scratch_out: Path | str, dats_dir: Path | str, series_name: str
     return {"edit_zip": str(edit_zip), "pristine_zip": str(pristine)}
 
 
-_TRIAGE_RE = re.compile(
-    r"full-movie predicted effort\s*=\s*([\d.]+)\s*events.*?TRIAGE:\s*(\S+)",
-    re.IGNORECASE | re.DOTALL,
-)
+def _render_report(payload: dict) -> str:
+    """Human-readable effort report, rendered from the predictor's JSON.
+
+    Mirrors the layout ``predict_effort.py`` prints without ``--json``, so the
+    file in ``dats/`` reads the same whether a human or the pipeline produced
+    it. Machine consumers should read the sibling ``_sn_effort.json``.
+    """
+    lines = ["=== predicted curation effort (GT-free, retrained-new-SN) ===",
+             f"{'stage':>6} {'N_at':>8} {'t_at':>8} {'effort_pred':>12}"]
+    for st in payload.get("stages") or []:
+        lines.append(
+            f"{st.get('stage',''):>6} {st.get('n_at',0):>8.1f} "
+            f"{st.get('t_at',0):>8.1f} {st.get('effort_predicted',0):>12.1f}"
+        )
+    events = payload.get("effort_events")
+    events_txt = "n/a" if events is None else f"{float(events):.0f}"
+    lines += [
+        "",
+        f"full-movie predicted effort = {events_txt} events   ->  TRIAGE: "
+        f"{payload.get('triage','n/a')}",
+        f"(triage tertiles from corpus: q1={payload.get('triage_q1',0):.0f} "
+        f"q2={payload.get('triage_q2',0):.0f} effort-events)",
+        f"model: {payload.get('model_version','?')} "
+        f"(md5 {str(payload.get('model_md5',''))[:8]})",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def run_effort(
@@ -206,16 +228,21 @@ def run_effort(
     ``dats/<series>-edit.zip`` because it is durable (survives scratch cleanup,
     so it is also backfillable) and decoupled from the driver's scratch layout.
 
-    Writes the full predictor stdout to ``dats/<series>_sn_effort.txt`` and
-    returns a structured summary (triage bucket + full-movie effort +
-    ``report_path``). Failures are reported in the returned dict rather than
-    raised — a missing effort estimate must not fail an otherwise good run.
+    Runs the predictor in ``--json`` mode so the PER-STAGE predictions survive
+    (the printed table alone only yields the full-movie number). Writes the raw
+    JSON to ``dats/<series>_sn_effort.json`` and a human report to
+    ``dats/<series>_sn_effort.txt``, and returns a structured summary carrying
+    ``stages`` for :func:`embryodb.queries.difficulty.upsert_predictions`.
+    Failures are reported in the returned dict rather than raised — a missing
+    effort estimate must not fail an otherwise good run.
 
-    SCOPE: valid ONLY on new-SN output. The model exhibits documented negative
-    transfer on legacy classic-SN lineages, so callers gate this on
-    ``sn_engine == "new"``. A future generalized estimator for legacy movies is
-    a planned extension (see the caller's placeholder).
+    SCOPE: calibrated on new-SN output. The model exhibits documented negative
+    transfer on legacy classic-SN lineages; it is still run on them so every
+    series gets a triage signal, but the caller tags those rows with a distinct
+    ``model_version`` (``queries.difficulty.OUT_OF_SCOPE_SUFFIX``) so biased
+    numbers can never be mistaken for in-scope ones.
     """
+    import json
     import subprocess
 
     script = settings.starrynite_v1_dir / "effort" / "predict_effort.py"
@@ -225,6 +252,7 @@ def run_effort(
         str(nuclei_source),
         str(xyres),
         str(zres),
+        "--json",
     ]
     try:
         proc = subprocess.run(
@@ -234,25 +262,38 @@ def run_effort(
         return {"ran": False, "error": f"{type(exc).__name__}: {exc}"}
 
     stdout = proc.stdout or ""
-    report_path = ensure_dir(dats_dir) / f"{series_name}_sn_effort.txt"
-    try:
-        report_path.write_text(
-            (stdout or "") + ("\n[stderr]\n" + proc.stderr if proc.stderr else ""),
-            encoding="utf-8",
-        )
-        chmod_if_possible(report_path, 0o664)
-        chgrp_if_possible(report_path)
-    except OSError:
-        pass
-
-    summary: dict = {"ran": proc.returncode == 0, "report_path": str(report_path)}
+    dats = ensure_dir(dats_dir)
+    summary: dict = {"ran": False}
     if proc.returncode != 0:
         summary["error"] = (proc.stderr or stdout or "").strip()[-500:]
         return summary
-    m = _TRIAGE_RE.search(stdout)
-    if m:
-        summary["effort_events"] = float(m.group(1))
-        summary["triage"] = m.group(2)
+    try:
+        payload = json.loads(stdout)
+    except ValueError as exc:
+        summary["error"] = f"could not parse predictor JSON: {exc}"
+        return summary
+
+    for name, text in (
+        (f"{series_name}_sn_effort.json", stdout),
+        (f"{series_name}_sn_effort.txt", _render_report(payload)),
+    ):
+        try:
+            path = dats / name
+            path.write_text(text, encoding="utf-8")
+            chmod_if_possible(path, 0o664)
+            chgrp_if_possible(path)
+        except OSError:
+            pass
+
+    summary.update(
+        ran=True,
+        report_path=str(dats / f"{series_name}_sn_effort.txt"),
+        json_path=str(dats / f"{series_name}_sn_effort.json"),
+        model_version=payload.get("model_version"),
+        effort_events=payload.get("effort_events"),
+        triage=payload.get("triage"),
+        stages=payload.get("stages") or [],
+    )
     return summary
 
 

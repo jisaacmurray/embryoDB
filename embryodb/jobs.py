@@ -173,6 +173,7 @@ _STEP_LABELS = {
     "create_alias_symlink": "Alias symlink",
     "write_matlab_params": "matlabParams",
     "run_starrynite": "StarryNite",
+    "compute_difficulty": "Editing difficulty",
     "run_red_extract": "Red Extract",
     "run_measure": "Measure",
 }

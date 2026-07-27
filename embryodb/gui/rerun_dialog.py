@@ -36,6 +36,7 @@ from ..pipeline.worker import WORKER_STEPS, spawn_worker
 _STEP_LABEL = {
     "stage_images": "Stage images (re-extract TIFFs from raw acquisition)",
     "run_starrynite": "StarryNite (cell detection + tracking)",
+    "compute_difficulty": "Editing difficulty (curation-effort prediction)",
     "run_red_extract": "Red Extract (reporter signal)",
     "run_measure": "Measure (morphometry)",
 }

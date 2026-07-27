@@ -81,6 +81,7 @@ STEPS = (
     "create_alias_symlink",
     "write_matlab_params",
     "run_starrynite",
+    "compute_difficulty",
     "run_red_extract",
     "run_measure",
 )
@@ -639,7 +640,7 @@ def import_acquisition(
         # disk but leave the old SN/RedExtract/Measure outputs marked
         # COMPLETE — the user's screenshot showed exactly that mismatch.
         if opts.overwrite_existing_images:
-            for ws in ("run_starrynite", "run_red_extract", "run_measure"):
+            for ws in ("run_starrynite", "compute_difficulty", "run_red_extract", "run_measure"):
                 wrun = _get_or_create_run(session, series.id, ws)
                 wrun.status = RunStatus.PENDING
                 wrun.started_at = None
@@ -667,7 +668,7 @@ def import_acquisition(
                 run.log_path = None
                 run.output_summary = {}
                 run.not_before = not_before
-                for ws in ("run_starrynite", "run_red_extract", "run_measure"):
+                for ws in ("run_starrynite", "compute_difficulty", "run_red_extract", "run_measure"):
                     wrun = _get_or_create_run(session, series.id, ws)
                     if wrun.status == RunStatus.PENDING:
                         wrun.not_before = not_before

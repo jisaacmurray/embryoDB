@@ -69,6 +69,9 @@ def _step_status_for(image_loc: Path, step: str) -> RunStatus:
         # Legacy convention: StarryNite output is <series>-edit.zip in dats/
         edit_zip = image_loc / "dats" / f"{image_loc.name}-edit.zip"
         return RunStatus.COMPLETE if edit_zip.exists() else RunStatus.PENDING
+    if step == "compute_difficulty":
+        effort = image_loc / "dats" / f"{image_loc.name}_sn_effort.json"
+        return RunStatus.COMPLETE if effort.exists() else RunStatus.PENDING
     if step == "run_red_extract":
         # Legacy convention: dats/CD<series>.csv produced by RedExcel2
         cd = image_loc / "dats" / f"CD{image_loc.name}.csv"

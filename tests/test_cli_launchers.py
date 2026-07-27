@@ -82,7 +82,9 @@ def test_requeue_default_steps_resets_failed_starrynite(db_session):
     _make_series_with_worker_runs(db_session, "dv_L1")
     result = requeue_series(db_session, ["dv_L1"])
     # earliest incomplete is run_starrynite → it + downstream reset
-    assert result.steps == ["run_starrynite", "run_red_extract", "run_measure"]
+    assert result.steps == [
+        "run_starrynite", "compute_difficulty", "run_red_extract", "run_measure"
+    ]
     assert result.matched == ["dv_L1"]
     assert not result.missing
     by_step = {
@@ -141,14 +143,16 @@ def test_default_steps_and_earliest_helpers():
     assert earliest_incomplete_step(
         {"stage_images": RunStatus.COMPLETE,
          "run_starrynite": RunStatus.COMPLETE,
+         "compute_difficulty": RunStatus.COMPLETE,
          "run_red_extract": RunStatus.PENDING}
     ) == "run_red_extract"
     # all complete → default to every worker step EXCEPT stage_images (an
     # explicit redo of the analysis, never a restage)
     allc = {s: RunStatus.COMPLETE for s in
-            ("stage_images", "run_starrynite", "run_red_extract", "run_measure")}
+            ("stage_images", "run_starrynite", "compute_difficulty",
+             "run_red_extract", "run_measure")}
     assert default_steps([allc]) == [
-        "run_starrynite", "run_red_extract", "run_measure"
+        "run_starrynite", "compute_difficulty", "run_red_extract", "run_measure"
     ]
 
 
@@ -161,12 +165,15 @@ def test_default_steps_never_includes_stage_images():
     runs = {
         "stage_images": RunStatus.FAILED,
         "run_starrynite": RunStatus.PENDING,
+        "compute_difficulty": RunStatus.PENDING,
         "run_red_extract": RunStatus.PENDING,
         "run_measure": RunStatus.PENDING,
     }
     steps = default_steps([runs])
     assert "stage_images" not in steps
-    assert steps == ["run_starrynite", "run_red_extract", "run_measure"]
+    assert steps == [
+        "run_starrynite", "compute_difficulty", "run_red_extract", "run_measure"
+    ]
 
     # Also when nothing has run yet (all rows absent): still no stage_images.
     assert "stage_images" not in default_steps([{}])

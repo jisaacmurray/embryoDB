@@ -351,11 +351,12 @@ def test_import_acquisition_end_to_end(
     assert "xyres=0.087" in params_text or "xyres=" in params_text
     assert "end_time=2;" in params_text  # number of timepoints
 
-    # 8) PipelineStepRun rows: 7 complete, 3 pending per series (×2 series).
+    # 8) PipelineStepRun rows: 7 complete, 4 pending per series (×2 series).
     # Inline (complete after orchestrator returns): stage_images,
     # stage_metadata, compute_timestamps, write_acetree_config,
     # write_embryodb_xml, create_alias_symlink, write_matlab_params.
-    # Worker (still pending): run_starrynite, run_red_extract, run_measure.
+    # Worker (still pending): run_starrynite, compute_difficulty,
+    # run_red_extract, run_measure.
     # compute_timestamps soft-succeeds when there's no Properties.xml in
     # the fixture (which is the case here), so it still counts as COMPLETE.
     runs = list(db_session.execute(select(PipelineStepRun)).scalars())
@@ -363,7 +364,7 @@ def test_import_acquisition_end_to_end(
     complete = [r for r in runs if r.status == RunStatus.COMPLETE]
     pending = [r for r in runs if r.status == RunStatus.PENDING]
     assert len(complete) == 7 * 2
-    assert len(pending) == 3 * 2
+    assert len(pending) == 4 * 2
 
 
 def test_compute_timestamps_populates_db_and_csv(
@@ -589,7 +590,7 @@ def test_backfill_is_idempotent(db_session, tmp_path):
 
     r1 = backfill_directory(db_session, tmp_path / "images")
     r2 = backfill_directory(db_session, tmp_path / "images")
-    assert r1.runs_inserted == 10  # one per step
+    assert r1.runs_inserted == 11  # one per step
     assert r2.runs_inserted == 0  # nothing new the second time
 
 
@@ -1013,7 +1014,9 @@ def test_worker_respects_not_before(db_session):
         if r.step == "stage_images":
             r.status = RunStatus.PENDING
             r.not_before = future
-        elif r.step in ("run_starrynite", "run_red_extract", "run_measure"):
+        elif r.step in (
+            "run_starrynite", "compute_difficulty", "run_red_extract", "run_measure"
+        ):
             r.not_before = future
     db_session.flush()
 
@@ -1091,7 +1094,7 @@ def test_worker_claim_advances_when_first_step_running(db_session):
     series = _make_full_pipeline_series(db_session, "claim_advance_L1")
     # First worker step already claimed/running elsewhere.
     for r in series.runs:
-        if r.step == "run_starrynite":
+        if r.step in ("run_starrynite", "compute_difficulty"):
             r.status = RunStatus.COMPLETE
     db_session.flush()
 

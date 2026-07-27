@@ -149,11 +149,26 @@ def test_find_nuclei_dir_subdir_and_flat(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_run_effort_parses_triage(release_dir, tmp_path, monkeypatch):
-    # Fake predict_effort.py that prints a realistic triage line.
+_FAKE_PAYLOAD = {
+    "model_version": "gtfree_v1",
+    "model_md5": "0" * 32,
+    "effort_events": 123.0,
+    "triage": "moderate",
+    "triage_q1": 5417.0,
+    "triage_q2": 14945.0,
+    "stages": [
+        {"stage": "to100", "effort_predicted": 12.0, "effort_bucket": "moderate",
+         "n_at": 101.0, "t_at": 40.0},
+        {"stage": "toEnd", "effort_predicted": 123.0, "effort_bucket": "moderate",
+         "n_at": 550.0, "t_at": 240.0},
+    ],
+}
+
+
+def test_run_effort_parses_json(release_dir, tmp_path, monkeypatch):
+    # Fake predict_effort.py that emits the --json contract.
     (release_dir / "effort" / "predict_effort.py").write_text(
-        "print('full-movie predicted effort = 123 events   ->  TRIAGE: curate/moderate')\n",
-        encoding="utf-8",
+        f"import json; print(json.dumps({_FAKE_PAYLOAD!r}))\n", encoding="utf-8"
     )
     monkeypatch.setattr(snv1.settings, "effort_python", Path(sys.executable))
     nuc = tmp_path / "nuclei"
@@ -161,9 +176,29 @@ def test_run_effort_parses_triage(release_dir, tmp_path, monkeypatch):
     dats = tmp_path / "dats"
     res = snv1.run_effort(nuc, 0.09, 0.49, dats, "SER_L1")
     assert res["ran"] is True
-    assert res["triage"] == "curate/moderate"
+    assert res["triage"] == "moderate"
     assert res["effort_events"] == 123.0
-    assert (dats / "SER_L1_sn_effort.txt").exists()
+    assert res["model_version"] == "gtfree_v1"
+    assert [st["stage"] for st in res["stages"]] == ["to100", "toEnd"]
+    assert (dats / "SER_L1_sn_effort.json").exists()
+
+    # The .txt mirrors what predict_effort.py prints by hand: stage, N_at,
+    # t_at, effort.
+    report = (dats / "SER_L1_sn_effort.txt").read_text(encoding="utf-8")
+    to_end = [ln for ln in report.splitlines() if ln.strip().startswith("toEnd")][0]
+    assert to_end.split()[3] == "123.0"
+
+
+def test_run_effort_rejects_non_json_output(release_dir, tmp_path, monkeypatch):
+    (release_dir / "effort" / "predict_effort.py").write_text(
+        "print('TRIAGE: curate/moderate')\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(snv1.settings, "effort_python", Path(sys.executable))
+    nuc = tmp_path / "nuclei"
+    nuc.mkdir()
+    res = snv1.run_effort(nuc, 0.09, 0.49, tmp_path / "dats", "SER_L1")
+    assert res["ran"] is False
+    assert "JSON" in res["error"]
 
 
 def test_run_effort_reports_failure(release_dir, tmp_path, monkeypatch):
@@ -235,6 +270,113 @@ def test_step_run_starrynite_default_old_does_not_call_new(db_session, tmp_path,
     monkeypatch.setattr(subprocess_steps, "_run_with_heartbeat", lambda *a, **k: 0)
     monkeypatch.setattr(subprocess_steps, "_finish_run", lambda *a, **k: None)
     subprocess_steps.step_run_starrynite(s.id, "DISP_L2", image_loc, run_id)
+
+
+# --------------------------------------------------------------------------
+# compute_difficulty step
+# --------------------------------------------------------------------------
+
+
+def _difficulty_series(db_session, name, tmp_path, *, sn_engine=None, with_zip=True):
+    image_loc = tmp_path / name
+    (image_loc / "dats").mkdir(parents=True)
+    if with_zip:
+        (image_loc / "dats" / f"{name}.zip").write_bytes(b"PK\x05\x06" + b"\0" * 18)
+    s = _series(db_session, name, image_loc)
+    sn = PipelineStepRun(series_id=s.id, step="run_starrynite", status=RunStatus.COMPLETE)
+    if sn_engine:
+        sn.params = {"sn_engine": sn_engine}
+    run = PipelineStepRun(series_id=s.id, step="compute_difficulty", status=RunStatus.RUNNING)
+    db_session.add_all([sn, run])
+    db_session.flush()
+    ids = (s.id, run.id)
+    db_session.commit()
+    return image_loc, ids
+
+
+def _fake_effort(**over):
+    payload = {
+        "ran": True, "model_version": "gtfree_v1", "triage": "moderate",
+        "effort_events": 123.0, "report_path": None, "json_path": None,
+        "stages": [
+            {"stage": "to100", "effort_predicted": 12.0, "effort_bucket": "moderate"},
+            {"stage": "toEnd", "effort_predicted": 123.0, "effort_bucket": "moderate"},
+        ],
+    }
+    payload.update(over)
+    return lambda *a, **k: payload
+
+
+def test_compute_difficulty_stores_predictions(db_session, tmp_path, monkeypatch):
+    image_loc, (sid, run_id) = _difficulty_series(
+        db_session, "DIFF_L1", tmp_path, sn_engine="new"
+    )
+    monkeypatch.setattr(snv1, "run_effort", _fake_effort())
+    subprocess_steps.step_compute_difficulty(sid, "DIFF_L1", image_loc, run_id)
+
+    from embryodb.queries import difficulty as q_difficulty
+
+    rows = q_difficulty.get_predictions(db_session, "DIFF_L1")
+    assert {r.stage for r in rows} == {"to100", "toEnd"}
+    # In-scope run: no out-of-scope tag.
+    assert all(r.model_version == "gtfree_v1" for r in rows)
+    assert db_session.get(PipelineStepRun, run_id).status == RunStatus.COMPLETE
+
+
+def test_compute_difficulty_tags_legacy_engine_out_of_scope(
+    db_session, tmp_path, monkeypatch
+):
+    # Default engine is "old" — the model is not calibrated on classic-SN
+    # lineages, so its rows must be tagged rather than silently comparable.
+    image_loc, (sid, run_id) = _difficulty_series(db_session, "DIFF_L2", tmp_path)
+    monkeypatch.setattr(snv1, "run_effort", _fake_effort())
+    subprocess_steps.step_compute_difficulty(sid, "DIFF_L2", image_loc, run_id)
+
+    from embryodb.queries import difficulty as q_difficulty
+
+    rows = q_difficulty.get_predictions(db_session, "DIFF_L2")
+    assert rows
+    assert all(
+        r.model_version == "gtfree_v1" + q_difficulty.OUT_OF_SCOPE_SUFFIX
+        for r in rows
+    )
+
+
+def test_compute_difficulty_skips_without_raw_lineage(db_session, tmp_path, monkeypatch):
+    image_loc, (sid, run_id) = _difficulty_series(
+        db_session, "DIFF_L3", tmp_path, with_zip=False
+    )
+    monkeypatch.setattr(
+        snv1, "run_effort",
+        lambda *a, **k: pytest.fail("predictor must not run without a lineage"),
+    )
+    subprocess_steps.step_compute_difficulty(sid, "DIFF_L3", image_loc, run_id)
+    # SKIPPED, never FAILED: a failure here would strand run_red_extract and
+    # run_measure behind an advisory triage number.
+    assert db_session.get(PipelineStepRun, run_id).status == RunStatus.SKIPPED
+
+
+def test_compute_difficulty_skips_when_predictor_fails(db_session, tmp_path, monkeypatch):
+    image_loc, (sid, run_id) = _difficulty_series(db_session, "DIFF_L4", tmp_path)
+    monkeypatch.setattr(
+        snv1, "run_effort", lambda *a, **k: {"ran": False, "error": "boom"}
+    )
+    subprocess_steps.step_compute_difficulty(sid, "DIFF_L4", image_loc, run_id)
+    row = db_session.get(PipelineStepRun, run_id)
+    assert row.status == RunStatus.SKIPPED
+    assert "boom" in row.error_excerpt
+
+
+def test_compute_difficulty_is_a_registered_worker_step():
+    from embryodb.pipeline.orchestrate import STEPS
+    from embryodb.pipeline.worker import WORKER_STEPS
+
+    # Ordering is load-bearing: the worker's _prerequisite_ok walks WORKER_STEPS,
+    # so difficulty must sit after the lineage exists and before extraction.
+    assert STEPS.index("run_starrynite") < STEPS.index("compute_difficulty")
+    assert STEPS.index("compute_difficulty") < STEPS.index("run_red_extract")
+    assert WORKER_STEPS.index("run_starrynite") < WORKER_STEPS.index("compute_difficulty")
+    assert WORKER_STEPS.index("compute_difficulty") < WORKER_STEPS.index("run_red_extract")
 
 
 # --------------------------------------------------------------------------

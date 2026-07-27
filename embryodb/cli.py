@@ -1935,7 +1935,8 @@ def pipeline_mark_legacy_cmd(
 def pipeline_worker_cmd() -> None:
     """Start the per-machine background worker (exits when queue is empty).
 
-    The worker picks up PENDING run_starrynite / run_red_extract / run_measure
+    The worker picks up PENDING run_starrynite / compute_difficulty /
+    run_red_extract / run_measure
     rows in series order and executes them sequentially. It is crash-safe: rows
     left RUNNING with a stale heartbeat are requeued on startup.
     """
@@ -1963,7 +1964,8 @@ def pipeline_rerun_cmd(
         typer.Option(
             "--step",
             help="Worker step(s) to reset (repeatable): run_starrynite, "
-            "run_red_extract, run_measure. Default: earliest incomplete + downstream.",
+            "compute_difficulty, run_red_extract, run_measure. Default: "
+            "earliest incomplete + downstream.",
         ),
     ] = None,
     set_param: Annotated[

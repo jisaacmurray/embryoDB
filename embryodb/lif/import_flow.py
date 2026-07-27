@@ -682,7 +682,7 @@ def _import_one_position(
     not_before = None
     if opts.delay_hours and opts.delay_hours > 0:
         not_before = datetime.now(tz=timezone.utc) + timedelta(hours=opts.delay_hours)
-    for ws in ("run_starrynite", "run_red_extract", "run_measure"):
+    for ws in ("run_starrynite", "compute_difficulty", "run_red_extract", "run_measure"):
         wrun = _get_or_create_run(session, series.id, ws)
         if not_before is not None and wrun.status == RunStatus.PENDING:
             wrun.not_before = not_before

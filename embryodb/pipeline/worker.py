@@ -69,7 +69,13 @@ COMMAND_HEARTBEAT = 30
 # (stage_metadata, write_acetree_config, write_embryodb_xml,
 # create_alias_symlink, write_matlab_params) are not in this tuple — those
 # are fast and stay synchronous in import_acquisition.
-WORKER_STEPS = ("stage_images", "run_starrynite", "run_red_extract", "run_measure")
+WORKER_STEPS = (
+    "stage_images",
+    "run_starrynite",
+    "compute_difficulty",
+    "run_red_extract",
+    "run_measure",
+)
 
 # A RUNNING row with heartbeat_at older than this is assumed crashed.
 STALE_THRESHOLD = timedelta(minutes=5)
@@ -791,6 +797,10 @@ def run_worker() -> None:
             subprocess_steps.step_stage_images(series_id, run_id)
         elif step_name == "run_starrynite":
             subprocess_steps.step_run_starrynite(
+                series_id, series_name, image_loc, run_id
+            )
+        elif step_name == "compute_difficulty":
+            subprocess_steps.step_compute_difficulty(
                 series_id, series_name, image_loc, run_id
             )
         elif step_name == "run_red_extract":

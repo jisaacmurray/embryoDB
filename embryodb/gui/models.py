@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from ..models import PipelineStepRun, RunStatus, Series, SeriesDifficulty, Status
 from ..queries import series as q_series
+from ..queries.difficulty import OUT_OF_SCOPE_SUFFIX, preferred_model_version
 
 
 @dataclass
@@ -79,6 +80,7 @@ _STEP_SHORT: dict[str, str] = {
     "create_alias_symlink": "lnk",
     "write_matlab_params": "prm",
     "run_starrynite": "SN",
+    "compute_difficulty": "diff",
     "run_red_extract": "red",
     "output_excel": "xls",
     "run_measure": "meas",
@@ -155,41 +157,19 @@ def _classify_triage(triage: str) -> tuple[str, QtGui.QColor | None]:
     return (triage or ""), None
 
 
-def _latest_effort(runs: list[PipelineStepRun]) -> dict | None:
-    """The effort dict from the most-recent run_starrynite run that produced one.
-
-    Returns None when no new-SN run has an effort estimate (legacy / old-engine
-    series, or a run that skipped the predictor)."""
-    sn = [
-        r for r in runs
-        if r.step == "run_starrynite" and isinstance(r.output_summary, dict)
-        and isinstance(r.output_summary.get("effort"), dict)
-        and r.output_summary["effort"].get("ran")
-    ]
-    if not sn:
-        return None
-    sn.sort(key=lambda r: (r.completed_at or r.started_at or datetime.min), reverse=True)
-    return sn[0].output_summary["effort"]
-
-
 def _difficulty_display(difficulty_rows: list) -> tuple[str, QtGui.QColor | None]:
     """Compact Effort-cell (text, background) from SeriesDifficulty rows.
 
     Colors by the to350 bucket; shows rounded to100 · to350 · toEnd integers.
+    An out-of-scope vintage is marked `~` so a miscalibrated number is never
+    read as a confident one.
     """
     if not difficulty_rows:
         return "", None
     # A series can carry several model vintages with differing stage sets;
-    # keying by stage across them would mix vintages. Newest vintage wins.
-    newest = max(
-        {r.model_version for r in difficulty_rows},
-        key=lambda mv: max(
-            (r.predicted_at for r in difficulty_rows
-             if r.model_version == mv and r.predicted_at is not None),
-            default=datetime.min.replace(tzinfo=timezone.utc),
-        ),
-    )
-    by_stage = {r.stage: r for r in difficulty_rows if r.model_version == newest}
+    # keying by stage across them would mix vintages.
+    chosen = preferred_model_version(difficulty_rows)
+    by_stage = {r.stage: r for r in difficulty_rows if r.model_version == chosen}
     to350 = by_stage.get("to350")
     color: QtGui.QColor | None = None
     bucket_label = ""
@@ -205,6 +185,8 @@ def _difficulty_display(difficulty_rows: list) -> tuple[str, QtGui.QColor | None
     if not vals and not bucket_label:
         return "", None
     label = (bucket_label + " — " if bucket_label else "") + " · ".join(vals)
+    if chosen.endswith(OUT_OF_SCOPE_SUFFIX):
+        label = "~" + label
     return label, color
 
 
@@ -212,21 +194,7 @@ def _summarize_effort(
     runs: list[PipelineStepRun],
     difficulty_rows: list = (),
 ) -> tuple[str, QtGui.QColor | None]:
-    """(display text, background color) for the Effort cell. Empty when none.
-
-    Prefers the new-SN model result from PipelineStepRun output_summary; falls
-    back to SeriesDifficulty rows (legacy model) when no new-SN result exists.
-    """
-    eff = _latest_effort(runs)
-    if eff is not None:
-        label, color = _classify_triage(str(eff.get("triage", "")))
-        events = eff.get("effort_events")
-        if events is not None:
-            try:
-                label = f"{label} — {int(round(float(events)))}"
-            except (TypeError, ValueError):
-                pass
-        return label, color
+    """(display text, background color) for the Effort cell. Empty when none."""
     return _difficulty_display(difficulty_rows)
 
 

@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Callable
 
 from .config import settings
+from .external import LaunchError
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +290,7 @@ def build_print_trees_command(
     linewidth: int = 3,
     cd_prefix: str = "CD",
     heap_mb: int = 4000,
+    on_screen: bool = False,
     base_dir: Path,
 ) -> str:
     """Render the `acexpress_CL2.jar Tree1` shell.
@@ -297,6 +299,10 @@ def build_print_trees_command(
     ``<series> - <cd_prefix>`` so Tree1's series-list parser uses the chosen
     file type (SCD or ACD) instead of the default CD<series>.csv.  The "-"
     sentinel tells the patched Tree1 that no editRules are active.
+
+    `on_screen` shows Tree1's window on the caller's X display instead of
+    rendering into a throwaway one — the quick-QC path, where looking at the
+    tree is the point and the PNG is a side effect.
     """
     list_path = Path(list_file)
     if cd_prefix != "CD":
@@ -311,19 +317,21 @@ def build_print_trees_command(
             args.append(str(int(max_expr)))
             args.append(shell_quote(color_scheme))
             args.append(str(int(linewidth)))
-    # Tree1 builds a JFrame even though it only ever writes PNGs, so it needs a
-    # real display: headless mode throws HeadlessException. xvfb-run supplies a
-    # throwaway one, which also stops a dead ssh X-forward from killing the run.
-    # Tree1 holds every rendered tree in memory, so deeply-curated embryos
-    # (~600+ cells) blow through the old 1000m heap partway down a long list.
+    # Tree1 builds a JFrame even though it also writes PNGs, so it always needs a
+    # display: headless mode throws HeadlessException. Batch runs get a throwaway
+    # one from xvfb-run, which also stops a dead ssh X-forward from killing the
+    # run; on_screen instead inherits the caller's $DISPLAY so the window is
+    # visible. Tree1 holds every rendered tree in memory, so deeply-curated
+    # embryos (~600+ cells) blow through the old 1000m heap partway down a list.
     java = (
         f"nice java -Xmx{int(heap_mb)}m "
         f"-cp {shell_quote(str(base_dir / 'acexpress_CL2.jar'))} "
         f"Tree1 {' '.join(args)}"
     )
+    launcher = java if on_screen else f"xvfb-run -a {java}"
     return (
         f"echo '== PrintTrees ({len(series_names)} series, {cd_prefix}) ==' && "
-        f"xvfb-run -a {java}"
+        f"{launcher}"
     )
 
 
@@ -450,6 +458,7 @@ def run_print_trees(
     linewidth: int = 3,
     cd_prefix: str = "CD",
     heap_mb: int = 4000,
+    on_screen: bool = False,
     tools3_dir: Path | None = None,
 ) -> LaunchResult:
     """Spawn `acexpress_CL2.jar Tree1` detached against the given series.
@@ -466,11 +475,27 @@ def run_print_trees(
     list format (``<series> - <prefix>``).
 
     Output PNGs land in /gpfs/fs0/l/murr/trees/ (hardcoded inside Tree1).
+
+    `on_screen` puts Tree1's window on the caller's display for quick visual QC.
+    PNGs are still written either way — it only controls whether you also see
+    the tree. Not available in remote mode, where the job runs on the worker.
     """
     if not series_names:
         raise ValueError("run_print_trees: series_names is empty")
 
+    if on_screen and not os.environ.get("DISPLAY"):
+        raise LaunchError(
+            "print-trees --on-screen needs an X display, but $DISPLAY is unset. "
+            "Use ssh -X / -Y, or drop --on-screen to render PNGs headlessly."
+        )
+
     if settings.remote:
+        if on_screen:
+            raise LaunchError(
+                "print-trees --on-screen is not available in remote mode: the "
+                "job runs on the penticton worker, so its window would open "
+                "there. Drop --on-screen and view the PNGs instead."
+            )
         return enqueue_command_job(
             "print_trees",
             {
@@ -496,6 +521,7 @@ def run_print_trees(
         linewidth=linewidth,
         cd_prefix=cd_prefix,
         heap_mb=heap_mb,
+        on_screen=on_screen,
         base_dir=base_dir,
     )
     proc = _spawn_detached(shell, log_path)

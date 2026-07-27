@@ -112,6 +112,32 @@ def test_run_print_trees_with_params(captured_popen, tmp_path):
     assert " 5" in after
 
 
+def test_run_print_trees_defaults_to_headless(captured_popen):
+    result = external_tools.run_print_trees(["seriesA"], tools3_dir=Path("/fake/tools3"))
+    assert "xvfb-run -a" in result.proc.args[2]
+
+
+def test_run_print_trees_on_screen_skips_xvfb(captured_popen, monkeypatch):
+    monkeypatch.setenv("DISPLAY", ":0")
+    result = external_tools.run_print_trees(
+        ["seriesA"], on_screen=True, tools3_dir=Path("/fake/tools3")
+    )
+    assert "xvfb-run" not in result.proc.args[2]
+
+
+def test_run_print_trees_on_screen_requires_display(captured_popen, monkeypatch):
+    monkeypatch.delenv("DISPLAY", raising=False)
+    with pytest.raises(external_tools.LaunchError, match="DISPLAY"):
+        external_tools.run_print_trees(["seriesA"], on_screen=True)
+
+
+def test_run_print_trees_on_screen_rejected_in_remote_mode(captured_popen, monkeypatch):
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setattr(external_tools.settings, "remote", True)
+    with pytest.raises(external_tools.LaunchError, match="remote mode"):
+        external_tools.run_print_trees(["seriesA"], on_screen=True)
+
+
 def test_run_getacd_builds_correct_shell(captured_popen, tmp_path):
     result = external_tools.run_getacd(
         ["seriesA", "seriesB"],

@@ -10,11 +10,13 @@ knows where to look.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from pathlib import Path
 
 from qtpy import QtCore, QtWidgets
 
+from ..config import settings
 from ..external_tools import LaunchResult, run_print_trees
 
 _CD_PREFIXES: list[tuple[str, str]] = [
@@ -133,6 +135,23 @@ class PrintTreesDialog(QtWidgets.QDialog):
 
         layout.addWidget(form)
 
+        self._on_screen = QtWidgets.QCheckBox("Show the tree on screen (quick QC)")
+        self._on_screen.setToolTip(
+            "Open Tree1's own window in addition to writing the PNGs.\n"
+            "Unavailable in remote mode (the job runs on the penticton worker) "
+            "or without an X display."
+        )
+        if settings.remote:
+            self._on_screen.setEnabled(False)
+            self._on_screen.setToolTip(
+                "Remote mode: the job runs on the penticton worker, so its "
+                "window would open there. View the PNGs instead."
+            )
+        elif not os.environ.get("DISPLAY"):
+            self._on_screen.setEnabled(False)
+            self._on_screen.setToolTip("$DISPLAY is unset — no X display to draw on.")
+        layout.addWidget(self._on_screen)
+
         info = QtWidgets.QLabel(
             f"PNG output: <code>{_TREE_OUTPUT_DIR}/&lt;series&gt;.png</code> "
             f"(directory must exist and be writeable by your account)."
@@ -173,6 +192,8 @@ class PrintTreesDialog(QtWidgets.QDialog):
         cd_prefix = self._cd_prefix.currentData() or "CD"
         if cd_prefix != "CD":
             kwargs["cd_prefix"] = cd_prefix
+        if self._on_screen.isChecked():
+            kwargs["on_screen"] = True
         try:
             result: LaunchResult = run_print_trees(self._series_names, **kwargs)
         except Exception as exc:

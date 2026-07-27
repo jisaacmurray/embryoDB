@@ -2580,22 +2580,35 @@ def print_trees_cmd(
         int,
         typer.Option("--heap-mb", help="Java heap for Tree1; raise for deep (600+ cell) embryos."),
     ] = 4000,
+    on_screen: Annotated[
+        bool,
+        typer.Option(
+            "--on-screen",
+            help="Also show Tree1's window on your display (quick QC). Needs $DISPLAY; local mode only.",
+        ),
+    ] = False,
 ) -> None:
     """Render lineage-tree PNGs via Tree1 (CLI twin of the GUI "Print trees…").
     Detached job; PNGs land in /gpfs/fs0/l/murr/trees/.
     """
+    from .external import LaunchError
     from .external_tools import run_print_trees
 
     names = _resolve_series_arg(series, dataset)
-    result = run_print_trees(
-        names,
-        min_expr=min_expr,
-        max_expr=max_expr,
-        color_scheme=color_scheme,
-        linewidth=linewidth,
-        cd_prefix=cd_prefix,
-        heap_mb=heap_mb,
-    )
+    try:
+        result = run_print_trees(
+            names,
+            min_expr=min_expr,
+            max_expr=max_expr,
+            color_scheme=color_scheme,
+            linewidth=linewidth,
+            cd_prefix=cd_prefix,
+            heap_mb=heap_mb,
+            on_screen=on_screen,
+        )
+    except LaunchError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
     _report_launch(result, "PrintTrees", len(names))
 
 

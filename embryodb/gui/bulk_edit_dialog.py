@@ -16,6 +16,7 @@ from collections.abc import Callable
 from qtpy import QtCore, QtWidgets
 
 from ..config import settings
+from .combo import use_exact_case
 from ..identity import known_persons
 from ..models import Series, Status
 from ..queries import series as q_series
@@ -100,6 +101,7 @@ class BulkEditMetadataDialog(QtWidgets.QDialog):
     def _editable_combo(self, column: str) -> QtWidgets.QComboBox:
         combo = QtWidgets.QComboBox()
         combo.setEditable(True)
+        use_exact_case(combo)
         combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
         combo.setEditText("")  # default blank = unchanged
         # Populate suggestions from existing values

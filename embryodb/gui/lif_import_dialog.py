@@ -21,6 +21,7 @@ from pathlib import Path
 from qtpy import QtCore, QtWidgets
 
 from ..external_tools import LaunchResult, run_lif_import
+from .combo import use_exact_case
 from ..identity import current_user, known_persons, system_users, user_has_image_dir
 
 # Roles the user can assign per channel. role_subdir() maps histone→tif/,
@@ -135,6 +136,7 @@ class LifImportDialog(QtWidgets.QDialog):
         # name is visibly absent and gets a confirm before it's created.
         self._person_combo = QtWidgets.QComboBox()
         self._person_combo.setEditable(True)
+        use_exact_case(self._person_combo)
         self._person_combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
         try:
             with self._session_cm() as s:

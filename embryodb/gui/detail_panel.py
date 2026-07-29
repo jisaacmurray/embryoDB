@@ -20,6 +20,7 @@ from qtpy import QtCore, QtWidgets
 from sqlalchemy.orm import Session
 
 from .. import external
+from .combo import use_exact_case
 from ..identity import known_persons
 from ..legacy_sync import sync_legacy_xml
 from ..models import RunStatus, Series, Status
@@ -309,6 +310,7 @@ class DetailPanel(QtWidgets.QWidget):
         if kind == "combo":
             w = QtWidgets.QComboBox()
             w.setEditable(True)
+            use_exact_case(w)
             w.lineEdit().textEdited.connect(self._on_dirty)
             return w
         if kind == "status":

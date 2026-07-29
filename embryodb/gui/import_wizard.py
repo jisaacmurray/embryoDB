@@ -18,6 +18,7 @@ from typing import Callable
 from qtpy import QtCore, QtWidgets
 
 from ..config import settings
+from .combo import use_exact_case
 from ..identity import current_user, known_persons, system_users, user_has_image_dir
 from ..parsers.filename import list_parsers
 
@@ -288,6 +289,7 @@ class MetadataPage(QtWidgets.QWizardPage):
         # visibly absent from the list and gets a confirm before it's created.
         self._person_combo = QtWidgets.QComboBox()
         self._person_combo.setEditable(True)
+        use_exact_case(self._person_combo)
         self._person_combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
         self._person_combo.setToolTip(
             "Who the data belongs to scientifically (e.g. the person who "

@@ -28,6 +28,7 @@ from ..config import settings
 from ..database import session_scope
 from ..fsutil import chmod_if_possible, ensure_dir
 from ..models import PipelineStepRun, RunStatus, Series
+from .annotation_archive import archive_annotations
 
 HEARTBEAT_INTERVAL = 30  # seconds between DB heartbeat writes during subprocess run
 
@@ -411,6 +412,15 @@ def step_run_starrynite(
     if engine == "new":
         _run_starrynite_new(series_id, series_name, image_loc, run_id, log_path)
         return
+
+    # The Perl script writes the lineage zips itself, so unlike the new-SN path
+    # there is no Python write to hook -- archive before handing over control.
+    archived = archive_annotations(
+        image_loc / "dats", series_name,
+        reason="run_starrynite (sn_engine=old) about to rerun",
+    )
+    if archived:
+        _append_log(log_path, f"embryoDB archived existing lineage zips: {archived}")
 
     cmd = [
         "nice",

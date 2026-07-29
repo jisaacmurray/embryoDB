@@ -37,6 +37,7 @@ from pathlib import Path
 
 from ..fsutil import chmod_if_possible, ensure_dir
 from ..models import Series
+from .annotation_archive import archive_annotations
 from .orchestrate import (
     FALLBACK_VOXEL_XY_UM,
     FALLBACK_VOXEL_Z_UM,
@@ -179,6 +180,12 @@ def write_stub_for_series(
 
     zip_path = dats / f"{series.series_name}.zip"
     edit_zip_path = dats / f"{series.series_name}-edit.zip"
+
+    # A stub rewrite on a series that already has a real (possibly curated)
+    # lineage would otherwise replace it with detections or a single placeholder.
+    archive_annotations(
+        dats, series.series_name, reason="write_stub_for_series overwriting lineage"
+    )
 
     nuclei_dir = image_loc / "tif" / f"{series.series_name}_matlabnuclei"
     use_detection = (

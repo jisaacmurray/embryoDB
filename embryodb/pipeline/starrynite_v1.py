@@ -33,6 +33,7 @@ from pathlib import Path
 from ..config import settings
 from ..fsutil import chmod_if_possible, chgrp_if_possible, ensure_dir, safe_copy
 from ..parsers.matlab_params import load as load_params
+from .annotation_archive import archive_annotations
 
 # Marker in params_template_newmatlab.txt where the FIXED tracking block begins.
 # Everything from here to EOF is the release-managed tracking config (the model
@@ -179,9 +180,16 @@ def land_lineage(scratch_out: Path | str, dats_dir: Path | str, series_name: str
     dats = ensure_dir(dats_dir)
     edit_zip = dats / f"{series_name}-edit.zip"
     pristine = dats / f"{series_name}.zip"
+    # -edit.zip may hold AceTree curation from a previous pass; keep a copy.
+    archived = archive_annotations(
+        dats, series_name, reason="run_starrynite (sn_engine=new) landing lineage"
+    )
     safe_copy(zip_path, edit_zip)
     safe_copy(zip_path, pristine)
-    return {"edit_zip": str(edit_zip), "pristine_zip": str(pristine)}
+    out = {"edit_zip": str(edit_zip), "pristine_zip": str(pristine)}
+    if archived:
+        out["archived"] = archived
+    return out
 
 
 def _render_report(payload: dict) -> str:

@@ -166,6 +166,25 @@ class Settings(BaseSettings):
             "zip + effort QC are copied back (EMBRYODB_STARRYNITE_SCRATCH_ROOT)."
         ),
     )
+    # --- Lineage-zip archiving ---------------------------------------------
+    archive_annotations: bool = Field(
+        default=True,
+        description=(
+            "Before a pipeline step overwrites dats/<series>-edit.zip (AceTree's "
+            "curation target) or the pristine dats/<series>.zip, copy the existing "
+            "ones into dats/archived/<UTC timestamp>/. The zips are ~1 MB, so this "
+            "is cheap insurance against a re-pipeline destroying manual curation "
+            "(EMBRYODB_ARCHIVE_ANNOTATIONS)."
+        ),
+    )
+    archive_annotations_keep: int = Field(
+        default=0,
+        description=(
+            "How many archive generations to retain per series; older ones are "
+            "pruned after each archive. 0 (default) keeps every generation "
+            "(EMBRYODB_ARCHIVE_ANNOTATIONS_KEEP)."
+        ),
+    )
     # --- R-based GetACD (get_acd.R port of GetACD.pl) -----------------------
     get_acd_dir: Path = Field(
         default=Path("/murrlab/gpfs/fs0/l/murr/new_tools/accessory/get_ACD"),

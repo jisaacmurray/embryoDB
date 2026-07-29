@@ -413,6 +413,17 @@ class DetailPanel(QtWidgets.QWidget):
         parts = []
         if summary.get("sn_engine") == "new":
             parts.append("StarryNite engine: new (all-MATLAB v1)")
+        elif summary.get("sn_engine") == "prod":
+            # The prod engine runs against a mutable dev tree, so the tree's
+            # state is part of the result — surface it rather than just "prod".
+            prov = summary.get("provenance") or {}
+            note = "StarryNite engine: prod"
+            head = prov.get("dev_head")
+            if head:
+                note += f" @ {head[:8]}"
+            if prov.get("dev_dirty"):
+                note += f" +{len(prov['dev_dirty'])} uncommitted"
+            parts.append(note)
 
         if not difficulty_rows:
             return ("  •  ".join(parts), "color: #444;") if parts else ("", "")

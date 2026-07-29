@@ -161,12 +161,17 @@ class RerunPipelineDialog(QtWidgets.QDialog):
         self._engine_combo.addItem("Keep current choice", None)
         self._engine_combo.addItem("Old (legacy compiled MATLAB)", "old")
         self._engine_combo.addItem("New (all-MATLAB v1)", "new")
+        self._engine_combo.addItem("Production (nucleus filter + dev tracker)", "prod")
         self._engine_combo.setToolTip(
             "Which StarryNite to use for this rerun.\n"
             "Keep current: leave each series' existing engine choice (defaults "
             "to old if never set).\n"
             "New runs full MATLAB with the retrained tracker and lands into the "
-            "same slot; it also records an effort estimate on the run."
+            "same slot; it also records an effort estimate on the run.\n"
+            "Production adds a GT-free nucleus filter and a flattened intensity "
+            "threshold, and tracks using the ACTIVE StarryNite dev tree — so it "
+            "picks up ongoing tracker work rather than a frozen release. Every "
+            "run records that tree's git state so a lineage stays traceable."
         )
         engine_row.addWidget(self._engine_combo, 1)
         params_vl.addLayout(engine_row)

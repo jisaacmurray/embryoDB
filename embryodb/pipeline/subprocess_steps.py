@@ -412,6 +412,9 @@ def step_run_starrynite(
     if engine == "new":
         _run_starrynite_new(series_id, series_name, image_loc, run_id, log_path)
         return
+    if engine == "prod":
+        _run_starrynite_prod(series_id, series_name, image_loc, run_id, log_path)
+        return
 
     # The Perl script writes the lineage zips itself, so unlike the new-SN path
     # there is no Python write to hook -- archive before handing over control.
@@ -533,6 +536,100 @@ def _run_starrynite_new(
             return
 
         summary: dict = {"sn_engine": "new", **landed}
+        _finish_run(run_id, log_path, 0, output_summary=summary)
+        _normalize_dats_perms(series_name)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _run_starrynite_prod(
+    series_id: int,
+    series_name: str,
+    image_loc: Path,
+    run_id: int,
+    log_path: Path,
+) -> None:
+    """Run the PRODUCTION StarryNite (``sn_production_driver.m``) for one series.
+
+    Selected via the run row's ``params.sn_engine == "prod"``. Structurally the
+    same shape as the new-SN path — scratch-only run, land into the legacy
+    ``dats/`` slot — with two differences: the driver consumes the series'
+    ``matlabParams`` directly (optionally with the intensity threshold flattened
+    across staging bands), and it emits loose ``tNNN-nuclei`` rather than a zip,
+    so landing packs one.
+
+    The driver's code resolves from the ACTIVE StarryNite dev tree, so the
+    provenance snapshot recorded on the run is the only durable record of what
+    produced this lineage. It is captured before the run, not after, so a run
+    that later fails still says what it tried.
+    """
+    from . import starrynite_prod as snp
+
+    params_path = image_loc / "matlabParams"
+    if not params_path.exists():
+        _finish_run(
+            run_id, log_path, 1,
+            diagnostic=(
+                f"production StarryNite: no matlabParams at {params_path}; run "
+                "write_matlab_params first"
+            ),
+        )
+        return
+
+    provenance = snp.capture_provenance()
+    if provenance.get("dev_dirty"):
+        _append_log(
+            log_path,
+            "embryoDB NOTE: the StarryNite dev tree has uncommitted changes, so "
+            "the recorded git HEAD does not fully identify the code used:\n  "
+            + "\n  ".join(provenance["dev_dirty"]),
+        )
+
+    scratch = Path(
+        tempfile.mkdtemp(
+            prefix=f"embryodb-snprod-{series_name}-",
+            dir=str(ensure_dir(settings.starrynite_scratch_root)),
+        )
+    )
+    scratch_out = scratch / "out"
+    try:
+        try:
+            paramfile = snp.build_prod_paramfile(
+                params_path, scratch / "matlabParams"
+            )
+        except ValueError as exc:
+            _finish_run(run_id, log_path, 1, diagnostic=str(exc))
+            return
+
+        image_first = image_loc / "tif" / f"{series_name}-t001-p01.tif"
+        cmd, env = snp.build_matlab_command(
+            paramfile, image_first, scratch_out, scratch
+        )
+        returncode = _run_with_heartbeat(
+            cmd, log_path, run_id,
+            cwd=str(scratch), env=env,
+            max_seconds=settings.starrynite_max_seconds,
+        )
+        if returncode != 0:
+            _finish_run(
+                run_id, log_path, returncode,
+                diagnostic="production StarryNite run failed; see log tail.",
+                output_summary={"sn_engine": "prod", "provenance": provenance},
+            )
+            return
+
+        try:
+            landed = snp.land_lineage(
+                scratch_out, image_loc / "dats", series_name, paramfile=paramfile
+            )
+        except FileNotFoundError as exc:
+            _finish_run(
+                run_id, log_path, 1, diagnostic=str(exc),
+                output_summary={"sn_engine": "prod", "provenance": provenance},
+            )
+            return
+
+        summary: dict = {"sn_engine": "prod", **landed, "provenance": provenance}
         _finish_run(run_id, log_path, 0, output_summary=summary)
         _normalize_dats_perms(series_name)
     finally:

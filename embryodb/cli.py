@@ -33,7 +33,7 @@ app = typer.Typer(
 )
 console = Console()
 
-SN_ENGINES = ("old", "new")
+SN_ENGINES = ("old", "new", "prod")
 
 
 def _validate_sn_engine(value: str) -> str:

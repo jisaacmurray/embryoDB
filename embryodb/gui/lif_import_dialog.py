@@ -179,10 +179,14 @@ class LifImportDialog(QtWidgets.QDialog):
         self._engine_combo = QtWidgets.QComboBox()
         self._engine_combo.addItem("Old (legacy compiled MATLAB)", "old")
         self._engine_combo.addItem("New (all-MATLAB v1)", "new")
+        self._engine_combo.addItem("Production (nucleus filter + dev tracker)", "prod")
         self._engine_combo.setToolTip(
             "Which StarryNite to run. Old (default) is the legacy compiled-MATLAB "
             "tracer; New runs full MATLAB with the retrained tracker, lands into "
-            "the same slot, and records an effort estimate on the run."
+            "the same slot, and records an effort estimate on the run.\n"
+            "Production adds a GT-free nucleus filter and a flattened intensity "
+            "threshold, and tracks using the ACTIVE StarryNite dev tree, so it "
+            "picks up ongoing tracker work rather than a frozen release."
         )
         adv_form.addRow("StarryNite engine:", self._engine_combo)
         layout.addWidget(adv)

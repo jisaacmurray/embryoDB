@@ -155,6 +155,60 @@ class Settings(BaseSettings):
         ),
         description="Python interpreter (numpy/pandas/sklearn/joblib) for the GT-free effort predictor.",
     )
+    # --- Production StarryNite (sn_production_driver) ----------------------
+    # Selected via `params.sn_engine == "prod"`. A THIRD engine, not a revision
+    # of "new": it runs a different entry point (permissive detect -> GT-free
+    # nucleus filter -> time-model track), a different tracking model, and takes
+    # its tracking parameters from a frozen template rather than the param file.
+    #
+    # Deliberately NOT frozen (decided by jmurr 2026-07-29): the driver resolves
+    # its .m code from the ACTIVE dev tree, so tracker improvements reach
+    # production without a release step. The cost is that a lineage's behaviour
+    # depends on the tree's state at run time, so every run records the dev-tree
+    # git HEAD + dirty files + driver/asset digests in its output_summary. Read
+    # that, not the clock, when comparing two prod lineages.
+    starrynite_prod_dir: Path = Field(
+        default=Path("/murrlab3/jmurr/starrynite_test/release_prod"),
+        description=(
+            "Dir holding sn_production_driver.m, applyParamDefaults.m, "
+            "apply_nucleus_filter.py and assets/ (EMBRYODB_STARRYNITE_PROD_DIR)."
+        ),
+    )
+    starrynite_prod_assets: Path | None = Field(
+        default=None,
+        description=(
+            "Asset dir with nucleus_filter.pkl, tracking_model.mat and "
+            "tracking_template.mat. None = <starrynite_prod_dir>/assets "
+            "(EMBRYODB_STARRYNITE_PROD_ASSETS)."
+        ),
+    )
+    starrynite_prod_iscale: float = Field(
+        default=1.0,
+        description=(
+            "Permissive intensity scale the driver applies to staging bands "
+            "stagelo..stagehi. 1.0 makes that scaling a no-op, which is what the "
+            "uniform-threshold variant wants (EMBRYODB_STARRYNITE_PROD_ISCALE)."
+        ),
+    )
+    starrynite_prod_stagelo: int = Field(
+        default=3,
+        description=(
+            "First staging band the permissive scale applies to. Irrelevant at "
+            "iscale=1.0 but recorded for provenance "
+            "(EMBRYODB_STARRYNITE_PROD_STAGELO)."
+        ),
+    )
+    starrynite_prod_uniform_threshold: float | None = Field(
+        default=0.004,
+        description=(
+            "Flatten parameters.intensitythreshold to this value across ALL "
+            "staging bands in a scratch copy of the series' matlabParams. The "
+            "shipped band-2 value (0.0075) is a ~1.9x notch above both "
+            "neighbours that costs mid-movie recall; flattening it measurably "
+            "improved band-2 capture across the 20260716 JIM801 set. None keeps "
+            "the file's own values (EMBRYODB_STARRYNITE_PROD_UNIFORM_THRESHOLD)."
+        ),
+    )
     starrynite_scratch_root: Path = Field(
         default_factory=lambda: Path(
             os.environ.get("EMBRYODB_STARRYNITE_SCRATCH_ROOT")

@@ -535,11 +535,15 @@ class TargetsPage(QtWidgets.QWizardPage):
         self._engine_combo = QtWidgets.QComboBox()
         self._engine_combo.addItem("Old (legacy compiled MATLAB)", "old")
         self._engine_combo.addItem("New (all-MATLAB v1)", "new")
+        self._engine_combo.addItem("Production (nucleus filter + dev tracker)", "prod")
         self._engine_combo.setToolTip(
             "Which StarryNite to run for these series.\n"
             "Old (default): the legacy compiled-MATLAB tracer.\n"
             "New: full MATLAB with the retrained tracker; lands into the same "
-            "slot and records an effort estimate on the run."
+            "slot and records an effort estimate on the run.\n"
+            "Production: adds a GT-free nucleus filter and a flattened intensity "
+            "threshold, tracking with the ACTIVE StarryNite dev tree, so it picks "
+            "up ongoing tracker work rather than a frozen release."
         )
         layout.addRow("StarryNite engine:", self._engine_combo)
 

@@ -1980,9 +1980,26 @@ def pipeline_rerun_cmd(
         str | None,
         typer.Option(
             "--sn-engine",
-            help="StarryNite engine when run_starrynite is reset: 'old' or 'new'. "
-            "Omit to keep the series' existing choice.",
+            help="StarryNite engine when run_starrynite is reset: 'old', 'new' or "
+            "'prod'. Omit to keep the series' existing choice.",
         ),
+    ] = None,
+    sn_uniform_threshold: Annotated[
+        str | None,
+        typer.Option(
+            "--sn-uniform-threshold",
+            help="prod engine only: flatten intensitythreshold to this value "
+            "(e.g. 0.0025 for a dim movie), or 'none' to keep the paramfile's "
+            "own per-band vector. Omit for the configured default.",
+        ),
+    ] = None,
+    sn_iscale: Annotated[
+        float | None,
+        typer.Option("--sn-iscale", help="prod engine only: driver iscale."),
+    ] = None,
+    sn_stagelo: Annotated[
+        int | None,
+        typer.Option("--sn-stagelo", help="prod engine only: driver stagelo."),
     ] = None,
     run: Annotated[
         bool,
@@ -1996,6 +2013,9 @@ def pipeline_rerun_cmd(
     When run_starrynite is among them, matlabParams xyres/zres are refreshed
     from the DB microscopy metadata and any --set overrides applied, then the
     worker is spawned unless --no-run is given.
+
+    The --sn-* threshold options are prod-engine call arguments, not matlabParams
+    entries, so they cannot be passed via --set.
     """
     from .pipeline.rerun import requeue_series
     from .pipeline.worker import WORKER_STEPS, spawn_worker
@@ -2022,10 +2042,33 @@ def pipeline_rerun_cmd(
 
     engine = _validate_sn_engine(sn_engine) if sn_engine is not None else None
 
-    with database.session_scope() as session:
-        result = requeue_series(
-            session, names, steps=steps, overrides=overrides, sn_engine=engine
+    prod_overrides: dict[str, str] = {}
+    if sn_uniform_threshold is not None:
+        prod_overrides["sn_uniform_threshold"] = sn_uniform_threshold
+    if sn_iscale is not None:
+        prod_overrides["sn_iscale"] = str(sn_iscale)
+    if sn_stagelo is not None:
+        prod_overrides["sn_stagelo"] = str(sn_stagelo)
+    if prod_overrides and engine not in (None, "prod"):
+        console.print(
+            f"[red]--sn-* threshold options apply to the prod engine only[/red] "
+            f"(got --sn-engine {engine})"
         )
+        raise typer.Exit(1)
+
+    with database.session_scope() as session:
+        try:
+            result = requeue_series(
+                session,
+                names,
+                steps=steps,
+                overrides=overrides,
+                sn_engine=engine,
+                prod_overrides=prod_overrides,
+            )
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1) from None
 
     for miss in result.missing:
         console.print(f"  [yellow]?[/yellow] {miss} (no such series — skipped)")

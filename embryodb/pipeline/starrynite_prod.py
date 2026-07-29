@@ -76,6 +76,58 @@ def dev_repo() -> Path | None:
     return Path(m.group(1)) if m else None
 
 
+#: Per-run override keys accepted on a ``run_starrynite`` step's ``params``,
+#: alongside ``sn_engine``. These are the only prod knobs that vary by movie.
+PROD_OVERRIDE_KEYS = ("sn_uniform_threshold", "sn_iscale", "sn_stagelo")
+
+#: Values of ``sn_uniform_threshold`` meaning "keep the paramfile's own per-band
+#: vector" — the right choice for a movie whose bands were tuned by hand.
+_NATIVE_TOKENS = frozenset({"", "none", "null", "native", "keep", "paramfile"})
+
+
+def resolve_options(params: dict | None = None) -> dict:
+    """Resolve the three per-movie prod knobs, `params` overriding `settings`.
+
+    Detection thresholds are not autotuned, and the corpus spans roughly a
+    factor of four in the DoG response that ``intensitythreshold`` actually
+    gates, so a single global value cannot serve a mixed-brightness batch.
+    These overrides let one queue carry per-series values.
+
+    A malformed value raises rather than falling back to the default: a run that
+    quietly ignored the threshold you set is a lineage you cannot explain later.
+    """
+    opts = {
+        "uniform_threshold": settings.starrynite_prod_uniform_threshold,
+        "iscale": float(settings.starrynite_prod_iscale),
+        "stagelo": int(settings.starrynite_prod_stagelo),
+    }
+    if not params:
+        return opts
+
+    if "sn_uniform_threshold" in params:
+        raw = params["sn_uniform_threshold"]
+        if raw is None or str(raw).strip().lower() in _NATIVE_TOKENS:
+            opts["uniform_threshold"] = None
+        else:
+            try:
+                opts["uniform_threshold"] = float(raw)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"sn_uniform_threshold={raw!r} is not a number; pass a value "
+                    f"like 0.0025, or one of {sorted(_NATIVE_TOKENS - {''})} to "
+                    f"keep the paramfile's own per-band vector"
+                ) from None
+    for key, cast in (("sn_iscale", float), ("sn_stagelo", int)):
+        if key in params and params[key] is not None:
+            try:
+                opts[key[3:]] = cast(params[key])
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"{key}={params[key]!r} is not a {cast.__name__}"
+                ) from None
+    return opts
+
+
 def build_prod_paramfile(
     matlab_params_path: Path | str,
     out_path: Path | str,
@@ -125,20 +177,23 @@ def build_matlab_command(
     image_first_plane: Path | str,
     out_dir: Path | str,
     workdir: Path | str,
+    *,
+    options: dict | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     """Build the headless MATLAB command + env that runs the production driver.
 
     `out_dir` receives the ``nuclei/`` lineage; `workdir` holds the driver's
     intermediates (``eseq_prod.mat``, the rich feature table, the keep mask).
-    Both are scratch.
+    Both are scratch. `options` comes from :func:`resolve_options`.
     """
+    opts = options or resolve_options()
     matlab_expr = (
         f"addpath('{Path(settings.starrynite_prod_dir)}'); "
         f"sn_production_driver('{paramfile}', '{image_first_plane}', '{out_dir}', "
         f"'workdir', '{workdir}', "
         f"'assetdir', '{assets_dir()}', "
-        f"'stagelo', {int(settings.starrynite_prod_stagelo)}, "
-        f"'iscale', {float(settings.starrynite_prod_iscale)!r}, "
+        f"'stagelo', {int(opts['stagelo'])}, "
+        f"'iscale', {float(opts['iscale'])!r}, "
         f"'pyexe', '{settings.effort_python}')"
     )
     cmd = [
@@ -182,7 +237,7 @@ def _git(repo: Path, *args: str) -> str | None:
     return proc.stdout.strip() if proc.returncode == 0 else None
 
 
-def capture_provenance() -> dict:
+def capture_provenance(options: dict | None = None) -> dict:
     """Snapshot what this run is about to execute.
 
     The dev tree is intentionally mutable, so this is the only durable record of
@@ -191,15 +246,20 @@ def capture_provenance() -> dict:
     identify the code — that combination bit us once already, when a tracker
     file changed overnight between two halves of an A/B.
 
+    The recorded knobs are the EFFECTIVE ones (`options` from
+    :func:`resolve_options`), not the settings defaults — a per-run override that
+    went unrecorded would make two lineages look identically configured.
+
     Never raises; an unavailable field is recorded as such.
     """
+    opts = options or resolve_options()
     prov: dict = {
         "driver": str(driver_path()),
         "driver_sha256": _digest(driver_path()),
         "assets": {},
-        "iscale": float(settings.starrynite_prod_iscale),
-        "stagelo": int(settings.starrynite_prod_stagelo),
-        "uniform_threshold": settings.starrynite_prod_uniform_threshold,
+        "iscale": float(opts["iscale"]),
+        "stagelo": int(opts["stagelo"]),
+        "uniform_threshold": opts["uniform_threshold"],
     }
     adir = assets_dir()
     for name in ("nucleus_filter.pkl", "tracking_model.mat", "tracking_template.mat"):
@@ -220,6 +280,39 @@ def capture_provenance() -> dict:
     if status is not None:
         prov["dev_dirty"] = [ln.strip() for ln in status.splitlines() if ln.strip()]
     return prov
+
+
+def diagnose_prod_failure(log_path: Path | str, options: dict | None = None) -> str:
+    """Turn a known-opaque driver crash into an actionable message.
+
+    ``intensitythreshold`` gates the Difference-of-Gaussians response computed in
+    ``processVolume``, not raw pixel intensity. That routine derives ``zlevel``
+    only inside ``if max(X(:,:,p)) > intensitythreshold*1.5``, with no else
+    branch, so on a movie too dim for the threshold the variable is never
+    assigned and MATLAB fails ~15 lines later on an unrelated-looking line.
+    Diagnosed on 20260727_JIM800_..._L2 (DoG max 0.00454 vs 0.006 required).
+    """
+    tail = ""
+    try:
+        tail = Path(log_path).read_text(errors="replace")[-8000:]
+    except OSError:
+        pass
+    if "variable 'zlevel'" in tail or 'variable "zlevel"' in tail:
+        thr = (options or {}).get("uniform_threshold")
+        current = (
+            f"the flattened threshold {thr:g}" if isinstance(thr, (int, float))
+            else "this movie's own per-band thresholds"
+        )
+        return (
+            "production StarryNite: detection found no image plane bright enough "
+            f"to locate the embryo bottom -- {current} is too high for this movie "
+            "(intensitythreshold gates the Difference-of-Gaussians response, not "
+            "raw intensity, so a dim or 8-bit movie can fail here while looking "
+            "fine by eye). Lower it via the rerun dialog's 'Uniform threshold' "
+            "field (sn_uniform_threshold), e.g. 0.0025, or select 'keep "
+            "paramfile values' if the series was already hand-tuned."
+        )
+    return "production StarryNite run failed; see log tail."
 
 
 def find_nuclei_dir(out_dir: Path | str) -> Path | None:
@@ -312,9 +405,12 @@ __all__ = [
     "assets_dir",
     "driver_path",
     "dev_repo",
+    "PROD_OVERRIDE_KEYS",
+    "resolve_options",
     "build_prod_paramfile",
     "build_matlab_command",
     "capture_provenance",
+    "diagnose_prod_failure",
     "find_nuclei_dir",
     "build_lineage_zip",
     "land_lineage",

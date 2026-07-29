@@ -416,3 +416,43 @@ def test_requeue_sets_and_preserves_sn_engine(db_session, tmp_path):
     run = db_session.query(PipelineStepRun).filter_by(
         series_id=s.id, step="run_starrynite").one()
     assert run.params.get("sn_engine") == "new"
+
+
+def test_requeue_threads_prod_overrides(db_session, tmp_path):
+    from embryodb.pipeline.rerun import requeue_series
+
+    s = _series(db_session, "RQP_L1", tmp_path / "img")
+    db_session.add(PipelineStepRun(
+        series_id=s.id, step="run_starrynite", status=RunStatus.COMPLETE,
+    ))
+    db_session.flush()
+
+    def sn_run():
+        return db_session.query(PipelineStepRun).filter_by(
+            series_id=s.id, step="run_starrynite").one()
+
+    requeue_series(
+        db_session, ["RQP_L1"], steps=["run_starrynite"], sn_engine="prod",
+        prod_overrides={"sn_uniform_threshold": "0.0025"},
+        refresh_resolution=False,
+    )
+    assert sn_run().params == {"sn_engine": "prod", "sn_uniform_threshold": "0.0025"}
+
+    # Re-running with the engine set but no threshold means "global default" --
+    # inheriting 0.0025 would run at a value the caller did not ask for.
+    requeue_series(db_session, ["RQP_L1"], steps=["run_starrynite"],
+                   sn_engine="prod", refresh_resolution=False)
+    assert sn_run().params == {"sn_engine": "prod"}
+
+
+def test_requeue_rejects_bad_prod_override(db_session, tmp_path):
+    from embryodb.pipeline.rerun import requeue_series
+
+    _series(db_session, "RQP_L2", tmp_path / "img")
+    db_session.flush()
+    with pytest.raises(ValueError, match="sn_uniform_threshold"):
+        requeue_series(
+            db_session, ["RQP_L2"], steps=["run_starrynite"], sn_engine="prod",
+            prod_overrides={"sn_uniform_threshold": "dim"},
+            refresh_resolution=False,
+        )

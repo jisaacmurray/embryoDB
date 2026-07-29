@@ -31,6 +31,7 @@ from ..pipeline.rerun import (
     refresh_matlab_params,
     reset_step as _reset_one_step,
 )
+from ..pipeline.starrynite_prod import PROD_OVERRIDE_KEYS
 from ..pipeline.worker import WORKER_STEPS, spawn_worker
 
 _STEP_LABEL = {
@@ -176,6 +177,54 @@ class RerunPipelineDialog(QtWidgets.QDialog):
         engine_row.addWidget(self._engine_combo, 1)
         params_vl.addLayout(engine_row)
 
+        # Production-only knobs. These do NOT live in matlabParams: the prod
+        # driver takes iscale/stagelo as call arguments and rewrites the
+        # threshold vector itself, so editing the table row below would be
+        # silently discarded. Shown only when the prod engine is selected.
+        self._prod_box = QtWidgets.QGroupBox("Production engine options")
+        prod_form = QtWidgets.QFormLayout(self._prod_box)
+        self._prod_threshold = QtWidgets.QComboBox()
+        self._prod_threshold.setEditable(True)
+        for label, data in (
+            ("Global default", ""),
+            ("Keep paramfile per-band values", "none"),
+            ("0.003", "0.003"),
+            ("0.0025", "0.0025"),
+            ("0.002", "0.002"),
+        ):
+            self._prod_threshold.addItem(label, data)
+        self._prod_threshold.setToolTip(
+            "Flatten parameters.intensitythreshold to one value across all "
+            "staging bands.\n"
+            "This threshold gates the Difference-of-Gaussians response, not raw "
+            "pixel intensity, so a dim or 8-bit movie can need a lower value "
+            "than it looks like it should.\n"
+            "Too HIGH is unrecoverable — the nucleus filter only removes "
+            "candidates, it cannot recover a nucleus detection never proposed, "
+            "and if no plane clears the threshold the driver fails outright.\n"
+            "Choose 'Keep paramfile per-band values' for a series whose bands "
+            "were already hand-tuned, or type any number."
+        )
+        prod_form.addRow("Uniform threshold:", self._prod_threshold)
+        self._prod_iscale = QtWidgets.QLineEdit()
+        self._prod_iscale.setPlaceholderText("blank = global default")
+        self._prod_iscale.setToolTip(
+            "Scales the threshold on staging bands stagelo..6 only.\n"
+            "Leave blank unless you know why: the flattened threshold above "
+            "already supplies the permissive detection, so the validated "
+            "configuration passes iscale=1.0 to make this a no-op."
+        )
+        prod_form.addRow("iscale:", self._prod_iscale)
+        self._prod_stagelo = QtWidgets.QLineEdit()
+        self._prod_stagelo.setPlaceholderText("blank = global default")
+        self._prod_stagelo.setToolTip(
+            "First staging band that iscale applies to (default 3, i.e. above "
+            "~200 cells). Irrelevant when iscale is 1.0."
+        )
+        prod_form.addRow("stagelo:", self._prod_stagelo)
+        params_vl.addWidget(self._prod_box)
+        self._engine_combo.currentIndexChanged.connect(self._on_engine_changed)
+
         # Protocol picker: select an existing Protocol and bulk-populate the
         # override column from its defaults. Useful when retuning across
         # multiple acquisitions or comparing brightness presets.
@@ -242,6 +291,7 @@ class RerunPipelineDialog(QtWidgets.QDialog):
         self._params_box = params_box  # for enable/disable based on SN checkbox
         self._step_checks["run_starrynite"].toggled.connect(self._params_box.setEnabled)
         self._params_box.setEnabled(self._step_checks["run_starrynite"].isChecked())
+        self._on_engine_changed()
 
         if first and first["params_path"] and not Path(first["params_path"]).exists():
             warn = QtWidgets.QLabel(
@@ -302,6 +352,47 @@ class RerunPipelineDialog(QtWidgets.QDialog):
             if item is not None:
                 item.setText(str(val))
 
+    _THRESHOLD_KEY = "parameters.intensitythreshold"
+
+    def _on_engine_changed(self) -> None:
+        """Show the prod knobs, and stop the table offering a threshold edit that
+        the prod engine would throw away."""
+        is_prod = self._engine_combo.currentData() == "prod"
+        self._prod_box.setVisible(is_prod)
+        if self._THRESHOLD_KEY not in TUNABLE_KEYS:
+            return
+        row = TUNABLE_KEYS.index(self._THRESHOLD_KEY)
+        item = self._params_table.item(row, 2)
+        if item is None:
+            return
+        if is_prod:
+            item.setText("")
+            item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+            item.setToolTip(
+                "The production engine rewrites this vector itself — use "
+                "'Uniform threshold' above instead."
+            )
+        else:
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsEditable)
+            item.setToolTip("")
+
+    def _prod_overrides(self) -> dict[str, str]:
+        """The three per-movie prod knobs, omitting any left at the default."""
+        result: dict[str, str] = {}
+        idx = self._prod_threshold.findText(self._prod_threshold.currentText())
+        data = self._prod_threshold.itemData(idx) if idx >= 0 else None
+        thr = data if data is not None else self._prod_threshold.currentText().strip()
+        if thr != "":
+            result["sn_uniform_threshold"] = thr
+        for key, widget in (
+            ("sn_iscale", self._prod_iscale),
+            ("sn_stagelo", self._prod_stagelo),
+        ):
+            val = widget.text().strip()
+            if val:
+                result[key] = val
+        return result
+
     def _overrides(self) -> dict[str, str]:
         result: dict[str, str] = {}
         for row_idx, key in enumerate(TUNABLE_KEYS):
@@ -325,6 +416,20 @@ class RerunPipelineDialog(QtWidgets.QDialog):
         sn_checked = "run_starrynite" in steps_to_run
         overrides = self._overrides() if sn_checked else {}
         sn_engine = self._engine_combo.currentData() if sn_checked else None
+        prod_overrides = (
+            self._prod_overrides() if sn_checked and sn_engine == "prod" else {}
+        )
+        # Validate here rather than in the worker: a typo caught now costs a
+        # dialog, caught later it costs a queued run that fails in MATLAB.
+        if prod_overrides:
+            from ..pipeline import starrynite_prod as snp
+            try:
+                snp.resolve_options(prod_overrides)
+            except ValueError as exc:
+                QtWidgets.QMessageBox.warning(
+                    self, "Invalid production option", str(exc)
+                )
+                return
         errors: list[str] = []
 
         with self._session_cm() as s:
@@ -348,12 +453,24 @@ class RerunPipelineDialog(QtWidgets.QDialog):
                         except Exception as exc:
                             errors.append(f"{sd['name']}: {exc}")
                 for step in steps_to_run:
-                    step_params = (
-                        {"sn_engine": sn_engine}
-                        if step == "run_starrynite" and sn_engine is not None
-                        else None
-                    )
-                    _reset_one_step(s, sd["id"], step, params=step_params)
+                    step_params: dict | None = None
+                    drop: list[str] = []
+                    if step == "run_starrynite":
+                        step_params = dict(prod_overrides)
+                        if sn_engine is not None:
+                            step_params["sn_engine"] = sn_engine
+                        step_params = step_params or None
+                        # Step params are merged on reset, so a field left at
+                        # "default" must actively clear the previous run's value.
+                        # Only when an engine was actually chosen: "keep current"
+                        # promises to leave the stored configuration alone.
+                        if sn_engine is not None:
+                            drop = [
+                                k for k in PROD_OVERRIDE_KEYS
+                                if k not in prod_overrides
+                            ]
+                    _reset_one_step(s, sd["id"], step, params=step_params,
+                                    drop_params=drop)
             s.flush()
 
         if errors:

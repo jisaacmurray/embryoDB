@@ -403,17 +403,21 @@ def step_run_starrynite(
     # Record log_path before the subprocess starts so the GUI can open it, and
     # read the per-run engine choice (params.sn_engine; default "old").
     engine = "old"
+    run_params: dict = {}
     with session_scope() as s:
         run = s.get(PipelineStepRun, run_id)
         if run is not None:
             run.log_path = str(log_path)
-            engine = (run.params or {}).get("sn_engine", "old")
+            run_params = dict(run.params or {})
+            engine = run_params.get("sn_engine", "old")
 
     if engine == "new":
         _run_starrynite_new(series_id, series_name, image_loc, run_id, log_path)
         return
     if engine == "prod":
-        _run_starrynite_prod(series_id, series_name, image_loc, run_id, log_path)
+        _run_starrynite_prod(
+            series_id, series_name, image_loc, run_id, log_path, run_params
+        )
         return
 
     # The Perl script writes the lineage zips itself, so unlike the new-SN path
@@ -548,6 +552,7 @@ def _run_starrynite_prod(
     image_loc: Path,
     run_id: int,
     log_path: Path,
+    run_params: dict | None = None,
 ) -> None:
     """Run the PRODUCTION StarryNite (``sn_production_driver.m``) for one series.
 
@@ -576,7 +581,13 @@ def _run_starrynite_prod(
         )
         return
 
-    provenance = snp.capture_provenance()
+    try:
+        options = snp.resolve_options(run_params)
+    except ValueError as exc:
+        _finish_run(run_id, log_path, 1, diagnostic=str(exc))
+        return
+
+    provenance = snp.capture_provenance(options)
     if provenance.get("dev_dirty"):
         _append_log(
             log_path,
@@ -595,7 +606,9 @@ def _run_starrynite_prod(
     try:
         try:
             paramfile = snp.build_prod_paramfile(
-                params_path, scratch / "matlabParams"
+                params_path,
+                scratch / "matlabParams",
+                uniform_threshold=options["uniform_threshold"],
             )
         except ValueError as exc:
             _finish_run(run_id, log_path, 1, diagnostic=str(exc))
@@ -603,7 +616,7 @@ def _run_starrynite_prod(
 
         image_first = image_loc / "tif" / f"{series_name}-t001-p01.tif"
         cmd, env = snp.build_matlab_command(
-            paramfile, image_first, scratch_out, scratch
+            paramfile, image_first, scratch_out, scratch, options=options
         )
         returncode = _run_with_heartbeat(
             cmd, log_path, run_id,
@@ -613,7 +626,7 @@ def _run_starrynite_prod(
         if returncode != 0:
             _finish_run(
                 run_id, log_path, returncode,
-                diagnostic="production StarryNite run failed; see log tail.",
+                diagnostic=snp.diagnose_prod_failure(log_path, options),
                 output_summary={"sn_engine": "prod", "provenance": provenance},
             )
             return

@@ -16,6 +16,7 @@ A "re-run" is two things:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,13 +36,25 @@ _STEP_ORDER = {s: i for i, s in enumerate(WORKER_STEPS)}
 _NEVER_DEFAULT_STEPS = frozenset({"stage_images"})
 
 
-def reset_step(session, series_id: int, step: str, *, params: dict | None = None) -> None:
+def reset_step(
+    session,
+    series_id: int,
+    step: str,
+    *,
+    params: dict | None = None,
+    drop_params: Sequence[str] = (),
+) -> None:
     """Set one worker step back to PENDING for a series (create row if absent).
 
     Clears result fields (log/error/timestamps/output_summary) but PRESERVES
     the input ``params`` unless `params` is given — so a series keeps its
     ``sn_engine`` choice across a plain rerun. Pass `params` (merged, not
     replaced) to change it, e.g. ``{"sn_engine": "new"}``.
+
+    ``drop_params`` removes keys before that merge. Because params are merged, a
+    knob the caller deliberately left blank would otherwise be inherited from
+    the previous run — so a form field showing "default" would run at last
+    time's value.
     """
     run = (
         session.query(PipelineStepRun)
@@ -58,8 +71,9 @@ def reset_step(session, series_id: int, step: str, *, params: dict | None = None
     run.error_excerpt = None
     run.log_path = None
     run.output_summary = {}
-    if params:
-        run.params = {**(run.params or {}), **params}
+    kept = {k: v for k, v in (run.params or {}).items() if k not in set(drop_params)}
+    if params or kept != (run.params or {}):
+        run.params = {**kept, **(params or {})}
 
 
 def earliest_incomplete_step(runs_by_step: dict[str, RunStatus]) -> str | None:
@@ -132,6 +146,7 @@ def requeue_series(
     overrides: dict[str, str] | None = None,
     refresh_resolution: bool = True,
     sn_engine: str | None = None,
+    prod_overrides: dict[str, str] | None = None,
 ) -> RequeueResult:
     """Reset worker steps to PENDING for each named series.
 
@@ -143,9 +158,14 @@ def requeue_series(
         refresh_resolution: when ``run_starrynite`` is reset, rewrite
             matlabParams to refresh xyres/zres from DB microscopy metadata
             (plus apply ``overrides``). Mirrors the GUI dialog.
-        sn_engine: "old" | "new" — which StarryNite to use when re-running the
-            ``run_starrynite`` step. ``None`` leaves the existing choice intact
-            (defaults to "old" if never set). Only applied to that step.
+        sn_engine: "old" | "new" | "prod" — which StarryNite to use when
+            re-running the ``run_starrynite`` step. ``None`` leaves the existing
+            choice intact (defaults to "old" if never set). Only applied to that
+            step.
+        prod_overrides: per-run production-engine knobs
+            (:data:`~embryodb.pipeline.starrynite_prod.PROD_OVERRIDE_KEYS`).
+            These are call arguments to the prod driver, not matlabParams
+            entries, so they cannot ride ``overrides``.
 
     Does not spawn the worker — callers decide whether to.
     """
@@ -153,6 +173,18 @@ def requeue_series(
 
     result = RequeueResult()
     overrides = overrides or {}
+    prod_overrides = prod_overrides or {}
+    from .starrynite_prod import PROD_OVERRIDE_KEYS, resolve_options
+
+    if prod_overrides:
+        resolve_options(prod_overrides)  # fail here, not in MATLAB an hour later
+    # An explicit engine choice means the caller configured the engine, so knobs
+    # they left out are defaults, not leftovers from the previous run.
+    stale_prod_keys = (
+        [k for k in PROD_OVERRIDE_KEYS if k not in prod_overrides]
+        if sn_engine is not None
+        else []
+    )
 
     rows = []
     for name in series_names:
@@ -180,12 +212,15 @@ def requeue_series(
             except Exception as exc:  # surface, don't abort the whole batch
                 result.errors.append(f"{row.series_name}: {exc}")
         for step in steps:
-            step_params = (
-                {"sn_engine": sn_engine}
-                if step == "run_starrynite" and sn_engine is not None
-                else None
-            )
-            reset_step(session, row.id, step, params=step_params)
+            step_params: dict | None = None
+            drop: list[str] = []
+            if step == "run_starrynite":
+                step_params = dict(prod_overrides)
+                if sn_engine is not None:
+                    step_params["sn_engine"] = sn_engine
+                step_params = step_params or None
+                drop = stale_prod_keys
+            reset_step(session, row.id, step, params=step_params, drop_params=drop)
         result.matched.append(row.series_name)
 
     return result

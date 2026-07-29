@@ -235,6 +235,108 @@ def test_prod_is_an_accepted_cli_engine():
     assert _validate_sn_engine("prod") == "prod"
 
 
+def test_resolve_options_defaults_to_settings(monkeypatch):
+    monkeypatch.setattr(settings, "starrynite_prod_uniform_threshold", 0.004)
+    monkeypatch.setattr(settings, "starrynite_prod_iscale", 1.0)
+    monkeypatch.setattr(settings, "starrynite_prod_stagelo", 3)
+    assert snp.resolve_options(None) == {
+        "uniform_threshold": 0.004, "iscale": 1.0, "stagelo": 3
+    }
+    assert snp.resolve_options({"sn_engine": "prod"})["uniform_threshold"] == 0.004
+
+
+def test_resolve_options_applies_per_run_overrides(monkeypatch):
+    monkeypatch.setattr(settings, "starrynite_prod_uniform_threshold", 0.004)
+    monkeypatch.setattr(settings, "starrynite_prod_iscale", 1.0)
+    monkeypatch.setattr(settings, "starrynite_prod_stagelo", 3)
+    opts = snp.resolve_options(
+        {"sn_uniform_threshold": "0.0025", "sn_iscale": "0.5", "sn_stagelo": 2}
+    )
+    assert opts == {"uniform_threshold": 0.0025, "iscale": 0.5, "stagelo": 2}
+
+
+@pytest.mark.parametrize("token", ["none", "None", "native", "keep", "paramfile", ""])
+def test_resolve_options_native_tokens_keep_paramfile_bands(token, monkeypatch):
+    """A hand-tuned per-band vector must survive: flattening it would undo the
+    tuning that makes a dim movie work."""
+    monkeypatch.setattr(settings, "starrynite_prod_uniform_threshold", 0.004)
+    assert snp.resolve_options(
+        {"sn_uniform_threshold": token}
+    )["uniform_threshold"] is None
+    assert snp.resolve_options(
+        {"sn_uniform_threshold": None}
+    )["uniform_threshold"] is None
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"sn_uniform_threshold": "very dim"},
+        {"sn_iscale": "half"},
+        {"sn_stagelo": "2.5x"},
+    ],
+)
+def test_resolve_options_rejects_garbage(params):
+    """Silently falling back to the default would produce a lineage whose
+    recorded threshold is not the one you asked for."""
+    with pytest.raises(ValueError):
+        snp.resolve_options(params)
+
+
+def test_matlab_command_honours_overridden_options(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "starrynite_prod_dir", Path("/opt/sn/release_prod"))
+    monkeypatch.setattr(settings, "starrynite_prod_assets", None)
+    monkeypatch.setattr(settings, "starrynite_prod_iscale", 1.0)
+    monkeypatch.setattr(settings, "starrynite_prod_stagelo", 3)
+    monkeypatch.setattr(settings, "matlab_command", Path("/usr/bin/matlab"))
+
+    cmd, _ = snp.build_matlab_command(
+        "/scratch/matlabParams", "/img/t001-p01.tif", "/scratch/out", "/scratch",
+        options={"uniform_threshold": None, "iscale": 0.5, "stagelo": 2},
+    )
+    expr = cmd[-1]
+    assert "'stagelo', 2" in expr
+    assert "'iscale', 0.5" in expr
+
+
+def test_capture_provenance_records_effective_options(tmp_path, monkeypatch):
+    """Two runs that differed only in threshold must not look identical in the
+    provenance record."""
+    monkeypatch.setattr(settings, "starrynite_prod_dir", tmp_path / "nope")
+    monkeypatch.setattr(settings, "starrynite_prod_assets", None)
+    monkeypatch.setattr(settings, "starrynite_prod_uniform_threshold", 0.004)
+    prov = snp.capture_provenance(
+        {"uniform_threshold": 0.0025, "iscale": 0.5, "stagelo": 2}
+    )
+    assert prov["uniform_threshold"] == 0.0025
+    assert prov["iscale"] == 0.5
+    assert prov["stagelo"] == 2
+
+
+def test_diagnose_prod_failure_explains_the_zlevel_crash(tmp_path):
+    log = tmp_path / "run.log"
+    log.write_text(
+        "Detect stage...\n"
+        "Unrecognized function or variable 'zlevel'.\n"
+        "Error in processVolume (line 113)\n"
+    )
+    msg = snp.diagnose_prod_failure(log, {"uniform_threshold": 0.004})
+    assert "0.004" in msg
+    assert "too high for this movie" in msg
+    # Points at the knob that actually fixes it.
+    assert "sn_uniform_threshold" in msg
+
+    native = snp.diagnose_prod_failure(log, {"uniform_threshold": None})
+    assert "per-band" in native
+
+
+def test_diagnose_prod_failure_is_generic_otherwise(tmp_path):
+    log = tmp_path / "run.log"
+    log.write_text("Error using imread\nsomething else entirely\n")
+    assert "see log tail" in snp.diagnose_prod_failure(log)
+    assert "see log tail" in snp.diagnose_prod_failure(tmp_path / "missing.log")
+
+
 def test_real_driver_still_matches_our_expectations():
     """The driver lives outside this repo and is edited by the StarryNite work.
     If its signature drifts, the pipeline would issue a call it no longer

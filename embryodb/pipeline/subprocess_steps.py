@@ -44,6 +44,12 @@ HEARTBEAT_INTERVAL = 30  # seconds between DB heartbeat writes during subprocess
 # marked FAILED with a descriptive excerpt.
 WATCHDOG_IDLE_SECONDS = 600  # ~10 min of no CPU + no log growth => wedged
 
+# Returned in place of a real exit status when the watchdog kills a wedged
+# process. Deliberately NOT -1: Popen reports signal deaths as -N, so -1 would
+# be indistinguishable from SIGHUP and _exit_status_note could not tell the user
+# whether we killed the job or something else did.
+WATCHDOG_KILLED = -101
+
 # Abort-specific strings — deliberately NOT generic ("error") so normal tool
 # chatter doesn't false-positive.
 _CRASH_SIGNATURES = (
@@ -288,12 +294,41 @@ def _run_with_heartbeat(
             pass
         _kill_process_group(proc)
         chmod_if_possible(log_path, 0o664)
-        return -1  # sentinel => _finish_run marks FAILED
+        return WATCHDOG_KILLED  # => _finish_run marks FAILED
 
     # Apply project permissions to the log file.
     chmod_if_possible(log_path, 0o664)
 
     return proc.returncode
+
+
+def _exit_status_note(returncode: int) -> str:
+    """Describe a nonzero exit status in the error excerpt.
+
+    Worth the words because a signal death and a tool error look identical in the
+    log: MATLAB killed from outside writes no error and no crash dump, so the log
+    simply stops. Without the status the user is left with a truncated log and no
+    way to tell "the tool failed" from "something killed the tool".
+    """
+    if returncode == WATCHDOG_KILLED:
+        return (
+            "killed by the embryoDB watchdog (its reason is at the end of the log)"
+        )
+    if returncode < 0:
+        num = -returncode
+        try:
+            name = signal.Signals(num).name
+        except ValueError:
+            name = "unknown signal"
+        note = f"killed by signal {num} ({name}) — terminated from outside, not a tool error"
+        if num == signal.SIGKILL:
+            note += (
+                ". SIGKILL leaves no message in the log; on a host with no swap "
+                "the usual cause is the kernel OOM killer, so check free memory "
+                "and how many MATLAB/analysis jobs were running concurrently"
+            )
+        return note
+    return f"exit code {returncode}"
 
 
 def _finish_run(
@@ -324,9 +359,13 @@ def _finish_run(
         else:
             run.status = RunStatus.FAILED
             excerpt = _tail_log(log_path)
+            header = f"exit: {_exit_status_note(returncode)}"
             if diagnostic:
-                excerpt = f"{diagnostic}\n\n--- log tail ---\n{excerpt}"
-            run.error_excerpt = excerpt
+                header = f"{diagnostic}\n\n{header}"
+            run.error_excerpt = f"{header}\n\n--- log tail ---\n{excerpt}"
+            run.output_summary = {
+                **(run.output_summary or {}), "returncode": returncode
+            }
 
 
 def _normalize_dats_perms(series_name: str) -> None:

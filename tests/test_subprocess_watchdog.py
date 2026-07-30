@@ -55,7 +55,7 @@ def test_hard_cap_kills_busy_but_stuck_process(tmp_path, run_id, fast_heartbeat)
         log, run_id, max_seconds=1,
     )
     elapsed = time.monotonic() - start
-    assert rc == -1
+    assert rc == ss.WATCHDOG_KILLED
     assert elapsed < 5  # killed promptly near the 1s cap, not left to run
     assert "hard wall-clock cap" in log.read_text(errors="replace")
 
@@ -69,7 +69,7 @@ def test_pure_virtual_signature_fast_fails(tmp_path, run_id, fast_heartbeat):
         ["bash", "-c", "echo 'pure virtual method called'; sleep 30"],
         log, run_id, max_seconds=60,
     )
-    assert rc == -1
+    assert rc == ss.WATCHDOG_KILLED
     text = log.read_text(errors="replace")
     assert "crash signature" in text
     assert "pure virtual method called" in text
@@ -83,3 +83,35 @@ def test_clean_exit_returns_zero(tmp_path, run_id, fast_heartbeat):
     )
     assert rc == 0
     assert "watchdog" not in log.read_text(errors="replace")
+
+
+def test_sigkill_is_reported_as_an_external_kill():
+    """A SIGKILLed MATLAB writes no error and no crash dump -- the log just
+    stops. Without the exit status there is nothing to distinguish that from a
+    tool failure, which is how one OOM kill went unexplained."""
+    import signal as _signal
+
+    note = ss._exit_status_note(-_signal.SIGKILL)
+    assert "signal 9" in note and "SIGKILL" in note
+    assert "OOM" in note
+    assert "not a tool error" in note
+
+
+def test_watchdog_kill_is_distinguishable_from_a_signal():
+    assert "watchdog" in ss._exit_status_note(ss.WATCHDOG_KILLED)
+    # -1 must read as SIGHUP, which is why the sentinel is not -1.
+    assert "SIGHUP" in ss._exit_status_note(-1)
+    assert ss._exit_status_note(3) == "exit code 3"
+
+
+def test_failed_run_records_returncode(db_session, tmp_path, run_id):
+    from embryodb.models import PipelineStepRun
+
+    log = tmp_path / "dead.log"
+    log.write_text("processed 184\n")
+    ss._finish_run(run_id, log, -9)
+    row = db_session.get(PipelineStepRun, run_id)
+    db_session.refresh(row)
+    assert row.output_summary["returncode"] == -9
+    assert "signal 9" in row.error_excerpt
+    assert "processed 184" in row.error_excerpt

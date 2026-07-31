@@ -2602,6 +2602,7 @@ def render_trees_batch_cmd(
     linewidth: Annotated[int, typer.Option("--linewidth")] = 3,
     min_expr: Annotated[int | None, typer.Option("--min-expr")] = None,
     max_expr: Annotated[int | None, typer.Option("--max-expr")] = None,
+    output_dir: Annotated[Path | None, typer.Option("--output-dir")] = None,
 ) -> None:
     """Render trees for a series list via LIVEtools (called by print-trees).
 
@@ -2612,6 +2613,7 @@ def render_trees_batch_cmd(
     import os
     import subprocess
 
+    from . import fsutil
     from .database import session_scope
     from .queries.series import get_by_name
 
@@ -2620,6 +2622,9 @@ def render_trees_batch_cmd(
         for line in list_file.read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.startswith("#")
     ]
+
+    out_dir = Path(output_dir) if output_dir is not None else settings.trees_dir
+    fsutil.ensure_dir(out_dir)
 
     jobs, skipped = [], []
     with session_scope() as s:
@@ -2632,7 +2637,7 @@ def render_trees_batch_cmd(
             if not csv.exists():
                 skipped.append((name, f"missing {csv.name}"))
                 continue
-            jobs.append((name, csv, settings.trees_dir / f"{name}.png"))
+            jobs.append((name, csv, out_dir / f"{name}.png"))
 
     for name, why in skipped:
         console.print(f"[yellow]skip {name}: {why}[/yellow]")
@@ -2664,7 +2669,7 @@ def render_trees_batch_cmd(
 
     console.print(
         f"render-trees-batch: {len(jobs)} series, {cd_prefix}, scheme={scheme}, "
-        f"LIVEtools {settings.livetools_commit[:7]}"
+        f"LIVEtools {settings.livetools_commit[:7]} -> {out_dir}"
     )
     rc = subprocess.call(cmd, env={**os.environ, "R_LIBS": str(settings.r_libs)})
     raise typer.Exit(rc)
@@ -2715,9 +2720,16 @@ def print_trees_cmd(
             help="'livetools' (R/ggtree, default) or 'java' (legacy Tree1). Java cannot read ACD files.",
         ),
     ] = None,
+    output_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--output-dir",
+            help="Where the PNGs land (default: the shared trees dir). LIVEtools only — Tree1 hardcodes its path.",
+        ),
+    ] = None,
 ) -> None:
     """Render lineage-tree PNGs (CLI twin of the GUI "Print trees…").
-    Detached job; PNGs land in /gpfs/fs0/l/murr/trees/.
+    Detached job; PNGs land in /gpfs/fs0/l/murr/trees/ unless --output-dir says otherwise.
     """
     from .external import LaunchError
     from .external_tools import run_print_trees
@@ -2734,6 +2746,7 @@ def print_trees_cmd(
             heap_mb=heap_mb,
             on_screen=on_screen,
             renderer=renderer,
+            output_dir=output_dir,
         )
     except LaunchError as exc:
         console.print(f"[red]{exc}[/red]")

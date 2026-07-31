@@ -289,6 +289,7 @@ def build_livetools_trees_command(
     color_scheme: str = "rainbow",
     linewidth: int = 3,
     cd_prefix: str = "CD",
+    output_dir: Path | str | None = None,
 ) -> str:
     """Render the LIVEtools (R/ggtree) tree shell.
 
@@ -306,6 +307,8 @@ def build_livetools_trees_command(
         args.append(f"--min-expr {int(min_expr)}")
     if max_expr is not None:
         args.append(f"--max-expr {int(max_expr)}")
+    if output_dir is not None:
+        args.append(f"--output-dir {shell_quote(str(output_dir))}")
     return (
         f"echo '== PrintTrees/LIVEtools ({len(series_names)} series, {cd_prefix}) ==' && "
         f"nice {shell_quote(sys.executable)} -m embryodb.cli render-trees-batch "
@@ -325,6 +328,7 @@ def build_print_trees_command(
     heap_mb: int = 4000,
     on_screen: bool = False,
     renderer: str | None = None,
+    output_dir: Path | str | None = None,
     base_dir: Path,
 ) -> str:
     """Render the tree-drawing shell for the selected renderer.
@@ -354,6 +358,7 @@ def build_print_trees_command(
             color_scheme=color_scheme,
             linewidth=linewidth,
             cd_prefix=cd_prefix,
+            output_dir=output_dir,
         )
     list_path = Path(list_file)
     if cd_prefix != "CD":
@@ -426,6 +431,7 @@ def build_command_for_kind(
             cd_prefix=params.get("cd_prefix", "CD"),
             heap_mb=params.get("heap_mb", 4000),
             renderer=params.get("renderer"),
+            output_dir=params.get("output_dir"),
             base_dir=base_dir,
         )
     if kind == "getacd":
@@ -512,6 +518,7 @@ def run_print_trees(
     heap_mb: int = 4000,
     on_screen: bool = False,
     renderer: str | None = None,
+    output_dir: Path | str | None = None,
     tools3_dir: Path | None = None,
 ) -> LaunchResult:
     """Spawn a detached tree render against the given series.
@@ -553,6 +560,13 @@ def run_print_trees(
             "drop --on-screen and open the PNG."
         )
 
+    if output_dir is not None and chosen == "java":
+        raise LaunchError(
+            "print-trees --output-dir is a LIVEtools option; Tree1 hardcodes its "
+            f"output at {settings.trees_dir}. Drop --renderer java to choose a "
+            "destination."
+        )
+
     if on_screen and not os.environ.get("DISPLAY"):
         raise LaunchError(
             "print-trees --on-screen needs an X display, but $DISPLAY is unset. "
@@ -577,6 +591,7 @@ def run_print_trees(
                 "cd_prefix": cd_prefix,
                 "heap_mb": heap_mb,
                 "renderer": chosen,
+                "output_dir": str(output_dir) if output_dir is not None else None,
             },
         )
 
@@ -594,6 +609,7 @@ def run_print_trees(
         heap_mb=heap_mb,
         on_screen=on_screen,
         renderer=chosen,
+        output_dir=output_dir,
         base_dir=base_dir,
     )
     proc = _spawn_detached(shell, log_path)

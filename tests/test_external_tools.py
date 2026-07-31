@@ -171,6 +171,21 @@ def test_livetools_renderer_rejects_on_screen(captured_popen, monkeypatch):
         external_tools.run_print_trees(["seriesA"], on_screen=True, renderer="livetools")
 
 
+def test_livetools_renderer_passes_output_dir(captured_popen, tmp_path):
+    cmd = external_tools.run_print_trees(
+        ["seriesA"], output_dir=tmp_path / "trees"
+    ).proc.args[2]
+    assert f"--output-dir '{tmp_path / 'trees'}'" in cmd
+
+
+def test_java_renderer_rejects_output_dir(captured_popen, tmp_path):
+    """Tree1 hardcodes its output path, so --output-dir can't be honoured."""
+    with pytest.raises(external_tools.LaunchError, match="LIVEtools option"):
+        external_tools.run_print_trees(
+            ["seriesA"], renderer="java", output_dir=tmp_path
+        )
+
+
 def test_print_trees_rejects_unknown_renderer(captured_popen):
     with pytest.raises(external_tools.LaunchError, match="unknown tree renderer"):
         external_tools.run_print_trees(["seriesA"], renderer="graphviz")

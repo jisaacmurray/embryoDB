@@ -2,12 +2,17 @@
 
 Maps per-embryo cell trajectories into the Richards 2013 reference time/space.
 
-Algorithm matches get_acd.R exactly, including:
+Algorithm matches get_acd.R, including:
   - last-row-wins for AuxInfo (Perl overwrite-loop semantics)
   - one-daughter-per-parent (last occurrence wins)
   - trunc() integer arithmetic for time indexing
   - Bug fixes from the R rewrite: unknown-cell guard before arithmetic,
     division-by-zero on zero cycle length, division-by-zero on empty ratios
+
+It deliberately diverges from GetACD.pl and get_acd.R in one place:
+``compute_time_correction`` restricts to fully-observed cell cycles and takes
+a median, where both predecessors take a mean over every cell. See that
+function.
 """
 
 from __future__ import annotations
@@ -172,25 +177,65 @@ def transform_coordinates(rows: list[Row], auxinfo_path: Path) -> list[Row]:
 
 # ---- Time correction -------------------------------------------------------
 
+MIN_COMPLETE_CYCLES = 20
+SANE_CORRECTION_RANGE = (0.8, 3.0)
+
+
 def compute_time_correction(rows: list[Row], div_times: DivTimes) -> float:
-    # Group by cell
+    """Estimate this movie's timepoints-to-reference-units scale factor.
+
+    Only cells whose cycle was *fully* observed contribute. A cell whose
+    division falls past the end of the movie still has a full model-length
+    ``standard`` but a truncated ``observed``, so its ratio is inflated
+    without bound -- on 20230328_SYS674_tab-1_L3 those cells reached 133 and
+    dragged the old mean-of-everything estimate to 8.1 against a true ~1.6.
+    Only leaf cells are scaled by this factor (internal branches take their
+    span straight from the model), which is why the error showed up as
+    terminal branches stretched ~5x too long.
+    """
     by_cell: dict[str, list[int]] = {}
     for r in rows:
         by_cell.setdefault(r["cell"], []).append(int(r["time"]))
+    observed_cells = set(by_cell)
 
-    ratios: list[float] = []
+    complete: list[float] = []
+    all_ratios: list[float] = []
     for cell, times in by_cell.items():
         b = div_times.birth.get(cell, math.nan)
         d = div_times.division.get(cell, math.nan)
         standard = d - b
         observed = max(times) - min(times)
-        if not (math.isnan(standard) or math.isnan(b)) and standard > 0 and observed > 0:
-            ratios.append(standard / observed)
+        if math.isnan(standard) or math.isnan(b) or standard <= 0 or observed <= 0:
+            continue
+        all_ratios.append(standard / observed)
+        birth_seen = div_times.parent.get(cell) in observed_cells
+        division_seen = div_times.daughter.get(cell) in observed_cells
+        if birth_seen and division_seen:
+            complete.append(standard / observed)
 
-    if not ratios:
+    if len(complete) >= MIN_COMPLETE_CYCLES:
+        correction = statistics.median(complete)
+    elif all_ratios:
+        correction = statistics.median(all_ratios)
+        print(
+            f"  Warning: only {len(complete)} fully-observed cell cycles "
+            f"(need {MIN_COMPLETE_CYCLES}); falling back to the median over all "
+            f"{len(all_ratios)} ratios, which is biased high by truncated cycles",
+            file=sys.stderr,
+        )
+    else:
         print("  Warning: no valid time ratios found; using time_correction = 1.0", file=sys.stderr)
         return 1.0
-    return statistics.mean(ratios)
+
+    lo, hi = SANE_CORRECTION_RANGE
+    if not lo <= correction <= hi:
+        print(
+            f"  Warning: time_correction {correction:.3f} is outside the expected "
+            f"range [{lo}, {hi}] -- the lineage is probably too short or too "
+            f"fragmented for ACD output to be meaningful",
+            file=sys.stderr,
+        )
+    return correction
 
 
 # ---- Time range for one cell -----------------------------------------------

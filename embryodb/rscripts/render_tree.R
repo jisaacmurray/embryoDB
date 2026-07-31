@@ -47,10 +47,29 @@ legacy_scheme <- function(name) {
     stop("unknown color scheme: ", name))
 }
 
+# Tree1 fixes the label font and grows the canvas — one font-size of room per
+# terminal branch (`k += kInc` per leaf, then `height = facty * kLast + 100`).
+# LIVEtools does the reverse: it shrinks the font to fit a fixed plot_height_in,
+# which bottoms out at tip_size_min and turns a 600-cell tree into a grey smear.
+# So pin tip_size and derive the tip-axis extent from the tip count instead.
+# Because the spacing is pinned to the font, dpi is the only lever left for
+# label legibility: 2 mm is ~9 px at 110 dpi (a smear) and ~16 px at 200.
+is_tip_layer <- function(layer) {
+  d <- layer$data
+  inherits(layer$geom, "GeomText") &&
+    is.data.frame(d) && all(c("cell", "tree_y") %in% names(d))
+}
+
+tip_count <- function(p) {
+  for (layer in rev(p$layers)) if (is_tip_layer(layer)) return(nrow(layer$data))
+  NA_integer_
+}
+
 args <- commandArgs(trailingOnly = TRUE)
 opt <- list(manifest = NA, scheme = "rainbow", root = "P0", value_col = "blot",
             linewidth = "3", min_expr = "", max_expr = "", orientation = "vertical",
-            width = "16", height = "10", dpi = "110")
+            width = "16", height = "10", dpi = "200",
+            tip_mm = "2", min_tip_axis_in = "8")
 for (a in args) {
   kv <- regmatches(a, regexec("^--([^=]+)=(.*)$", a))[[1]]
   if (length(kv) == 3) opt[[gsub("-", "_", kv[2])]] <- kv[3]
@@ -58,6 +77,7 @@ for (a in args) {
 stopifnot(!is.na(opt$manifest))
 
 sch <- legacy_scheme(opt$scheme)
+tip_mm <- as.numeric(opt$tip_mm)
 vmin <- if (nzchar(opt$min_expr)) as.numeric(opt$min_expr) else NULL
 vmax <- if (nzchar(opt$max_expr)) as.numeric(opt$max_expr) else NULL
 
@@ -73,19 +93,39 @@ for (i in seq_len(nrow(jobs))) {
       cd, root = opt$root, value_col = opt$value_col, resolution = "timepoint",
       colors = sch$colors, value_min = vmin, value_max = vmax,
       na_color = sch$bg, branch_width = as.numeric(opt$linewidth),
-      end_time = max(cd$time), tip_lab = TRUE, value_legend = opt$value_col)
+      end_time = max(cd$time), tip_lab = TRUE, tip_size = tip_mm,
+      value_legend = opt$value_col)
     # Tree1 draws time downward with cells across; ggtree defaults to
     # left-to-right, so rotate to match when asked.
-    if (opt$orientation == "vertical") p <- p + layout_dendrogram()
+    vertical <- opt$orientation == "vertical"
+    if (vertical) {
+      p <- p + layout_dendrogram()
+      # The rotation leaves the tip labels reading across the tips, and its
+      # scale_x_reverse discards the headroom plot_lineage_tree had reserved
+      # for them, so they clip. Stand them up and hand the room back.
+      for (j in seq_along(p$layers)) {
+        if (is_tip_layer(p$layers[[j]])) {
+          p$layers[[j]]$aes_params$angle <- 90
+          p$layers[[j]]$aes_params$hjust <- 1
+        }
+      }
+      p <- p + scale_x_reverse(expand = expansion(mult = c(0.18, 0.02)))
+    }
     p <- p + theme(
       plot.background   = element_rect(fill = sch$bg, colour = NA),
       panel.background  = element_rect(fill = sch$bg, colour = NA),
       legend.background = element_rect(fill = sch$bg, colour = NA),
       legend.key        = element_rect(fill = sch$bg, colour = NA))
+    n_tips <- tip_count(p)
+    tip_axis_in <- if (is.na(n_tips)) NA_real_ else
+      max(as.numeric(opt$min_tip_axis_in), n_tips * tip_mm / 25.4)
+    # layout_dendrogram() puts the tips along x; otherwise they run down y.
+    w <- if (!is.na(tip_axis_in) &&  vertical) tip_axis_in else as.numeric(opt$width)
+    h <- if (!is.na(tip_axis_in) && !vertical) tip_axis_in else as.numeric(opt$height)
     dir.create(dirname(job$png), showWarnings = FALSE, recursive = TRUE)
-    ggsave(job$png, p, width = as.numeric(opt$width),
-           height = as.numeric(opt$height), dpi = as.numeric(opt$dpi),
+    ggsave(job$png, p, width = w, height = h, dpi = as.numeric(opt$dpi),
            limitsize = FALSE)
+    cat(sprintf("      %s tips, %.1f x %.1f in\n", n_tips, w, h))
     TRUE
   }, error = function(e) {
     message(sprintf("  FAILED %s: %s", job$series, conditionMessage(e)))

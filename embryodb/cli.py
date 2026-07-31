@@ -2599,7 +2599,7 @@ def render_trees_batch_cmd(
     list_file: Annotated[Path, typer.Option("--list", help="Series list file")],
     cd_prefix: Annotated[str, typer.Option("--cd-prefix")] = "CD",
     color_scheme: Annotated[str, typer.Option("--color-scheme")] = "rainbow",
-    linewidth: Annotated[int, typer.Option("--linewidth")] = 3,
+    linewidth: Annotated[int | None, typer.Option("--linewidth")] = None,
     min_expr: Annotated[int | None, typer.Option("--min-expr")] = None,
     max_expr: Annotated[int | None, typer.Option("--max-expr")] = None,
     output_dir: Annotated[Path | None, typer.Option("--output-dir")] = None,
@@ -2660,8 +2660,9 @@ def render_trees_batch_cmd(
         settings.rscript_command, str(script),
         f"--manifest={manifest}",
         f"--scheme={scheme}",
-        f"--linewidth={linewidth}",
     ]
+    if linewidth is not None:
+        cmd.append(f"--linewidth={linewidth}")
     if min_expr is not None:
         cmd.append(f"--min-expr={min_expr}")
     if max_expr is not None:
@@ -2694,7 +2695,13 @@ def print_trees_cmd(
     color_scheme: Annotated[
         str, typer.Option("--color-scheme", help="Color scheme or root cell")
     ] = "rainbow",
-    linewidth: Annotated[int, typer.Option("--linewidth")] = 3,
+    linewidth: Annotated[
+        int | None,
+        typer.Option(
+            "--linewidth",
+            help="Branch stroke. Left unset, LIVEtools derives one that keeps a gap between terminal branches.",
+        ),
+    ] = None,
     cd_prefix: Annotated[
         str,
         typer.Option(

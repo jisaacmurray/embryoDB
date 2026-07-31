@@ -65,11 +65,28 @@ tip_count <- function(p) {
   NA_integer_
 }
 
+# Only the panel is a "null" unit; the legend, axis and margins are absolute.
+# The tip budget has to go to the panel, so measure the rest and add it on top
+# of the canvas rather than letting it eat into the per-tip spacing.
+furniture_in <- function(p, vertical) {
+  g <- ggplot2::ggplotGrob(p)
+  u <- if (vertical) g$widths else g$heights
+  keep <- grid::unitType(u) != "null"
+  conv <- if (vertical) grid::convertWidth else grid::convertHeight
+  sum(conv(u[keep], "in", valueOnly = TRUE))
+}
+
+# ggplot2 renders linewidth 1 as .pt/96 inch, so a branch's stroke in mm is
+# linewidth * 0.753. Tree1 instead strokes 1px into a kInc*facty = 8.3px slot,
+# leaving most of the slot empty; branch_frac is that ratio, expressed against
+# the tip spacing so the gap survives any tip_mm.
+MM_PER_LINEWIDTH <- (72.27 / 25.4) / 96 * 25.4
+
 args <- commandArgs(trailingOnly = TRUE)
 opt <- list(manifest = NA, scheme = "rainbow", root = "P0", value_col = "blot",
-            linewidth = "3", min_expr = "", max_expr = "", orientation = "vertical",
+            linewidth = "", min_expr = "", max_expr = "", orientation = "vertical",
             width = "16", height = "10", dpi = "200",
-            tip_mm = "2", min_tip_axis_in = "8")
+            tip_mm = "2", min_tip_axis_in = "8", branch_frac = "0.7")
 for (a in args) {
   kv <- regmatches(a, regexec("^--([^=]+)=(.*)$", a))[[1]]
   if (length(kv) == 3) opt[[gsub("-", "_", kv[2])]] <- kv[3]
@@ -78,6 +95,8 @@ stopifnot(!is.na(opt$manifest))
 
 sch <- legacy_scheme(opt$scheme)
 tip_mm <- as.numeric(opt$tip_mm)
+branch_lw <- if (nzchar(opt$linewidth)) as.numeric(opt$linewidth) else
+  as.numeric(opt$branch_frac) * tip_mm / MM_PER_LINEWIDTH
 vmin <- if (nzchar(opt$min_expr)) as.numeric(opt$min_expr) else NULL
 vmax <- if (nzchar(opt$max_expr)) as.numeric(opt$max_expr) else NULL
 
@@ -92,9 +111,13 @@ for (i in seq_len(nrow(jobs))) {
     p <- plot_lineage_tree(
       cd, root = opt$root, value_col = opt$value_col, resolution = "timepoint",
       colors = sch$colors, value_min = vmin, value_max = vmax,
-      na_color = sch$bg, branch_width = as.numeric(opt$linewidth),
+      na_color = sch$bg, branch_width = branch_lw,
       end_time = max(cd$time), tip_lab = TRUE, tip_size = tip_mm,
       value_legend = opt$value_col)
+    # Tips sit at integer tree_y, so half a unit of padding at each end makes
+    # the panel exactly n_tips wide — without this the default 5% expansion
+    # silently squeezes the spacing below tip_mm and the branches collide.
+    p <- p + scale_y_continuous(expand = expansion(add = 0.5))
     # Tree1 draws time downward with cells across; ggtree defaults to
     # left-to-right, so rotate to match when asked.
     vertical <- opt$orientation == "vertical"
@@ -118,7 +141,8 @@ for (i in seq_len(nrow(jobs))) {
       legend.key        = element_rect(fill = sch$bg, colour = NA))
     n_tips <- tip_count(p)
     tip_axis_in <- if (is.na(n_tips)) NA_real_ else
-      max(as.numeric(opt$min_tip_axis_in), n_tips * tip_mm / 25.4)
+      max(as.numeric(opt$min_tip_axis_in), n_tips * tip_mm / 25.4) +
+        furniture_in(p, vertical)
     # layout_dendrogram() puts the tips along x; otherwise they run down y.
     w <- if (!is.na(tip_axis_in) &&  vertical) tip_axis_in else as.numeric(opt$width)
     h <- if (!is.na(tip_axis_in) && !vertical) tip_axis_in else as.numeric(opt$height)

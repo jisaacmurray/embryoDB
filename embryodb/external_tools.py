@@ -287,7 +287,7 @@ def build_livetools_trees_command(
     min_expr: int | None = None,
     max_expr: int | None = None,
     color_scheme: str = "rainbow",
-    linewidth: int = 3,
+    linewidth: int | None = None,
     cd_prefix: str = "CD",
     output_dir: Path | str | None = None,
 ) -> str:
@@ -301,8 +301,11 @@ def build_livetools_trees_command(
         f"--list {shell_quote(str(list_file))}",
         f"--cd-prefix {shell_quote(cd_prefix)}",
         f"--color-scheme {shell_quote(color_scheme)}",
-        f"--linewidth {int(linewidth)}",
     ]
+    # Left unset, the renderer derives a stroke that keeps a gap between
+    # adjacent terminal branches; an explicit value overrides that.
+    if linewidth is not None:
+        args.append(f"--linewidth {int(linewidth)}")
     if min_expr is not None:
         args.append(f"--min-expr {int(min_expr)}")
     if max_expr is not None:
@@ -323,7 +326,7 @@ def build_print_trees_command(
     min_expr: int | None = None,
     max_expr: int | None = None,
     color_scheme: str = "rainbow",
-    linewidth: int = 3,
+    linewidth: int | None = None,
     cd_prefix: str = "CD",
     heap_mb: int = 4000,
     on_screen: bool = False,
@@ -372,7 +375,7 @@ def build_print_trees_command(
         if max_expr is not None:
             args.append(str(int(max_expr)))
             args.append(shell_quote(color_scheme))
-            args.append(str(int(linewidth)))
+            args.append(str(int(linewidth if linewidth is not None else 3)))
     # Tree1 builds a JFrame even though it also writes PNGs, so it always needs a
     # display: headless mode throws HeadlessException. Batch runs get a throwaway
     # one from xvfb-run, which also stops a dead ssh X-forward from killing the
@@ -427,7 +430,7 @@ def build_command_for_kind(
             min_expr=params.get("min_expr"),
             max_expr=params.get("max_expr"),
             color_scheme=params.get("color_scheme", "rainbow"),
-            linewidth=params.get("linewidth", 3),
+            linewidth=params.get("linewidth"),
             cd_prefix=params.get("cd_prefix", "CD"),
             heap_mb=params.get("heap_mb", 4000),
             renderer=params.get("renderer"),
@@ -513,7 +516,7 @@ def run_print_trees(
     min_expr: int | None = None,
     max_expr: int | None = None,
     color_scheme: str = "rainbow",
-    linewidth: int = 3,
+    linewidth: int | None = None,
     cd_prefix: str = "CD",
     heap_mb: int = 4000,
     on_screen: bool = False,

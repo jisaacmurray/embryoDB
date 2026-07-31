@@ -178,6 +178,17 @@ def test_livetools_renderer_passes_output_dir(captured_popen, tmp_path):
     assert f"--output-dir '{tmp_path / 'trees'}'" in cmd
 
 
+def test_livetools_omits_linewidth_by_default(captured_popen):
+    """An unset stroke lets the renderer keep a gap between terminal branches."""
+    cmd = external_tools.run_print_trees(["seriesA"]).proc.args[2]
+    assert "--linewidth" not in cmd
+
+
+def test_livetools_passes_explicit_linewidth(captured_popen):
+    cmd = external_tools.run_print_trees(["seriesA"], linewidth=3).proc.args[2]
+    assert "--linewidth 3" in cmd
+
+
 def test_java_renderer_rejects_output_dir(captured_popen, tmp_path):
     """Tree1 hardcodes its output path, so --output-dir can't be honoured."""
     with pytest.raises(external_tools.LaunchError, match="LIVEtools option"):

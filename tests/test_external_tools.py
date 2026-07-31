@@ -78,6 +78,7 @@ def test_run_extract_rejects_unknown_step(captured_popen):
 def test_run_print_trees_minimal(captured_popen, tmp_path):
     result = external_tools.run_print_trees(
         ["seriesA"],
+        renderer="java",
         tools3_dir=Path("/fake/tools3"),
     )
     cmd = result.proc.args[2]
@@ -99,6 +100,7 @@ def test_run_print_trees_with_params(captured_popen, tmp_path):
         max_expr=5000.0,
         color_scheme="ABal",
         linewidth=5,
+        renderer="java",
         tools3_dir=Path("/fake/tools3"),
     )
     cmd = result.proc.args[2]
@@ -113,14 +115,16 @@ def test_run_print_trees_with_params(captured_popen, tmp_path):
 
 
 def test_run_print_trees_defaults_to_headless(captured_popen):
-    result = external_tools.run_print_trees(["seriesA"], tools3_dir=Path("/fake/tools3"))
+    result = external_tools.run_print_trees(
+        ["seriesA"], renderer="java", tools3_dir=Path("/fake/tools3")
+    )
     assert "xvfb-run -a" in result.proc.args[2]
 
 
 def test_run_print_trees_on_screen_skips_xvfb(captured_popen, monkeypatch):
     monkeypatch.setenv("DISPLAY", ":0")
     result = external_tools.run_print_trees(
-        ["seriesA"], on_screen=True, tools3_dir=Path("/fake/tools3")
+        ["seriesA"], on_screen=True, renderer="java", tools3_dir=Path("/fake/tools3")
     )
     assert "xvfb-run" not in result.proc.args[2]
 
@@ -128,14 +132,59 @@ def test_run_print_trees_on_screen_skips_xvfb(captured_popen, monkeypatch):
 def test_run_print_trees_on_screen_requires_display(captured_popen, monkeypatch):
     monkeypatch.delenv("DISPLAY", raising=False)
     with pytest.raises(external_tools.LaunchError, match="DISPLAY"):
-        external_tools.run_print_trees(["seriesA"], on_screen=True)
+        external_tools.run_print_trees(["seriesA"], on_screen=True, renderer="java")
 
 
 def test_run_print_trees_on_screen_rejected_in_remote_mode(captured_popen, monkeypatch):
     monkeypatch.setenv("DISPLAY", ":0")
     monkeypatch.setattr(external_tools.settings, "remote", True)
     with pytest.raises(external_tools.LaunchError, match="remote mode"):
-        external_tools.run_print_trees(["seriesA"], on_screen=True)
+        external_tools.run_print_trees(["seriesA"], on_screen=True, renderer="java")
+
+
+def test_print_trees_defaults_to_livetools(captured_popen):
+    """The default renderer is LIVEtools -- no JVM in the shell at all."""
+    cmd = external_tools.run_print_trees(["seriesA"]).proc.args[2]
+    assert "render-trees-batch" in cmd
+    assert "acexpress_CL2.jar" not in cmd
+
+
+def test_livetools_renderer_passes_scale_and_prefix(captured_popen):
+    cmd = external_tools.run_print_trees(
+        ["seriesA"],
+        min_expr=0,
+        max_expr=43750,
+        color_scheme="blueyellow",
+        cd_prefix="ACD",
+        renderer="livetools",
+    ).proc.args[2]
+    assert "--cd-prefix 'ACD'" in cmd
+    assert "--color-scheme 'blueyellow'" in cmd
+    assert "--min-expr 0" in cmd
+    assert "--max-expr 43750" in cmd
+
+
+def test_livetools_renderer_rejects_on_screen(captured_popen, monkeypatch):
+    """--on-screen shows Tree1's JFrame; LIVEtools only writes PNGs."""
+    monkeypatch.setenv("DISPLAY", ":0")
+    with pytest.raises(external_tools.LaunchError, match="Tree1 feature"):
+        external_tools.run_print_trees(["seriesA"], on_screen=True, renderer="livetools")
+
+
+def test_print_trees_rejects_unknown_renderer(captured_popen):
+    with pytest.raises(external_tools.LaunchError, match="unknown tree renderer"):
+        external_tools.run_print_trees(["seriesA"], renderer="graphviz")
+
+
+def test_queued_print_trees_job_keeps_its_renderer(tmp_path):
+    """A job queued in remote mode must render the same way on the worker."""
+    shell = external_tools.build_command_for_kind(
+        "print_trees",
+        {"series_names": ["seriesA"], "renderer": "java"},
+        tmp_path / "list.txt",
+        Path("/fake/tools3"),
+    )
+    assert "acexpress_CL2.jar" in shell
 
 
 def test_run_getacd_builds_correct_shell(captured_popen, tmp_path):

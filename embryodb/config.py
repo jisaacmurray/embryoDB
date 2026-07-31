@@ -87,6 +87,43 @@ class Settings(BaseSettings):
         default=Path("/tmp"),
         description="Directory for the per-machine worker pidfile.",
     )
+
+    # --- Lineage-tree rendering -------------------------------------------
+    # Two renderers draw the same trees. "livetools" (default) is the R/ggtree
+    # path; "java" is the legacy acexpress_CL2.jar Tree1. Tree1 stays available
+    # because it is what the corpus of existing PNGs was drawn with, but it
+    # parses cell x/y with Integer.parseInt, so it cannot read ACD files (their
+    # coordinates are signed floats) and it silently clips trees at two
+    # independent end-time limits.
+    tree_renderer: str = Field(
+        default="livetools",
+        description="Default lineage-tree renderer: 'livetools' or 'java' (EMBRYODB_TREE_RENDERER).",
+    )
+    trees_dir: Path = Field(
+        default=Path("/gpfs/fs0/l/murr/trees"),
+        description="Output directory for rendered tree PNGs (matches Tree1's hardcoded sink).",
+    )
+    rscript_command: str = Field(
+        default="Rscript",
+        description="Rscript launcher for the LIVEtools renderer (EMBRYODB_RSCRIPT_COMMAND).",
+    )
+    r_libs: Path = Field(
+        default=Path("/murrlab3/Software/Rlib/x86_64-pc-linux-gnu/4.5"),
+        description=(
+            "Shared R library holding LIVEtools and its dependency closure, "
+            "exported as R_LIBS so no user needs a personal install. Lives on "
+            "/murrlab3 so every host that mounts it gets the same tree "
+            "(EMBRYODB_R_LIBS)."
+        ),
+    )
+    livetools_commit: str = Field(
+        default="e209fb72c5b1478d489ec6ea817bfbeb75a09180",
+        description=(
+            "LIVEtools commit installed in r_libs (johnmurraylab/LIVE_tools). "
+            "Upstream is an external repo, so the version is pinned here and "
+            "recorded with each render rather than tracking HEAD implicitly."
+        ),
+    )
     worker_max_slots: int = Field(
         default=3,
         description=(

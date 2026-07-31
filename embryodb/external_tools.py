@@ -280,6 +280,39 @@ def build_extract_command(
     )
 
 
+def build_livetools_trees_command(
+    series_names: list[str],
+    list_file: Path | str,
+    *,
+    min_expr: int | None = None,
+    max_expr: int | None = None,
+    color_scheme: str = "rainbow",
+    linewidth: int = 3,
+    cd_prefix: str = "CD",
+) -> str:
+    """Render the LIVEtools (R/ggtree) tree shell.
+
+    Delegates to `embryodb render-trees-batch`, which resolves each series'
+    CSV and PNG path from the DB before handing R a manifest — R never
+    discovers work on the filesystem.
+    """
+    args = [
+        f"--list {shell_quote(str(list_file))}",
+        f"--cd-prefix {shell_quote(cd_prefix)}",
+        f"--color-scheme {shell_quote(color_scheme)}",
+        f"--linewidth {int(linewidth)}",
+    ]
+    if min_expr is not None:
+        args.append(f"--min-expr {int(min_expr)}")
+    if max_expr is not None:
+        args.append(f"--max-expr {int(max_expr)}")
+    return (
+        f"echo '== PrintTrees/LIVEtools ({len(series_names)} series, {cd_prefix}) ==' && "
+        f"nice {shell_quote(sys.executable)} -m embryodb.cli render-trees-batch "
+        + " ".join(args)
+    )
+
+
 def build_print_trees_command(
     series_names: list[str],
     list_file: Path | str,
@@ -291,9 +324,17 @@ def build_print_trees_command(
     cd_prefix: str = "CD",
     heap_mb: int = 4000,
     on_screen: bool = False,
+    renderer: str | None = None,
     base_dir: Path,
 ) -> str:
-    """Render the `acexpress_CL2.jar Tree1` shell.
+    """Render the tree-drawing shell for the selected renderer.
+
+    `renderer` picks between "livetools" (R/ggtree) and "java" (Tree1);
+    None takes `settings.tree_renderer`. The Java-only options (`heap_mb`,
+    `on_screen`) are ignored by the LIVEtools path, which has no JVM and no
+    window.
+
+    Everything below documents the Java path.
 
     When `cd_prefix` is not "CD" each series-list line is written as
     ``<series> - <cd_prefix>`` so Tree1's series-list parser uses the chosen
@@ -304,6 +345,16 @@ def build_print_trees_command(
     rendering into a throwaway one — the quick-QC path, where looking at the
     tree is the point and the PNG is a side effect.
     """
+    if (renderer or settings.tree_renderer) == "livetools":
+        return build_livetools_trees_command(
+            series_names,
+            list_file,
+            min_expr=min_expr,
+            max_expr=max_expr,
+            color_scheme=color_scheme,
+            linewidth=linewidth,
+            cd_prefix=cd_prefix,
+        )
     list_path = Path(list_file)
     if cd_prefix != "CD":
         list_path.write_text(
@@ -374,6 +425,7 @@ def build_command_for_kind(
             linewidth=params.get("linewidth", 3),
             cd_prefix=params.get("cd_prefix", "CD"),
             heap_mb=params.get("heap_mb", 4000),
+            renderer=params.get("renderer"),
             base_dir=base_dir,
         )
     if kind == "getacd":
@@ -459,9 +511,16 @@ def run_print_trees(
     cd_prefix: str = "CD",
     heap_mb: int = 4000,
     on_screen: bool = False,
+    renderer: str | None = None,
     tools3_dir: Path | None = None,
 ) -> LaunchResult:
-    """Spawn `acexpress_CL2.jar Tree1` detached against the given series.
+    """Spawn a detached tree render against the given series.
+
+    `renderer` selects "livetools" (R/ggtree, the default) or "java" (Tree1);
+    None takes `settings.tree_renderer`. `heap_mb` and `on_screen` apply only
+    to the Java path.
+
+    Everything below documents the Java path.
 
     Tree1 args (positional, per accessory inventory):
         <series_list_file> [minExpr] [maxExpr] [colorScheme|rootCell] [linewidth]
@@ -482,6 +541,17 @@ def run_print_trees(
     """
     if not series_names:
         raise ValueError("run_print_trees: series_names is empty")
+
+    chosen = renderer or settings.tree_renderer
+    if chosen not in ("livetools", "java"):
+        raise LaunchError(f"unknown tree renderer {chosen!r}; expected 'livetools' or 'java'")
+
+    if on_screen and chosen == "livetools":
+        raise LaunchError(
+            "print-trees --on-screen is a Tree1 feature (it shows the JFrame); "
+            "the LIVEtools renderer only writes PNGs. Add --renderer java, or "
+            "drop --on-screen and open the PNG."
+        )
 
     if on_screen and not os.environ.get("DISPLAY"):
         raise LaunchError(
@@ -506,6 +576,7 @@ def run_print_trees(
                 "linewidth": linewidth,
                 "cd_prefix": cd_prefix,
                 "heap_mb": heap_mb,
+                "renderer": chosen,
             },
         )
 
@@ -522,6 +593,7 @@ def run_print_trees(
         cd_prefix=cd_prefix,
         heap_mb=heap_mb,
         on_screen=on_screen,
+        renderer=chosen,
         base_dir=base_dir,
     )
     proc = _spawn_detached(shell, log_path)
@@ -664,6 +736,7 @@ __all__ = [
     "build_command_for_kind",
     "build_extract_command",
     "build_getacd_command",
+    "build_livetools_trees_command",
     "build_print_trees_command",
     "command_job_log_path",
     "enqueue_command_job",

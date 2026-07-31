@@ -2594,6 +2594,82 @@ def run_extract_batch_cmd(
     raise typer.Exit(worst)
 
 
+@app.command("render-trees-batch", hidden=True)
+def render_trees_batch_cmd(
+    list_file: Annotated[Path, typer.Option("--list", help="Series list file")],
+    cd_prefix: Annotated[str, typer.Option("--cd-prefix")] = "CD",
+    color_scheme: Annotated[str, typer.Option("--color-scheme")] = "rainbow",
+    linewidth: Annotated[int, typer.Option("--linewidth")] = 3,
+    min_expr: Annotated[int | None, typer.Option("--min-expr")] = None,
+    max_expr: Annotated[int | None, typer.Option("--max-expr")] = None,
+) -> None:
+    """Render trees for a series list via LIVEtools (called by print-trees).
+
+    Resolves every series' dats/ CSV and output PNG from the DB, writes a
+    manifest, and hands that to render_tree.R — R is never asked to discover
+    anything on the filesystem.
+    """
+    import os
+    import subprocess
+
+    from .database import session_scope
+    from .queries.series import get_by_name
+
+    names = [
+        line.split()[0]
+        for line in list_file.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+
+    jobs, skipped = [], []
+    with session_scope() as s:
+        for name in names:
+            row = get_by_name(s, name)
+            if row is None or not row.annot_loc:
+                skipped.append((name, "not in DB or no annot_loc"))
+                continue
+            csv = Path(row.annot_loc) / "dats" / f"{cd_prefix}{name}.csv"
+            if not csv.exists():
+                skipped.append((name, f"missing {csv.name}"))
+                continue
+            jobs.append((name, csv, settings.trees_dir / f"{name}.png"))
+
+    for name, why in skipped:
+        console.print(f"[yellow]skip {name}: {why}[/yellow]")
+    if not jobs:
+        console.print("[red]render-trees-batch: nothing to render[/red]")
+        raise typer.Exit(1)
+
+    manifest = list_file.with_suffix(".manifest.tsv")
+    manifest.write_text(
+        "series\tcsv\tpng\n"
+        + "".join(f"{n}\t{c}\t{p}\n" for n, c, p in jobs),
+        encoding="utf-8",
+    )
+
+    # Tree1's "rainbow"/"blueyellow" names carry over; its unnamed default
+    # (iColorOption 2) is black->red.
+    scheme = {"default": "blackred"}.get(color_scheme, color_scheme)
+    script = Path(__file__).parent / "rscripts" / "render_tree.R"
+    cmd = [
+        settings.rscript_command, str(script),
+        f"--manifest={manifest}",
+        f"--scheme={scheme}",
+        f"--linewidth={linewidth}",
+    ]
+    if min_expr is not None:
+        cmd.append(f"--min-expr={min_expr}")
+    if max_expr is not None:
+        cmd.append(f"--max-expr={max_expr}")
+
+    console.print(
+        f"render-trees-batch: {len(jobs)} series, {cd_prefix}, scheme={scheme}, "
+        f"LIVEtools {settings.livetools_commit[:7]}"
+    )
+    rc = subprocess.call(cmd, env={**os.environ, "R_LIBS": str(settings.r_libs)})
+    raise typer.Exit(rc)
+
+
 @app.command("print-trees")
 def print_trees_cmd(
     series: Annotated[
@@ -2629,11 +2705,18 @@ def print_trees_cmd(
         bool,
         typer.Option(
             "--on-screen",
-            help="Also show Tree1's window on your display (quick QC). Needs $DISPLAY; local mode only.",
+            help="Also show Tree1's window on your display (quick QC). Needs $DISPLAY; --renderer java only.",
         ),
     ] = False,
+    renderer: Annotated[
+        str | None,
+        typer.Option(
+            "--renderer",
+            help="'livetools' (R/ggtree, default) or 'java' (legacy Tree1). Java cannot read ACD files.",
+        ),
+    ] = None,
 ) -> None:
-    """Render lineage-tree PNGs via Tree1 (CLI twin of the GUI "Print trees…").
+    """Render lineage-tree PNGs (CLI twin of the GUI "Print trees…").
     Detached job; PNGs land in /gpfs/fs0/l/murr/trees/.
     """
     from .external import LaunchError
@@ -2650,6 +2733,7 @@ def print_trees_cmd(
             cd_prefix=cd_prefix,
             heap_mb=heap_mb,
             on_screen=on_screen,
+            renderer=renderer,
         )
     except LaunchError as exc:
         console.print(f"[red]{exc}[/red]")

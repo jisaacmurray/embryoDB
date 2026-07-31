@@ -1,0 +1,98 @@
+#!/usr/bin/env Rscript
+# LIVEtools lineage-tree renderer.
+#
+# Driven by `embryodb render-trees-batch`, which resolves every input and
+# output path from the DB and hands them over in a manifest. Nothing here
+# touches the filesystem to discover work.
+#
+# Colors reproduce org.rhwlab.tree.HeatMap's gradients step-for-step so trees
+# rendered here are comparable to the ones Tree1 has been producing for years:
+# the integer truncation is deliberate (black->red tops out at #FE0000, not
+# #FF0000), and java.awt.Color.orange is (255,200,0), not R's #FFA500.
+
+suppressPackageStartupMessages({
+  library(LIVEtools); library(ggplot2); library(ggtree); library(data.table)
+})
+
+java_gradient <- function(one, two, num_steps) {
+  c1 <- grDevices::col2rgb(one)[, 1]
+  c2 <- grDevices::col2rgb(two)[, 1]
+  norm <- (seq_len(num_steps) - 1L) / num_steps
+  ch <- vapply(1:3, function(k) as.integer(c1[k] + norm * (c2[k] - c1[k])),
+               numeric(num_steps))
+  grDevices::rgb(ch[, 1], ch[, 2], ch[, 3], maxColorValue = 255)
+}
+
+java_multi_gradient <- function(colors, num_steps) {
+  n_sections <- length(colors) - 1L
+  per <- num_steps %/% n_sections
+  out <- unlist(lapply(seq_len(n_sections),
+                       function(s) java_gradient(colors[s], colors[s + 1L], per)))
+  if (length(out) < num_steps) {
+    out <- c(out, rep(colors[length(colors)], num_steps - length(out)))
+  }
+  out[seq_len(num_steps)]
+}
+
+# Tree1 option mapping: 2 -> black->red on white (its default);
+# 1/"rainbow" and 3/"blueyellow" both switch the background to LIGHT_GRAY.
+legacy_scheme <- function(name) {
+  switch(name,
+    blackred = list(colors = java_gradient("black", "red", 500), bg = "#FFFFFF"),
+    blueyellow = list(colors = java_gradient("blue", "yellow", 500), bg = "#C0C0C0"),
+    rainbow = list(
+      colors = java_multi_gradient(
+        c("#B520FF", "#0000FF", "#00FF00", "#FFFF00", "#FFC800", "#FF0000"), 500),
+      bg = "#C0C0C0"),
+    stop("unknown color scheme: ", name))
+}
+
+args <- commandArgs(trailingOnly = TRUE)
+opt <- list(manifest = NA, scheme = "rainbow", root = "P0", value_col = "blot",
+            linewidth = "3", min_expr = "", max_expr = "", orientation = "vertical",
+            width = "16", height = "10", dpi = "110")
+for (a in args) {
+  kv <- regmatches(a, regexec("^--([^=]+)=(.*)$", a))[[1]]
+  if (length(kv) == 3) opt[[gsub("-", "_", kv[2])]] <- kv[3]
+}
+stopifnot(!is.na(opt$manifest))
+
+sch <- legacy_scheme(opt$scheme)
+vmin <- if (nzchar(opt$min_expr)) as.numeric(opt$min_expr) else NULL
+vmax <- if (nzchar(opt$max_expr)) as.numeric(opt$max_expr) else NULL
+
+jobs <- fread(opt$manifest, sep = "\t", header = TRUE, colClasses = "character")
+failed <- 0L
+
+for (i in seq_len(nrow(jobs))) {
+  job <- jobs[i]
+  cat(sprintf("[%d/%d] %s -> %s\n", i, nrow(jobs), job$series, job$png))
+  ok <- tryCatch({
+    cd <- as.data.frame(fread(job$csv))
+    p <- plot_lineage_tree(
+      cd, root = opt$root, value_col = opt$value_col, resolution = "timepoint",
+      colors = sch$colors, value_min = vmin, value_max = vmax,
+      na_color = sch$bg, branch_width = as.numeric(opt$linewidth),
+      end_time = max(cd$time), tip_lab = TRUE, value_legend = opt$value_col)
+    # Tree1 draws time downward with cells across; ggtree defaults to
+    # left-to-right, so rotate to match when asked.
+    if (opt$orientation == "vertical") p <- p + layout_dendrogram()
+    p <- p + theme(
+      plot.background   = element_rect(fill = sch$bg, colour = NA),
+      panel.background  = element_rect(fill = sch$bg, colour = NA),
+      legend.background = element_rect(fill = sch$bg, colour = NA),
+      legend.key        = element_rect(fill = sch$bg, colour = NA))
+    dir.create(dirname(job$png), showWarnings = FALSE, recursive = TRUE)
+    ggsave(job$png, p, width = as.numeric(opt$width),
+           height = as.numeric(opt$height), dpi = as.numeric(opt$dpi),
+           limitsize = FALSE)
+    TRUE
+  }, error = function(e) {
+    message(sprintf("  FAILED %s: %s", job$series, conditionMessage(e)))
+    FALSE
+  })
+  if (!ok) failed <- failed + 1L
+}
+
+cat(sprintf("rendered %d/%d trees\n", nrow(jobs) - failed, nrow(jobs)))
+if (failed > 0L) quit(status = 1L)

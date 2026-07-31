@@ -26,11 +26,11 @@ _CD_PREFIXES: list[tuple[str, str]] = [
 ]
 
 
-_TREE_OUTPUT_DIR = Path("/gpfs/fs0/l/murr/trees")
+_TREE_OUTPUT_DIR = settings.trees_dir
 
 
 class PrintTreesDialog(QtWidgets.QDialog):
-    """Pick optional Tree1 parameters and launch the tree-printing job."""
+    """Pick renderer + optional parameters and launch the tree-printing job."""
 
     def __init__(
         self,
@@ -133,6 +133,23 @@ class PrintTreesDialog(QtWidgets.QDialog):
         )
         fl.addRow("Expression file:", self._cd_prefix)
 
+        self._renderer = QtWidgets.QComboBox()
+        self._renderer.addItem("LIVEtools (R/ggtree)", "livetools")
+        self._renderer.addItem("Tree1 (legacy Java)", "java")
+        self._renderer.setCurrentIndex(
+            0 if settings.tree_renderer == "livetools" else 1
+        )
+        self._renderer.setToolTip(
+            "LIVEtools — the default; reads any of CD/SCD/ACD and draws the "
+            "whole movie.\n"
+            "Tree1 — the legacy renderer the existing PNG corpus was drawn "
+            "with. It cannot read ACD files (their coordinates are signed "
+            "floats, which it parses as ints) and clips trees at its own "
+            "end-time limits."
+        )
+        self._renderer.currentIndexChanged.connect(self._sync_renderer)
+        fl.addRow("Renderer:", self._renderer)
+
         layout.addWidget(form)
 
         self._on_screen = QtWidgets.QCheckBox("Show the tree on screen (quick QC)")
@@ -151,6 +168,8 @@ class PrintTreesDialog(QtWidgets.QDialog):
             self._on_screen.setEnabled(False)
             self._on_screen.setToolTip("$DISPLAY is unset — no X display to draw on.")
         layout.addWidget(self._on_screen)
+        self._on_screen_allowed = self._on_screen.isEnabled()
+        self._sync_renderer()
 
         info = QtWidgets.QLabel(
             f"PNG output: <code>{_TREE_OUTPUT_DIR}/&lt;series&gt;.png</code> "
@@ -182,8 +201,15 @@ class PrintTreesDialog(QtWidgets.QDialog):
 
     # --- launch + log -----------------------------------------------------
 
+    def _sync_renderer(self) -> None:
+        """On-screen display is a Tree1 JFrame; LIVEtools only writes PNGs."""
+        is_java = self._renderer.currentData() == "java"
+        self._on_screen.setEnabled(self._on_screen_allowed and is_java)
+        if not is_java:
+            self._on_screen.setChecked(False)
+
     def _on_launch(self) -> None:
-        kwargs: dict = {}
+        kwargs: dict = {"renderer": self._renderer.currentData()}
         if self._min_expr_check.isChecked():
             kwargs["min_expr"] = int(self._min_expr.value())
             kwargs["max_expr"] = int(self._max_expr.value())

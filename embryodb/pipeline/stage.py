@@ -41,6 +41,16 @@ ROLE_TO_SUBDIR: dict[str, str] = {
     "DIC": "DIC",
 }
 
+# Assigning this role drops a channel instead of routing it anywhere. A DIC
+# channel is the same size as the fluorescence ones and nothing downstream
+# reads it, so on a 3-channel acquisition omitting it saves a third of the
+# extraction time and disk.
+SKIP_ROLE = "skip"
+
+
+def is_skipped_role(role: str) -> bool:
+    return role.strip().lower() == SKIP_ROLE
+
 
 def role_subdir(role: str, raw_channel_index: int) -> str:
     """Pick the subdirectory for a given channel role.
@@ -171,6 +181,9 @@ def stage_position(
 
     for raw_channel, files in plan.files_by_channel.items():
         role = channel_map.get(raw_channel, "")
+        if is_skipped_role(role):
+            outcome.skipped += len(files)
+            continue
         subdir_name = role_subdir(role, raw_channel)
         subdir = ensure_dir(image_loc / subdir_name)
 

@@ -141,7 +141,10 @@ new files added). This is the v1 guarantee; v2 honours it via
   Stellaris variants (Sequential / Simultaneous / Simultaneous+DIC) are
   now rows in the `Protocol` table with `channel_map = {raw_ch: role}`.
   Extra channels route to `tifC<n>/` so the data survives even though
-  legacy AceTree only displays 2.
+  legacy AceTree only displays 2. The role `skip` drops a channel
+  entirely — nothing is read or written for it (use it to decline a DIC
+  channel; `--channel-role 2=skip`, or the `skip` entry in the GUI LIF
+  dialog's role dropdown). The histone channel may not be skipped.
 - **Filename parser is a plugin registry**
   (`embryodb/parsers/filename.py`). Ships Leica TileScan; designed to add
   Zeiss / Nikon without forking the pipeline.

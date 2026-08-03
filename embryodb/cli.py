@@ -22,6 +22,7 @@ from .importers.xml_importer import import_dir
 from .pipeline.backfill import backfill_directory
 from .pipeline.orchestrate import ImportOptions, STEPS, import_acquisition
 from .pipeline.protocol_seed import seed_protocols
+from .pipeline.stage import is_skipped_role
 from .models import Status
 from .queries import datasets as q_datasets
 from .queries import series as q_series
@@ -1579,7 +1580,8 @@ def pipeline_import_lif_cmd(
         typer.Option(
             "--channel-role",
             help="Override channel role: e.g. '0=histone' (raw_ch=role). "
-                 "Repeatable. Defaults to the Protocol's channel_map.",
+                 "Repeatable. Defaults to the Protocol's channel_map. "
+                 "Use role 'skip' to omit a channel (e.g. '2=skip' to drop DIC).",
         ),
     ] = None,
     bit_depth_policy: Annotated[
@@ -1717,14 +1719,23 @@ def pipeline_import_lif_cmd(
         f"  positions:  {len(series_info.positions)}"
         + (f" (filtered to {len(position)})" if position else "")
     )
+    n_ch = len(series_info.channels)
+    n_kept = sum(
+        1 for c in series_info.channels
+        if not is_skipped_role(eff_map.get(c.raw_index, ""))
+    )
+    kept_note = f" ({n_ch - n_kept} omitted)" if n_kept < n_ch else ""
     console.print(
         f"  per-pos:    {series_info.positions[0].n_timepoints} tp × "
         f"{series_info.positions[0].n_planes} planes × "
-        f"{len(series_info.channels)} ch  "
-        f"= {series_info.positions[0].n_timepoints * series_info.positions[0].n_planes * len(series_info.channels):,} planes"
+        f"{n_kept} ch{kept_note}  "
+        f"= {series_info.positions[0].n_timepoints * series_info.positions[0].n_planes * n_kept:,} planes"
     )
+    est_bytes = series_info.estimated_uncompressed_bytes()
+    if n_ch:
+        est_bytes = est_bytes * n_kept / n_ch
     console.print(
-        f"  est size:   ~{series_info.estimated_uncompressed_bytes() / 1e9:.1f} GB "
+        f"  est size:   ~{est_bytes / 1e9:.1f} GB "
         f"uncompressed (LZW typically 30-50% of that)\n"
     )
 
@@ -1782,6 +1793,12 @@ def pipeline_import_lif_cmd(
     console.print(f"[bold]Channel mapping[/bold] (from Protocol {protocol!r}):")
     for c in series_info.channels:
         role = eff_map.get(c.raw_index, "(unmapped → tifC?)")
+        if is_skipped_role(role):
+            console.print(
+                f"  raw_ch {c.raw_index}: {c.dye_name or '(no dye)'} "
+                f"· {c.laser_line_nm} nm  →  [dim]omitted (not extracted)[/dim]"
+            )
+            continue
         # Heuristic warning: histone is usually the longer wavelength.
         warn = ""
         if (

@@ -55,7 +55,9 @@ log = logging.getLogger(__name__)
 # during extraction; returns the destination Path for that plane. Callers
 # embed any layout decision they want (Z-inversion, channel routing) in
 # this closure.
-PathFn = Callable[[int, int, int], Path]
+# Returning None omits that plane entirely — used to drop a whole channel
+# (e.g. DIC) without writing it anywhere.
+PathFn = Callable[[int, int, int], "Path | None"]
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +158,7 @@ class ExtractionReport:
     planes_total: int = 0
     planes_written: int = 0
     planes_skipped: int = 0       # dst already existed; not overwritten
+    planes_omitted: int = 0       # channel dropped by role 'skip'
     bytes_written: int = 0
     bit_depth_warning: str | None = None
     error: str | None = None
@@ -336,6 +339,12 @@ class LifExtractor:
             for z in range(nz):
                 for raw_ch in range(nc):
                     dst = path_fn(t, z, raw_ch)
+                    if dst is None:
+                        report.planes_omitted += 1
+                        done += 1
+                        if on_progress is not None:
+                            on_progress(done, report.planes_total)
+                        continue
                     if dst.exists() and not overwrite:
                         report.planes_skipped += 1
                         done += 1

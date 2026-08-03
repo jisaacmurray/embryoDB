@@ -521,6 +521,51 @@ def test_role_subdir_unknown_role_falls_back_to_tifC():
     assert role_subdir("", 4) == "tifC4"
 
 
+def test_is_skipped_role():
+    from embryodb.pipeline.stage import is_skipped_role
+
+    assert is_skipped_role("skip")
+    assert is_skipped_role(" Skip ")
+    assert not is_skipped_role("DIC")
+    assert not is_skipped_role("")
+
+
+def test_stage_position_omits_skipped_channel(tmp_path):
+    """A 'skip' role writes nothing at all — not even a tifC<n>/ dir."""
+    from embryodb.parsers.filename import RawImage
+    from embryodb.pipeline.stage import PositionPlan, stage_position
+
+    src = tmp_path / "raw"
+    src.mkdir()
+    plan = PositionPlan(position=1, series_name="acq_L1")
+    for raw_ch in (0, 2):
+        p = src / f"ch{raw_ch}.tif"
+        p.write_bytes(b"")
+        plan.files_by_channel[raw_ch].append(
+            RawImage(
+                path=p,
+                acquisition_stem="acq",
+                position=1,
+                timepoint=0,
+                z_plane=0,
+                raw_channel=raw_ch,
+            )
+        )
+
+    outcome = stage_position(
+        plan,
+        {0: "histone", 2: "skip"},
+        tmp_path / "images",
+        slices=1,
+        compress_with_lzw=False,
+    )
+    image_loc = tmp_path / "images" / "acq_L1"
+    assert (image_loc / "tif" / "acq_L1-t001-p01.tif").exists()
+    assert not (image_loc / "tifC2").exists()
+    assert outcome.written == 1
+    assert outcome.skipped == 1
+
+
 # ---------------------------------------------------------------------------
 # Backfill: pretend the pipeline already ran on disk; discover state
 # ---------------------------------------------------------------------------

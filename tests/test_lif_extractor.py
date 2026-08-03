@@ -236,6 +236,25 @@ def test_extract_position_is_idempotent(install_fake_lif, tmp_path):
     assert second.planes_skipped == 12
 
 
+def test_extract_position_omits_planes_when_path_fn_returns_none(
+    install_fake_lif, tmp_path
+):
+    """Returning None drops a whole channel — nothing read, nothing written."""
+    install_fake_lif()
+    ex = LifExtractor("ignored.lif")
+
+    def path_fn(t, z, c):
+        if c == 1:
+            return None
+        return tmp_path / f"t{t}_z{z}_c{c}.tif"
+
+    report = ex.extract_position("TileScan 1", "Position 1", path_fn=path_fn)
+    assert report.planes_total == 12
+    assert report.planes_written == 6
+    assert report.planes_omitted == 6
+    assert len(list(tmp_path.glob("*.tif"))) == 6
+
+
 def test_extract_position_overwrite_rewrites(install_fake_lif, tmp_path):
     install_fake_lif()
     ex = LifExtractor("ignored.lif")

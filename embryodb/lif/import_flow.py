@@ -52,7 +52,7 @@ from ..pipeline.orchestrate import (
     step_write_embryodb_xml,
     step_write_matlab_params,
 )
-from ..pipeline.stage import StageOutcome, role_subdir
+from ..pipeline.stage import StageOutcome, is_skipped_role, role_subdir
 from .extractor import LifExtractor
 
 log = logging.getLogger(__name__)
@@ -298,6 +298,16 @@ def import_lif(
                 f"channel may hold it (reassign the rest to 'extra')"
             )
 
+    # Everything downstream (StarryNite, AceTree) reads tif/, so an import
+    # that drops the nuclear channel produces nothing usable.
+    if any(is_skipped_role(r) for r in channel_map.values()) and not any(
+        r == "histone" for r in channel_map.values()
+    ):
+        raise ValueError(
+            "the histone (nuclear) channel cannot be skipped — StarryNite and "
+            "AceTree both read it; skip the reporter or extra channels instead"
+        )
+
     # Acquisition stem: caller-supplied or derived from the LIF filename.
     stem = acquisition_name or Path(lif_path).stem
     # We store stem on Acquisition.name so re-runs are idempotent on the
@@ -473,12 +483,15 @@ def _import_one_position(
 
     total_written = 0
     total_skipped = 0
+    total_omitted = 0
     total_bytes = 0
     offset = 0
     for seg_lif_name, seg_pos in segments:
 
-        def _path_fn(t: int, z: int, raw_ch: int, _offset: int = offset) -> Path:
+        def _path_fn(t: int, z: int, raw_ch: int, _offset: int = offset) -> Path | None:
             role = channel_map.get(raw_ch, "")
+            if is_skipped_role(role):
+                return None
             subdir = ensure_dir(image_loc / role_subdir(role, raw_ch))
             # 1-based timepoint, shifted by the running offset so appended
             # segments continue the main movie (e.g. t241 after a 240-tp main).
@@ -515,6 +528,7 @@ def _import_one_position(
             return outcome
         total_written += extract_report.planes_written
         total_skipped += extract_report.planes_skipped
+        total_omitted += extract_report.planes_omitted
         total_bytes += extract_report.bytes_written
         offset += seg_pos.n_timepoints
 
@@ -526,6 +540,7 @@ def _import_one_position(
         "appended_timepoints": total_nt - position_info.n_timepoints,
         "planes_written": total_written,
         "planes_skipped": total_skipped,
+        "planes_omitted": total_omitted,
         "bytes_written": total_bytes,
     }
     outcome.stage_outcome = StageOutcome(

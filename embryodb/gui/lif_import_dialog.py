@@ -25,8 +25,8 @@ from .combo import use_exact_case
 from ..identity import current_user, known_persons, system_users, user_has_image_dir
 
 # Roles the user can assign per channel. role_subdir() maps histone→tif/,
-# reporter→tifR/, anything else→tifC<n>/.
-_ROLES = ["histone", "reporter", "extra"]
+# reporter→tifR/, anything else→tifC<n>/. ``skip`` extracts nothing at all.
+_ROLES = ["histone", "reporter", "extra", "skip"]
 # Roles that stage into a single fixed dir (tif/ resp. tifR/), so at most one
 # channel may hold each — two would collide on disk. ``extra`` is exempt
 # (each lands in its own tifC<n>/).
@@ -428,6 +428,12 @@ class LifImportDialog(QtWidgets.QDialog):
         two histone channels would both stage into ``tif/`` and collide.
         """
         channel_map = self._protocol_combo.currentData() or {}
+        # A single acquired channel is always the nuclear one, whatever the
+        # protocol says — some map ch0 to reporter, which would send the
+        # nuclei to tifR/. Mirrors the same rule in lif/import_flow.py.
+        if len(self._channel_combos) == 1:
+            next(iter(self._channel_combos.values())).setCurrentText("histone")
+            return
         for raw_idx, combo in self._channel_combos.items():
             role = channel_map.get(str(raw_idx))
             if role in _ROLES:
@@ -484,10 +490,22 @@ class LifImportDialog(QtWidgets.QDialog):
                 f"'extra' before launching.",
             )
             return
+        # StarryNite and AceTree both read tif/, so an import that omits the
+        # nuclear channel produces nothing usable.
+        if "histone" not in channel_roles.values():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "No histone channel",
+                "The histone (nuclear) channel cannot be omitted — StarryNite "
+                "and AceTree both read it. Skip the reporter or extra "
+                "channels instead.",
+            )
+            return
         # Confirm — extraction is long and irreversible-ish (writes lots of
         # files). Surface the channel mapping + any appended movies one more time.
         mapping = "\n".join(
-            f"  raw_ch {i} → {r}" for i, r in sorted(channel_roles.items())
+            f"  raw_ch {i} → {r}" + ("  (not extracted)" if r == "skip" else "")
+            for i, r in sorted(channel_roles.items())
         )
         append_names = self._selected_append_names()
         append_msg = ""

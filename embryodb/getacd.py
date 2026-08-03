@@ -9,10 +9,15 @@ Algorithm matches get_acd.R, including:
   - Bug fixes from the R rewrite: unknown-cell guard before arithmetic,
     division-by-zero on zero cycle length, division-by-zero on empty ratios
 
-It deliberately diverges from GetACD.pl and get_acd.R in one place:
-``compute_time_correction`` restricts to fully-observed cell cycles and takes
-a median, where both predecessors take a mean over every cell. See that
-function.
+It deliberately diverges from GetACD.pl and get_acd.R in two places:
+
+  - ``compute_time_correction`` restricts to fully-observed cell cycles and
+    takes a median, where both predecessors take a mean over every cell.
+  - ``resolve_z_res`` takes the plane spacing from the DB (or AuxInfo's
+    ``zpixres``) instead of hardcoding 0.504 um. Both predecessors parse
+    ``zpixres`` and then never use it.
+
+See those functions.
 """
 
 from __future__ import annotations
@@ -24,10 +29,21 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
+# The reference (Richards 2013) embryo: major/minor axis in pixels, and the
+# pixel size of the movie it was measured on. X and Y are normalized onto this
+# embryo (`x /= maj / STD_MAJ`) BEFORE the micron conversion, so XY_RES belongs
+# to the reference, not to the movie being processed -- 571*0.087 = 49.7 um and
+# 348*0.087 = 30.3 um, the real dimensions of a C. elegans embryo. Overriding
+# it per-movie would double-count that movie's pixel size.
 STD_MAJ = 571
 STD_MIN = 348
 XY_RES  = 0.087
-Z_RES   = 0.504
+
+# Z gets no such normalization: the CD z column is a plane index and is simply
+# multiplied through, so this really is an assertion about the movie's plane
+# spacing and must come from the data when it is known. Used only as the last
+# fallback -- see resolve_z_res().
+DEFAULT_Z_RES = 0.504
 
 # Column order when a CD file has no header (positional Perl read)
 DEFAULT_COLS = ("cellTime", "cell", "time", "none", "global", "local",
@@ -132,8 +148,39 @@ def _read_auxinfo(path: Path) -> Row:
     return data[-1]  # last row wins
 
 
-def transform_coordinates(rows: list[Row], auxinfo_path: Path) -> list[Row]:
+def resolve_z_res(
+    aux: Row,
+    voxel_z_um: float | None = None,
+    voxel_xy_um: float | None = None,
+) -> tuple[float, str]:
+    """Pick the plane spacing (um) to convert the CD z index into microns.
+
+    In order: the DB's measured `voxel_z_um`; else AuxInfo's `zpixres` (the
+    z/xy spacing *ratio*) scaled by the DB's `voxel_xy_um`; else the legacy
+    constant. GetACD.pl parses `zpixres` and then never uses it, so a movie
+    acquired at a different step size got silently rescaled -- 1.007 um stacks
+    came out half as deep as they really were.
+    """
+    if voxel_z_um:
+        return float(voxel_z_um), "DB voxel_z_um"
+    try:
+        zpixres = float(aux.get("zpixres", "") or 0)
+    except ValueError:
+        zpixres = 0.0
+    if zpixres and voxel_xy_um:
+        return zpixres * float(voxel_xy_um), "AuxInfo zpixres x DB voxel_xy_um"
+    return DEFAULT_Z_RES, "default"
+
+
+def transform_coordinates(
+    rows: list[Row],
+    auxinfo_path: Path,
+    voxel_z_um: float | None = None,
+    voxel_xy_um: float | None = None,
+) -> list[Row]:
     aux = _read_auxinfo(auxinfo_path)
+    z_res, z_src = resolve_z_res(aux, voxel_z_um, voxel_xy_um)
+    print(f"  Z plane spacing: {z_res:.4f} um ({z_src})", file=sys.stderr)
 
     # AuxInfo columns: name,slope,intercept,xc,yc,maj,min,ang,zc,zslope,time,zpixres,axis
     xc     = float(aux.get("xc", 0))
@@ -159,7 +206,7 @@ def transform_coordinates(rows: list[Row], auxinfo_path: Path) -> list[Row]:
         x, y = new_x, new_y
         x /= maj / STD_MAJ
         y /= min_ax / STD_MIN
-        x *= XY_RES; y *= XY_RES; z *= Z_RES
+        x *= XY_RES; y *= XY_RES; z *= z_res
         if axis == "AVR":
             z = -z; y = -y
         elif axis == "PVL":
@@ -305,6 +352,8 @@ def process_series(
     input_file: Path | str,
     auxinfo_file: Path | str | None,
     div_times: DivTimes,
+    voxel_z_um: float | None = None,
+    voxel_xy_um: float | None = None,
 ) -> tuple[list[str], list[Row]] | None:
     """Return (header, rows) for the ACD output, or None if no output produced."""
     input_file = Path(input_file)
@@ -318,7 +367,9 @@ def process_series(
     if auxinfo_file is not None:
         print(f"  Applying coordinate transform from: {Path(auxinfo_file).name}",
               file=sys.stderr)
-        rows = transform_coordinates(rows, Path(auxinfo_file))
+        rows = transform_coordinates(
+            rows, Path(auxinfo_file), voxel_z_um, voxel_xy_um
+        )
 
     time_correction = compute_time_correction(rows, div_times)
     print(f"  Time correction factor: {time_correction:.4f}", file=sys.stderr)

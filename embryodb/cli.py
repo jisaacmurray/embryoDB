@@ -2550,6 +2550,12 @@ def extract_getacd_cmd(
             console.print(f"[red]extract-getacd: series {series_name!r} not found[/red]")
             raise typer.Exit(2)
         annot_loc = row.annot_loc
+        # The CD z column is a plane index; without the measured spacing the
+        # transform falls back to a constant 0.504 um, which is wrong by 2x on
+        # movies acquired at a coarser step.
+        md = row.microscopy
+        voxel_z_um = md.voxel_z_um if md else None
+        voxel_xy_um = md.voxel_xy_um if md else None
 
     if not annot_loc:
         console.print(f"[red]extract-getacd: {series_name!r} has no annot_loc[/red]")
@@ -2572,7 +2578,7 @@ def extract_getacd_cmd(
     div_times_path = settings.get_acd_dir / "SupplementalTable2_DivisionTimes.txt"
     console.print(f"extract-getacd: {series_name}")
     div_times = load_division_times(div_times_path)
-    out = process_series(cd_file, aux_file, div_times)
+    out = process_series(cd_file, aux_file, div_times, voxel_z_um, voxel_xy_um)
     if out is None:
         console.print(f"[red]extract-getacd: no output produced for {series_name}[/red]")
         raise typer.Exit(1)

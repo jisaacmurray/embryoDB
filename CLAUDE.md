@@ -616,14 +616,27 @@ Per-series, so a failure on one embryo doesn't stop the rest and each gets a
 `PipelineStepRun` row. Reads `CD<series>.csv` + `<series>AuxInfo.csv` from the
 DB-resolved `dats/`, writes `ACD<series>.csv` back in place.
 
-**It deliberately diverges from both predecessors** in
-`compute_time_correction`: Perl and R average the standard/observed ratio over
-*every* cell, including cells whose division falls past the end of the movie —
-their `observed` is truncated while `standard` is full-length, so the ratio is
-unbounded. On `20230328_SYS674_tab-1_L3` those reached 133 and dragged the
-estimate to 8.1 against a true ~1.6, stretching terminal branches ~5×. The
-Python port takes a **median over fully-observed cycles only**
-(`tests/test_getacd_time_correction.py`).
+**It deliberately diverges from both predecessors in two places.**
+
+1. `compute_time_correction`: Perl and R average the standard/observed ratio
+   over *every* cell, including cells whose division falls past the end of the
+   movie — their `observed` is truncated while `standard` is full-length, so
+   the ratio is unbounded. On `20230328_SYS674_tab-1_L3` those reached 133 and
+   dragged the estimate to 8.1 against a true ~1.6, stretching terminal
+   branches ~5×. The port takes a **median over fully-observed cycles only**
+   (`tests/test_getacd_time_correction.py`).
+2. `resolve_z_res`: the plane spacing now comes from `voxel_z_um` (else
+   AuxInfo `zpixres` × `voxel_xy_um`, else 0.504). Perl and R hardcode 0.504
+   and *parse `zpixres` without ever using it*, so 23 series acquired at
+   1.007 µm had every ACD z coordinate come out 2× too small
+   (`tests/test_getacd_z_resolution.py`).
+
+**Do not "fix" `XY_RES`/`STD_MAJ`/`STD_MIN` the same way.** X and Y are
+normalized onto the reference embryo (`x /= maj / STD_MAJ`) *before* the micron
+conversion, which cancels the movie's own pixel size — `571 × 0.087 = 49.7 µm`
+and `348 × 0.087 = 30.3 µm` are the reference embryo's real dimensions.
+Substituting the movie's `voxel_xy_um` there would double-count. Z has no such
+normalization, which is exactly why it needed the data-driven value.
 
 **The R copy still has the bug.** `accessory/get_ACD/get_acd.R:124` is still
 `mean(ratios)`. That file is someone else's and `accessory/` is a read-only

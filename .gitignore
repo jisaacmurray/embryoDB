@@ -34,3 +34,11 @@ venv/
 # package. Listed defensively in case anyone copies them in.
 embryoDB_test_data/
 test_data/
+
+# One-off permission-repair run: a filesystem census plus per-owner scripts
+# generated from it. Hardcodes this deployment's uids and paths, goes stale as
+# soon as anyone re-saves a file, and this repo is public. The reusable half is
+# the group-laundering technique (create a fresh inode inside a setgid dir when
+# the NFS server refuses a client-side chgrp) -- that belongs in
+# embryodb/permissions.py, not here.
+permission_fix_fulldb/

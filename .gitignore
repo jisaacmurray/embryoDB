@@ -35,10 +35,10 @@ venv/
 embryoDB_test_data/
 test_data/
 
-# One-off permission-repair run: a filesystem census plus per-owner scripts
-# generated from it. Hardcodes this deployment's uids and paths, goes stale as
-# soon as anyone re-saves a file, and this repo is public. The reusable half is
-# the group-laundering technique (create a fresh inode inside a setgid dir when
-# the NFS server refuses a client-side chgrp) -- that belongs in
-# embryodb/permissions.py, not here.
-permission_fix_fulldb/
+# Generated output of the permission-repair run. The generators in
+# permission_fix_fulldb/ ARE tracked (see its README); their output is not --
+# it is a snapshot of one moment's on-disk state, hardcodes uids and absolute
+# home paths, is regenerable, and goes stale the moment anyone re-saves a file.
+permission_fix_fulldb/census.tsv
+permission_fix_fulldb/fix_permissions_*.sh
+permission_fix_fulldb/regen/

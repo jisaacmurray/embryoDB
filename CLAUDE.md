@@ -386,6 +386,15 @@ walk):
 ACL presence (the `+` in `ls -l`) is intentionally *not* audited: the GPFS
 mounts carry a default ACL on every entry, so it would flag everything.
 
+`embryodb plan-permission-fix --all` extends this to a whole-DB census plus
+per-owner fix scripts (root can't override perms here, so each owner runs their
+own). The residue it can't fix — files the NFS server's `manage-gids` refuses a
+client-side `chgrp` for — is handled by the deployment-specific scripts in
+`permission_fix_fulldb/`, which launder a file's group via setgid inheritance
+(fresh inode in a setgid gid-100 dir) instead of chgrp'ing it. See
+`permission_fix_fulldb/README.md`; those scripts hardcode this lab's numeric
+uids and gid 100 and are **not** portable.
+
 ## Gotchas
 
 - **PySide6 doesn't launch on the lab cluster.** Missing

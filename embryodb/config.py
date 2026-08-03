@@ -276,17 +276,17 @@ class Settings(BaseSettings):
             "(EMBRYODB_ARCHIVE_ANNOTATIONS_KEEP)."
         ),
     )
-    # --- R-based GetACD (get_acd.R port of GetACD.pl) -----------------------
+    # --- GetACD reference data (the algorithm itself is embryodb.getacd) ----
     get_acd_dir: Path = Field(
         default=Path("/murrlab/gpfs/fs0/l/murr/new_tools/accessory/get_ACD"),
         description=(
-            "Directory containing get_acd.R and SupplementalTable2_DivisionTimes.txt "
-            "(EMBRYODB_GET_ACD_DIR)."
+            "Directory containing SupplementalTable2_DivisionTimes.txt, the "
+            "Richards 2013 reference division times (EMBRYODB_GET_ACD_DIR)."
         ),
     )
     rscript_command: Path = Field(
         default=Path("Rscript"),
-        description="Rscript executable for running get_acd.R (EMBRYODB_RSCRIPT_COMMAND).",
+        description="Rscript executable for the R tree renderer (EMBRYODB_RSCRIPT_COMMAND).",
     )
 
     command_log_dir: Path = Field(

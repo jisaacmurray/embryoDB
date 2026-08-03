@@ -219,12 +219,13 @@ def test_run_getacd_builds_correct_shell(captured_popen, tmp_path):
         tools3_dir=Path("/fake/tools3"),
     )
     cmd = result.proc.args[2]
-    assert "GetACD STOPGAP" in cmd
-    # Invokes the legacy Perl script from tools3 on the list file.
-    assert "perl '/fake/tools3/GetACD.pl'" in cmd
-    assert f"'{result.series_list}'" in cmd
-    # Pre-creates the scratch dirs GetACD.pl copies into.
-    assert "mkdir -p CDs AuxInfos" in cmd
+    # Runs the Python port via the same tracked per-series runner the extract
+    # chain uses -- no perl, no tools3 scratch dirs.
+    assert "-m embryodb.cli run-extract-batch" in cmd
+    assert "--steps 'getacd'" in cmd
+    assert f"--list '{result.series_list}'" in cmd
+    assert "perl" not in cmd
+    assert "GetACD.pl" not in cmd
     assert result.series_list.read_text() == "seriesA\nseriesB\n"
     assert result.proc.kwargs["start_new_session"] is True
 

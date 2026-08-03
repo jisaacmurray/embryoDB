@@ -3293,11 +3293,11 @@ def phenotyping_freeze(
 def phenotyping_getacd(
     dataset: Annotated[str, typer.Argument(help="Dataset name to run GetACD on")],
 ) -> None:
-    """STOPGAP: run the legacy Perl GetACD.pl on DATASET to generate
-    ACD<series>.csv files in each series' dats/ before a freeze.
+    """Run GetACD on DATASET to generate ACD<series>.csv files in each
+    series' dats/ before a freeze.
 
-    Detached job; ACD files land in place. This is temporary — it will be
-    replaced by the in-progress R GetACD rewrite.
+    Detached job; ACD files land in place. Same per-series Python
+    implementation (embryodb.getacd) as the `getacd` extract step.
     """
     from .external_tools import run_getacd
 
@@ -3311,7 +3311,7 @@ def phenotyping_getacd(
         console.print(f"[yellow]dataset {dataset!r} has no member series[/yellow]")
         raise typer.Exit(1)
     result = run_getacd(names)
-    _report_launch(result, "GetACD stopgap", len(names))
+    _report_launch(result, "GetACD", len(names))
 
 
 def open_gui() -> None:

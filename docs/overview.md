@@ -66,7 +66,7 @@ the defect-calling analysis + figures.
 | Step | Command |
 |---|---|
 | Freeze (embryoDB) | GUI **Freeze for phenotyping** / `embryodb phenotyping freeze <dataset> [--output-base DIR]` → freeze dir + `configs/<dataset>.yaml` + list + report |
-| (stopgap) ACD gen | `embryodb phenotyping getacd <dataset>` — wraps legacy Perl `GetACD.pl`; temporary until the R rewrite lands |
+| ACD gen | `embryodb phenotyping getacd <dataset>` — runs the Python port (`embryodb.getacd`) per series; same code as the `getacd` extract step |
 | Build inputs (R) | `Rscript build_inputs.R <freeze_dir> <name> [output_dir]` (LineagePhenotyping) → `…DivTimeNorm.tsv`,`…CCLengthNorm.tsv`,`…CCLengthMinTerminal.tsv`,`…positions.txt` |
 | Analyze (R) | `Rscript run_pipeline.R configs/<dataset>.yaml` → defect calls + figures |
 

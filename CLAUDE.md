@@ -67,7 +67,7 @@ the code; this is a map.
 | **v2.6 — TIME at import time** | done | New `compute_timestamps` pipeline step parses the Stellaris `<TimeStampList>` (hex FILETIME) at import, fills `volume_timestamps`, and writes `TIME<series>.csv` from the DB. `ProcessTime` removed from the default extract checklist (legacy SP5 series only). Vendor-pluggable registry in `parsers/timestamps.py`. CLI: `embryodb emit-time-csv [name…\|all]`. |
 | **v2.7 — Acquisition settings + depth compensation** | done | Parser now extracts per-active-channel laser line + AOTF intensity + detector gain/dye/band, depth-compensation curves (projected per channel), and scalar scope settings (bit depth, pixel dwell, zoom, scan geometry, programmed timing, instrument serial). Stored as JSON on `MicroscopyMetadata` (`channels`, `depth_compensation`, `acquisition_settings`). Right-click → **Microscopy details…** opens a per-series dialog with the high-value table (channels + depth-comp curve). |
 | **v2.7.1 — Multi-host worker claim** | done | `_claim_next` in `pipeline/worker.py` atomically transitions PENDING→RUNNING via a guarded `UPDATE … WHERE id=? AND status='pending'` + `rowcount` check (portable across SQLite/Postgres; no `FOR UPDATE SKIP LOCKED` needed). Race losers re-evaluate and pick the next candidate. New `claimed_by` column on `PipelineStepRun` (observability; additive migration). Safe for two machines running workers against one DB. |
-| v2.8 — LineagePhenotyping bridge | **done** | Phase 1 (Python dataset freeze: CLI + GUI) + Phase 2 (GetACD stopgap, `external_tools.run_getacd`) + Phase 3 (R `build_inputs.R` port) all done; Phase 3 byte-validated against `die-1/` and `ceh-32_mutant/` Perl outputs. See "LineagePhenotyping bridge" section below. |
+| v2.8 — LineagePhenotyping bridge | **done** | Phase 1 (Python dataset freeze: CLI + GUI) + Phase 2 (GetACD ported to Python, `embryodb/getacd.py`) + Phase 3 (R `build_inputs.R` port) all done; Phase 3 byte-validated against `die-1/` and `ceh-32_mutant/` Perl outputs. See "LineagePhenotyping bridge" section below. |
 | **v2.9 — One-command remote GUI** | done | `scripts/embryodb-remote` opens (or reuses) a nested bastion→penticton SSH tunnel to Postgres via `ControlMaster`, sources the secret `EMBRYODB_DB_URL` from a chmod-600 file, and launches `embryodb-gui` flagged `EMBRYODB_REMOTE=1`. In remote mode `spawn_worker()` is a no-op so heavy jobs run on a penticton-resident worker (the GUI just enqueues PENDING rows). Assumes lab paths resolve locally via mount + root symlinks (`/murrlab3` etc.), so AceTree needs no path remap. Full recipe: `docs/remote_access.md`. (FastAPI tier still deferred — tunnel suffices for single-user Mac.) |
 | **v3 — Reimplement remaining Java/Perl tools** | pending | The bigger remaining chunk. See "Legacy tools currently called" below + the v3 ordering note. **StarryNite track** is planned separately and **license-gated** — see `docs/starrynite_modernization.md` (adopt 2025 all-MATLAB upstream + retrain on the curated corpus; needs MATLAB + Image Processing + Statistics/ML, plus Compiler for the free-MCR cluster build). Reference checkout at `../StarryNite/`. |
 | v4 — acetree_py / archive lifecycle / image tiles | pending | |
@@ -485,7 +485,7 @@ reimplementation. Listed roughly in order of how much code depends on them.
 | `ProcessTime.pl` | `external_tools.run_extract` — opt-in for legacy SP5 series only. The Stellaris branch was ported to `parsers/timestamps.py` in v2.6; the SP5 `info/_t<N>_*` branch still needs a Python port. | Per-timepoint timestamps for SP5-era data (writes `TIME<series>.csv`). |
 | `UpdatePermissions.pl` | `external_tools.run_extract` | `chgrp users` + `chmod` across each series' `dats/` |
 | ~~`Process_Time_Stellaris.pl`~~ | ported in v2.6 → `parsers/timestamps.py::LeicaStellarisTimestampParser` | The old regex looked for `<TimeStamp RelativeTime="..."/>`; the modern Stellaris format packs timestamps as hex Windows FILETIME values in `<TimeStampList>`. The Python parser handles the new format. |
-| `GetACD.pl` | wrapped → `external_tools.run_getacd` (v2.8, **temporary stopgap** — R rewrite is the planned replacement) | ACD coordinate normalization vs. Richards 2013 reference |
+| ~~`GetACD.pl`~~ | ported → `embryodb.getacd` (stdlib-only). Both entry points — the `getacd` extract step and `embryodb phenotyping getacd <dataset>` — run it per series via `run-extract-batch`. | ACD coordinate normalization vs. Richards 2013 reference |
 | `GetFiles.pl` | ported → `embryodb.phenotyping.freeze` (v2.8) | Per-series `dats/*.csv` freeze into a per-user directory; the embryoDB-native dataset-aware replacement. |
 | `PrintTrees.pl` | bypassed | Tiny wrapper around `Tree1`; we call the Java class directly |
 
@@ -602,16 +602,34 @@ reproduce; for biological exactness pass a real CA via `--expression-file` /
 `--expression-series`. The `CD_to_CA.pl` `×10` scaling is a stale convention not
 present in current data, so it is **not** applied.
 
-**Phase 2 — DONE (GetACD stopgap).** `external_tools.run_getacd(series_names,
-tools3_dir=...)` wraps the *existing* Perl `GetACD.pl` as a detached
-subprocess step (same launcher pattern as `run_extract` / `run_print_trees`):
-writes a series-list file, pre-creates the `CDs`/`AuxInfos` scratch dirs the
-script copies into, and shells `perl <tools3>/GetACD.pl <list>`. Runs on a
-dataset/list (not per-embryo — that's a script limitation). Tests in
-`tests/test_external_tools.py::test_run_getacd_*`. **HIGH PRIORITY next
-step:** replace this stopgap with the in-progress R `GetACD` rewrite (owned
-by someone else — leave their effort alone) and integrate ACD generation
-cleanly into the freeze/extract flow.
+**Phase 2 — DONE (GetACD ported to Python).** `embryodb/getacd.py` is a
+stdlib-only port of `GetACD.pl` / `get_acd.R`; the Perl stopgap that shelled
+`perl <tools3>/GetACD.pl <list>` is gone. **There is exactly one
+implementation now** — both entry points render the same shell
+(`run-extract-batch --steps getacd`), so a dataset-wide run and the extract
+chain's `getacd` step cannot diverge:
+
+- `embryodb phenotyping getacd <dataset>` → `external_tools.run_getacd`
+- the `getacd` extract step → `embryodb extract-getacd <series>`
+
+Per-series, so a failure on one embryo doesn't stop the rest and each gets a
+`PipelineStepRun` row. Reads `CD<series>.csv` + `<series>AuxInfo.csv` from the
+DB-resolved `dats/`, writes `ACD<series>.csv` back in place.
+
+**It deliberately diverges from both predecessors** in
+`compute_time_correction`: Perl and R average the standard/observed ratio over
+*every* cell, including cells whose division falls past the end of the movie —
+their `observed` is truncated while `standard` is full-length, so the ratio is
+unbounded. On `20230328_SYS674_tab-1_L3` those reached 133 and dragged the
+estimate to 8.1 against a true ~1.6, stretching terminal branches ~5×. The
+Python port takes a **median over fully-observed cycles only**
+(`tests/test_getacd_time_correction.py`).
+
+**The R copy still has the bug.** `accessory/get_ACD/get_acd.R:124` is still
+`mean(ratios)`. That file is someone else's and `accessory/` is a read-only
+snapshot, so it was left alone — but anyone running the R version directly
+gets the old behavior. Reference data (`SupplementalTable2_DivisionTimes.txt`)
+is still read from that directory via `settings.get_acd_dir`.
 
 **Phase 3 — done, byte-validated.** `build_inputs.R` in the
 LineagePhenotyping repo (the numeric port of `CompareDivTime.pl` +

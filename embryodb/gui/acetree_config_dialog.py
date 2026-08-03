@@ -131,8 +131,8 @@ class AceTreeConfigDialog(QtWidgets.QDialog):
         self._axis.setCurrentText(cfg.axis)
         self._axis.setToolTip(
             "Body-axis convention used by AceTree's reconstruction frame "
-            "(ADL/AVR/PVL/PDR or blank). The legacy GetACD.pl honors this; "
-            "future v3 will use AP/LR vectors directly."
+            "(ADL/AVR/PVL/PDR or blank). GetACD honors this; future v3 will "
+            "use AP/LR vectors directly."
         )
         form.addRow("axis:", self._axis)
 

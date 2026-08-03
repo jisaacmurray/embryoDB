@@ -95,7 +95,8 @@ EXTRACT_STEPS: tuple[ExtractStep, ...] = (
         "java", "Align1"),
     ExtractStep("getacd", "GetACD",
         "Map trajectories onto the Richards 2013 reference embryo "
-        "(writes ACD<series>.csv via get_acd.R). Requires AuxInfo.csv from Measure.",
+        "(writes ACD<series>.csv via embryodb.getacd). Requires AuxInfo.csv "
+        "from Measure.",
         "python_cli", "extract-getacd", per_series=True),
     ExtractStep("process_time", "ProcessTime",
         "Per-timepoint timestamps via legacy ProcessTime.pl (SP5 era + older "
@@ -399,13 +400,13 @@ def build_getacd_command(
     list_file: Path | str,
     base_dir: Path,
 ) -> str:
-    """Render the legacy `GetACD.pl` stopgap shell."""
-    return (
-        f"echo '== GetACD STOPGAP ({len(series_names)} series) ==' && "
-        "mkdir -p CDs AuxInfos && "
-        f"nice perl {shell_quote(str(base_dir / 'GetACD.pl'))} "
-        f"{shell_quote(str(list_file))}"
-    )
+    """Render the standalone GetACD shell.
+
+    Delegates to the same per-series tracked runner the extract chain uses, so
+    a dataset-wide GetACD and the `getacd` extract step run identical code
+    (`embryodb.getacd`, the Python port) and both record PipelineStepRun rows.
+    """
+    return build_extract_command(series_names, ["getacd"], list_file, base_dir)
 
 
 # Command-job kinds → the params each builder reads from CommandJob.params.
@@ -624,26 +625,16 @@ def run_getacd(
     *,
     tools3_dir: Path | None = None,
 ) -> LaunchResult:
-    """**TEMPORARY STOPGAP** — wrap the legacy Perl ``GetACD.pl`` to generate
-    ``ACD<series>.csv`` files (aligned/derotated cell coordinates in microns)
-    before a phenotyping freeze.
+    """Generate ``ACD<series>.csv`` (aligned/derotated cell coordinates in
+    microns) for a list of series, typically before a phenotyping freeze.
 
-    ``GetACD.pl`` takes a single series-list file, looks each series up via the
-    legacy Perl ``MakeDB`` (same embryoDB XML corpus as the Python DB), reads
-    ``CD<series>.csv`` + ``<series>AuxInfo.csv`` from each series' ``dats/``,
-    and writes ``ACD<series>.csv`` **in place** into that same ``dats/`` dir —
-    exactly where the freeze then picks it up. It also depends on
-    ``SupplementalTable2_DivisionTimes.txt`` and ``MakeDB.pm`` in the working
-    directory; both live in ``tools3_dir`` (the cwd ``_spawn_detached`` uses),
-    so we run from there. The ``CDs/``/``AuxInfos/`` scratch dirs the script
-    copies into are pre-created so its incidental ``cp`` calls don't error.
-
-    Granularity note: the script runs on a **dataset/list**, not a single
-    embryo — there is no per-embryo mode without hacking the script.
-
-    HIGH PRIORITY follow-up: replace this with the in-progress R ``GetACD``
-    rewrite and integrate ACD generation cleanly into the freeze/extract flow
-    (see embryoDB CLAUDE.md, "LineagePhenotyping bridge").
+    Runs the Python port (:mod:`embryodb.getacd`) per series via the tracked
+    extract runner: each series resolves its own ``dats/`` from the DB, reads
+    ``CD<series>.csv`` + ``<series>AuxInfo.csv``, and writes ``ACD<series>.csv``
+    back into that same dir — exactly where the freeze picks it up. Unlike the
+    legacy ``GetACD.pl`` this needs no ``MakeDB.pm``/``CDs``/``AuxInfos``
+    scratch in ``tools3_dir``, isolates failures per embryo, and can be run on
+    a single series.
     """
     if not series_names:
         raise ValueError("run_getacd: series_names is empty")

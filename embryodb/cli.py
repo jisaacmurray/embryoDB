@@ -2355,6 +2355,97 @@ def gc_deleted_cmd(
             console.print("[yellow]Dry-run only.[/yellow] Re-run with --apply to commit.")
 
 
+@app.command("gc-import-sources")
+def gc_import_sources_cmd(
+    older_than: Annotated[
+        int,
+        typer.Option("--older-than", help="Days since staged_at before a source is eligible."),
+    ] = 30,
+    root: Annotated[
+        list[Path] | None,
+        typer.Option("--root", help="Restrict to sources under this dir (repeatable)."),
+    ] = None,
+    dirs_only: Annotated[
+        bool,
+        typer.Option("--dirs-only", help="Consider directory imports only, never .lif files."),
+    ] = False,
+    show_blocked: Annotated[
+        bool,
+        typer.Option("--show-blocked", help="Also list sources that failed a check, and why."),
+    ] = False,
+    apply: Annotated[
+        bool,
+        typer.Option("--apply", help="Actually delete. Without --apply this is a dry run."),
+    ] = False,
+) -> None:
+    """Reclaim import sources whose movies are fully staged and verified.
+
+    The successor to `tools3/CheckImages.pl`, which deleted a source directory
+    whenever *any* of its positions had produced an XML — so an acquisition
+    where L1 staged and L2 failed lost L2's only copy. Here every series of an
+    acquisition must pass, and for a `.lif` every TileScan in the file must have
+    been imported: a position that was never imported leaves no DB row to miss,
+    so the container is read to confirm.
+
+    Per series it requires complete microscopy metadata, a COMPLETE (not
+    SKIPPED) stage_images run, and a `tif/` holding exactly the plane count the
+    source's own metadata claims, with no zero-byte planes.
+    """
+    import shutil
+
+    from . import import_sources
+
+    roots = tuple(root) if root else import_sources.DEFAULT_ROOTS
+    with database.session_scope() as session:
+        verdicts = import_sources.plan_source_gc(
+            session,
+            older_than=older_than,
+            roots=roots,
+            include_lif=not dirs_only,
+        )
+
+    deletable = [v for v in verdicts if v.ok]
+    blocked = [v for v in verdicts if not v.ok]
+
+    if not verdicts:
+        console.print(f"[green]No import sources found under {', '.join(map(str, roots))}.[/green]")
+        return
+
+    total = 0
+    for v in deletable:
+        total += v.bytes_reclaimed
+        planes = sum(s.planes_found for s in v.series)
+        console.print(
+            f"  [green]{'DELETE' if apply else 'would delete'}[/green] {v.source}  "
+            f"({v.kind}, {len(v.series)} series, {planes} planes verified, "
+            f"{v.bytes_reclaimed / 1e9:.2f} GB)"
+        )
+        if apply:
+            if v.kind == "lif":
+                v.source.unlink()
+            else:
+                shutil.rmtree(v.source, ignore_errors=False)
+
+    if blocked:
+        console.print(f"\n[yellow]{len(blocked)} source(s) kept[/yellow] (failed a check).")
+        if show_blocked:
+            for v in blocked:
+                console.print(f"  [yellow]keep[/yellow] {v.source}")
+                for reason in v.blockers[:6]:
+                    console.print(f"      [dim]{reason}[/dim]")
+                if len(v.blockers) > 6:
+                    console.print(f"      [dim]… +{len(v.blockers) - 6} more[/dim]")
+        else:
+            console.print("[dim]Re-run with --show-blocked to see why.[/dim]")
+
+    console.print(
+        f"\n[bold]{'Reclaimed' if apply else 'Would reclaim'} "
+        f"~{total / 1e9:.2f} GB from {len(deletable)} source(s)[/bold]"
+    )
+    if not apply and deletable:
+        console.print("[yellow]Dry-run only.[/yellow] Re-run with --apply to commit.")
+
+
 # --- open (convenience launcher) --------------------------------------------
 
 

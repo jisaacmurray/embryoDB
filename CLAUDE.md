@@ -306,6 +306,7 @@ functions):
 | `embryodb pipeline stub <series…\|-d DATASET>` | _(automatic in worker; CLI is the manual escape hatch)_ | `pipeline/stub_annotation.py::write_stub_for_series` |
 | `embryodb audit-permissions <series…\|-d DATASET>` | _(read-only; no GUI twin yet)_ | `permissions.audit_series` |
 | `embryodb fix-permissions <series…\|-d DATASET> [--dats-only]` | "Fix permissions" button | `permissions.normalize_series` |
+| `embryodb gc-import-sources [--older-than N] [--root DIR] [--dirs-only] [--show-blocked] [--apply]` | _(no GUI twin; dry-run by default)_ | `import_sources.plan_source_gc` |
 
 `cli.py::_resolve_series_arg(series, dataset)` is the shared "names or
 `--dataset`" resolver for rerun/extract/print-trees.

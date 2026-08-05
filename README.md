@@ -22,6 +22,9 @@ for the broader roadmap (v1.5 through v4).
   consumer programs.
 - [docs/portability.md](docs/portability.md) — what a port to another lab's
   environment would need.
+- [docs/import_source_gc.md](docs/import_source_gc.md) — reclaiming the
+  originals in `/murrlab3/Images` once a movie is staged and verified. **Read
+  this before running `gc-import-sources --apply`** — it deletes the only copy.
 
 ---
 

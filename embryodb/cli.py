@@ -2388,8 +2388,9 @@ def gc_import_sources_cmd(
     so the container is read to confirm.
 
     Per series it requires complete microscopy metadata, a COMPLETE (not
-    SKIPPED) stage_images run, and a `tif/` holding exactly the plane count the
-    source's own metadata claims, with no zero-byte planes.
+    SKIPPED) stage_images run whose recorded plane count is a whole multiple of
+    what the source's metadata implies, and a first and last plane still present
+    and non-empty on disk.
     """
     import shutil
 

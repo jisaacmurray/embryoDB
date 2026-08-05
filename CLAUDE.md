@@ -41,6 +41,7 @@ the code; this is a map.
 | `README.md` | User-facing install + CLI cheatsheet + Postgres/Mac runbook |
 | `docs/portability.md` | What another lab would hit porting embryoDB to a different OS / directory layout / no-cluster environment (MCR v714, Java deps, hard-coded paths, POSIX permission model, …). Forward-looking, not a current work item. |
 | `docs/data_access.md` | Self-contained how-to for a **consumer** program (or AI agent) that needs to read embryoDB data without the full dev context: connect via `EMBRYODB_DB_URL`, query via CLI exports or the `queries/` Python API, the data model, and where on-disk `dats/` files live. |
+| `docs/import_source_gc.md` | Reclaiming the originals in `/murrlab3/Images` once a movie is staged: what `gc-import-sources` verifies per series, why completeness comes from `stage_images.output_summary` rather than a `tif/` census (resumed runs, segmented acquisitions, and the penticton OOM), and the run sequence. Destructive — deletes the only copy. |
 | `pyproject.toml` | Package metadata + dependencies (requires Python ≥ 3.11) |
 | **Sibling, not committed** | |
 | `../embryoDB_test_data/20250527_JIM783_efl-3_test/` | ~4.6 GB raw-image fixture: 7 positions × 67 planes × 2 channels. Position 1 has 100 real timepoints (copied from production), L2-L7 stay at 10. Used for end-to-end pipeline smoke tests. |
@@ -306,7 +307,7 @@ functions):
 | `embryodb pipeline stub <series…\|-d DATASET>` | _(automatic in worker; CLI is the manual escape hatch)_ | `pipeline/stub_annotation.py::write_stub_for_series` |
 | `embryodb audit-permissions <series…\|-d DATASET>` | _(read-only; no GUI twin yet)_ | `permissions.audit_series` |
 | `embryodb fix-permissions <series…\|-d DATASET> [--dats-only]` | "Fix permissions" button | `permissions.normalize_series` |
-| `embryodb gc-import-sources [--older-than N] [--root DIR] [--dirs-only] [--show-blocked] [--apply]` | _(no GUI twin; dry-run by default)_ | `import_sources.plan_source_gc` |
+| `embryodb gc-import-sources [--older-than N] [--root DIR] [--dirs-only] [--show-blocked] [--apply]` | _(no GUI twin; dry-run by default — see `docs/import_source_gc.md`)_ | `import_sources.plan_source_gc` |
 
 `cli.py::_resolve_series_arg(series, dataset)` is the shared "names or
 `--dataset`" resolver for rerun/extract/print-trees.
